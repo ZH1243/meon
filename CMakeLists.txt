@@ -117,6 +117,7 @@ if(RDMA_PROXY_BUILD_TESTS)
 
   add_executable(test_forwarding_rounds tests/native/test_forwarding_rounds.cpp)
   target_include_directories(test_forwarding_rounds PRIVATE native/include)
+  target_link_libraries(test_forwarding_rounds PRIVATE Threads::Threads)
   add_test(NAME test_forwarding_rounds COMMAND test_forwarding_rounds)
 
   add_executable(test_forward_round_scheduler tests/native/test_forward_round_scheduler.cpp)
@@ -201,7 +202,7 @@ if(RDMA_PROXY_BUILD_TESTS)
   add_test(NAME test_return_copies COMMAND test_return_copies)
   target_link_libraries(test_down_ready_trace PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_down_ready_trace COMMAND test_down_ready_trace)
-  target_link_libraries(test_c_api PRIVATE rdma_cpu_proxy_shared)
+  target_link_libraries(test_c_api PRIVATE rdma_cpu_proxy_shared Threads::Threads)
   add_test(NAME test_c_api COMMAND test_c_api ${CMAKE_CURRENT_SOURCE_DIR}/config/example_config.json)
 
   add_executable(test_forward_events tests/native/test_forward_events.cpp)

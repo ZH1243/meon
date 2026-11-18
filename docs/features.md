@@ -20,9 +20,12 @@ The native loader reads JSON and then applies CLI overrides. The launch scripts 
 Inspect actual launch arguments on any host, including the profile's JSON file and library path.
 
 ```bash
+python3 python/rdma_proxy_worker.py --help
 TORCHRUN_BIN=echo bash scripts/run_single_node_torchrun.sh
 TORCHRUN_BIN=echo bash scripts/run_node0_torchrun.sh
 ```
+
+The first command lists Python worker options. The launcher previews show the arguments passed to that worker. Look up forwarded options such as `--num_tokens=…` by their JSON key in the [native configuration reference](native-configuration.md). For a flag-by-flag interpretation of a complete set of overrides, see the [single-node example](#reading-a-single-node-command).
 
 | Environment | Meaning and defaults |
 | --- | --- |
@@ -86,6 +89,38 @@ GPU scatter preparation decodes the actual streamed descriptors into compact per
 With weights enabled, source initialization normalizes generated positive weights across the original token's entire top-k set, using an FP64 sum and rounding the quotients to FP32. Each immutable source weight is indexed by its position in the corresponding expert list. Down multiplies each logical FP32 accumulator by its weight before result conversion and additive scatter. Intra-node and inter-node combine sum these already weighted results. Empty domains and zero-weight contributions still participate in readiness. The default unweighted path sums expert contributions directly. [Weighted reference tests](../tests/python/test_weighted_projection.py)
 
 Before-down reset clears additive destinations just before down mapping and computation. End-of-iteration reset clears them after return, combine, reader barriers and validation, including the final iteration. Both policies reset readiness for reuse and charge output clearing to pipeline time. Hardware residence matters when a polling combine kernel overlaps down. Changing geometry, budgets or cluster mode requires both numerical tests and a bounded concurrent run. [Worker composition and reuse tests](../tests/python/test_worker_composition.py)
+
+## Reading a single-node command
+
+This example explains a launch with 20,480 tokens per GPU, width 7,168, and a weighted SwiGLU/down pipeline. The defaults below are those of `scripts/run_single_node_torchrun.sh`, including its JSON and worker defaults. That profile already enables SwiGLU, up cluster M=2, additive down stores, per-group NVLink returns and intra-node combine. [Launcher](../scripts/run_single_node_torchrun.sh)
+
+| Workload and data movement | Meaning in this run |
+| --- | --- |
+| `--num_iterations=3` | Run three measured iterations (launcher default 5). |
+| `--num_tokens=20480`, `--token_dimension=7168` | Each source GPU supplies 20,480 tokens, the launcher default. Each token has 7,168 BF16 elements instead of the default 4,096. Expert assignments can create several routed rows per token. |
+| `--nvlink_forward_prepared_batch_chunks=64` | Keep the launcher's 64 chunks per prepared forward batch. At 32 tokens per chunk this covers up to 2,048 input rows. Routing determines how many rows each destination receives. |
+| `--router_local_input_early_ready_enabled=true` | Make the GPU's own already-staged input eligible when the iteration starts. Peer inputs still wait for their transfer completions. Default off. |
+| `--nvlink_forward_notification_scheduling_mode=complete_round` | Schedule new gather work after collecting the completions for one forward batch ordinal from the participating sources. The default schedules after each data notification. Early-local readiness can publish own-source work ahead of the round. |
+| `--nvlink_return_local_batch_sync_enabled=true` | Before submitting a return column group, wait for every local producer to reach that group, including producers with zero rows to send. This setting affects the return path. Default off. |
+
+| Projection and GPU resources | Meaning in this run |
+| --- | --- |
+| `--grouped-gemm-m-tile=256`, `--grouped-gemm-n-tile=512` | Select the up GEMM's matrix-multiply tile in routed rows (M) and projected columns (N). The launcher uses 128 × 128. On Blackwell with the inherited two-CTA M cluster, a full cluster covers 256 rows, 128 per thread block (CTA). |
+| `--grouped-gemm-output-dimension=1536`, `--grouped-gemm-max-swizzle-size=1` | Produce 1,536 features after SwiGLU (launcher default 2,048). SwiGLU requires two projections, so up computes 3,072 columns from 7,168 inputs. Swizzle 1 schedules one 512-column N tile per group, giving six groups per M cluster. The launcher uses swizzle 8. |
+| `--down-tile-m=256`, `--down-tile-n=512`, `--down-cluster-m=2`, `--down-max-swizzle-size=2` | Down maps 1,536 features back to 7,168. Use a 256 × 512 MMA tile and cluster two CTAs along M. Group two N tiles at a time. The 14 output tiles become seven 1,024-column ready/return groups. Launcher defaults are 128 × 128, cluster 1, swizzle 1. |
+| `--down-bulk-smem-padding=16`, `--down-bulk-smem-cols=128`, `--down-bulk-smem-buffers=1`, `--down-bulk-store-warps=4` | Specialize the **Blackwell** down bulk-store epilogue. Request 16 bytes of shared-memory padding per row, a total budget of 128 buffered columns, one reusable buffer and four issuing epilogue warps. QuACK applies padding when it preserves pipeline depth. The launcher leaves these settings to QuACK. Hopper rejects these explicit overrides. |
+| `--down-sm-count=140`, `--intra-node-combine-ctas=6`, `--intra-node-combine-relax-sm-guard` | Set the persistent down kernel's SM budget to 140 and launch six combine CTAs (launcher defaults 74 and 4). The relaxed guard requires at least **146 visible SMs** (140 + 6). The default guard with this geometry requires **152** (140 + 6 × 2). The budget must also be divisible by down cluster M. The guard checks launch headroom. Concurrent progress still needs a hardware test. |
+
+| Contributions, reuse and timeouts | Meaning in this run |
+| --- | --- |
+| `--weighted-contributions` | Multiply each expert's FP32 down contribution by its normalized routing weight before output conversion and additive scatter. Later combine stages sum those weighted partials. The launcher uses unit weights by default. |
+| `--cpu-scatter-preparation`, `--cpu-scatter-publication=threaded` | Move scatter-address and weight packing to a native CPU thread. It processes committed gather-table prefixes as forwarding proceeds. After the final gather publication and packing, one upload transfers the packed metadata. Down waits on that iteration's upload event. Default preparation runs on the GPU. Enabling CPU preparation alone selects `deferred`. |
+| `--down-output-reset=end-of-iteration` | Clear additive down outputs after all returns, combines and enabled checks finish reading them, including on the last iteration. The default clears them before down GEMM. |
+| `--completion_timeout_ms=600000`, `--return-token-timeout=600` | Both values are ten minutes. The native proxy uses **milliseconds** for progress/completion waits (default 30,000). The worker uses **seconds** for same-node return coordination and CPU scatter event-submission waits (default 120). Each bounds its own waits. |
+
+**Correctness checks.** The launcher checks NVLink return copies, intra-node combine and final token-order combine. Append `--check-projections` to compare up and down results against their numerical references on each iteration. [Numerical validation](development.md)
+
+**Running on Hopper.** Start with the single-node launcher's 128 × 128 up and down tiles, down cluster M=1 and down SM budget of 74. Omit the four Blackwell bulk-store overrides. The launcher's expert-wave barrier requires the SM90 ping-pong kernel, which rejects the 256 × 512 down tile in this example. [Hopper quick start](development.md#hopper-h100-quick-start) · [Bulk-store tuning](runtime.md#bulk-store-configuration-and-performance)
 
 ## Validation and measurement entry points
 

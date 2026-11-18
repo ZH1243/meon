@@ -36,6 +36,8 @@ After setting the build and fabric environment in the development guide, a minim
 bash scripts/run_single_node_torchrun.sh --num_tokens=1024 --num_iterations=3 --check-projections
 ```
 
+For a larger single-node run, the [annotated parameter example](docs/features.md#reading-a-single-node-command) explains the workload, GEMM tiles, SM budget, forwarding and return policies, and timeouts, with Hopper and Blackwell constraints.
+
 ## Directory map
 
 | Path | Responsibility |

@@ -1,0 +1,272 @@
+"""Source-side intra-node reduction, concurrent with readiness-publishing down GEMM."""
+import ctypes
+
+
+def validate_intra_node_sm_budget(total_sms, down_sm_count, combine_ctas, down_cluster_m,
+                                  *, relax_guard=False):
+    """Check launch headroom; this does not reserve or pin physical SMs."""
+    # The default budgets a whole down cluster per combine CTA to allow for
+    # fragmentation. Opting in budgets one SM per CTA, retaining a total cap.
+    available = total_sms - combine_ctas * (1 if relax_guard else down_cluster_m)
+    if down_sm_count is None or down_sm_count > available:
+        policy = "relaxed" if relax_guard else "cluster"
+        raise ValueError(f"intra-node combine requires --down-sm-count <= {available} "
+                         "to leave room for persistent combine CTAs "
+                         f"(SM guard: {policy}; total SMs: {total_sms})")
+
+
+def contribution_indices(masks, world):
+    """Output row k of peer p corresponds to the k-th selected full-input row."""
+    if not 2 <= world <= 8 or any(mask <= 0 or mask >= (1 << world) for mask in masks):
+        raise ValueError("invalid intra-node routing masks")
+    return [[row for row, mask in enumerate(masks) if mask & (1 << peer)]
+            for peer in range(world)]
+
+
+class IntraNodeCombine:
+    def __init__(self, exchange, options):
+        import torch
+        import cuda.bindings.driver as cuda
+        import cutlass.cute as cute
+        from cutlass.cute.runtime import from_dlpack
+        from intra_node_combine_kernel import RegisterIntraNodeKernel
+
+        self.exchange = exchange
+        self.torch, self.cuda = torch, cuda
+        self.device = exchange.down.up.output.device
+        self.stream = torch.cuda.Stream(device=self.device)
+        self.control_stream = torch.cuda.Stream(device=self.device)
+        self.mapping_ready = torch.cuda.Event()
+        self.finished = torch.cuda.Event()
+        self.launched = False
+        self.inter_node_combine = None
+        self.check_enabled = options.check_intra_node_combine
+        self.cancel = torch.zeros(1, dtype=torch.int32, device=self.device)
+        width = int(exchange.down.up.x_buffers[0].shape[1])
+        tile = options.down_tile_n
+        vec = options.intra_node_combine_elements_per_thread
+        threads = options.intra_node_combine_threads_per_cta
+        ctas = options.intra_node_combine_ctas
+        if width % tile or tile % vec:
+            raise ValueError("intra-node combine requires tile_n dividing width and elements/thread dividing tile_n")
+        properties = torch.cuda.get_device_properties(self.device)
+        relax_sm_guard = getattr(options, "intra_node_combine_relax_sm_guard", False)
+        validate_intra_node_sm_budget(
+            properties.multi_processor_count, options.down_sm_count, ctas,
+            options.down_cluster_m, relax_guard=relax_sm_guard,
+        )
+        query = exchange.library.rdma_proxy_get_intra_node_source_masks
+        query.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_uint8),
+                          ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)]
+        query.restype = ctypes.c_int
+        publication = exchange.library.rdma_proxy_get_return_ready_publication
+        publication.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+                               ctypes.POINTER(ctypes.c_size_t)]
+        publication.restype = ctypes.c_int
+        host, device = ctypes.c_size_t(), ctypes.c_size_t()
+        exchange.require(publication(exchange.handle, ctypes.byref(host), ctypes.byref(device)))
+        self.group_tiles = min(options.down_max_swizzle_size, width // tile)
+        self.num_groups = (width // tile + self.group_tiles - 1) // self.group_tiles
+        self.ready_groups = (torch.zeros(1, dtype=torch.int32, device=self.device)
+                             if options.intra_node_combine_publish_ready else None)
+        self.completion_slots = (torch.zeros(self.num_groups * ctas, dtype=torch.int32,
+                                            device=self.device)
+                                 if self.ready_groups is not None else None)
+        self.addresses = torch.tensor([device.value, self.cancel.data_ptr(),
+                                      self.completion_slots.data_ptr() if self.completion_slots is not None else 0,
+                                      self.ready_groups.data_ptr() if self.ready_groups is not None else 0],
+                                     dtype=torch.int64, device=self.device)
+        self.nodes = sorted({node for node, _ in exchange.down.up.source_pairs})
+        self.domains = []
+        self.entries = []
+        total_rows = 0
+        dtype = exchange.outputs[0].dtype
+        for node in self.nodes:
+            count = ctypes.c_uint64()
+            exchange.require(query(exchange.handle, node, None, 0, ctypes.byref(count)))
+            masks = (ctypes.c_uint8 * count.value)()
+            exchange.require(query(exchange.handle, node, masks, count.value, ctypes.byref(count)))
+            indices = contribution_indices(list(masks), exchange.world)
+            self.domains.append((node, total_rows, count.value))
+            for peer, selected in enumerate(indices):
+                if peer == exchange.rank:
+                    source = exchange.down.up.source_pairs.index((node, peer))
+                    buffer = exchange.outputs[source]
+                else:
+                    buffer = exchange.received[peer, node]
+                index = torch.tensor(selected, dtype=torch.int64, device=self.device)
+                self.entries.append((node, peer, total_rows, index, buffer))
+            total_rows += count.value
+        if total_rows * width > 2**31 - 1:
+            raise ValueError("intra-node combine exceeds the kernel's int32 element-index range")
+        active = [entry for entry in self.entries if entry[3].numel()]
+        inverse = torch.full((max(1, len(active)), max(1, total_rows)), -1,
+                             dtype=torch.int32, device=self.device)
+        for p, (_, _, offset, index, _) in enumerate(active):
+            inverse[p, index + offset] = torch.arange(index.numel(), dtype=torch.int32, device=self.device)
+        self.rows = inverse
+        self.output_tile_n = tile if options.intra_node_combine_n_tile_major_output else 0
+        self.total_rows = total_rows
+        # Pack each domain independently so consecutive N tiles for a source
+        # form one contiguous transfer span, including multi-tile groups.
+        self.output = torch.empty((total_rows * width,) if self.output_tile_n else (total_rows, width),
+                                  dtype=dtype, device=self.device)
+        self.outputs = {
+            node: (self.output.view(-1)[offset * width:(offset + count) * width]
+                   .view(width // tile, count, tile)
+                   if self.output_tile_n else self.output[offset:offset + count])
+            for node, offset, count in self.domains
+        }
+        self.buffers = tuple(buffer.view(-1)[:index.numel() * width]
+                             for _, _, _, index, buffer in active)
+        self.compiled = None
+        self.width, self.tile = width, tile
+        self.kernel_output = self.output if total_rows else torch.empty(1, dtype=dtype, device=self.device)
+        self.rdma_return = None
+        if options.rdma_return_token_results:
+            from rdma_network_return import NetworkReturn
+            self.rdma_return = NetworkReturn(self, options)
+            self.addresses = torch.cat((self.addresses, torch.tensor(
+                [self.rdma_return.device_prefix], dtype=torch.int64, device=self.device)))
+        if total_rows or self.ready_groups is not None:
+            self.arguments = (
+                tuple(from_dlpack(buffer, assumed_align=16) for buffer in self.buffers)
+                if self.buffers else None,
+                from_dlpack(self.rows), from_dlpack(self.kernel_output, assumed_align=16),
+                from_dlpack(self.addresses),
+            )
+            kernel = RegisterIntraNodeKernel(
+                tuple(entry[3].numel() for entry in active), width, tile, ctas, vec,
+                threads, True, self.output_tile_n)
+            kernel.output_domains = tuple((offset, count) for _, offset, count in self.domains)
+            first_peer = 0
+            input_domains = []
+            for node, offset, count in self.domains:
+                peers = sum(entry[0] == node for entry in active)
+                input_domains.append((offset, count, first_peer, peers))
+                first_peer += peers
+            kernel.input_domains = tuple(input_domains)
+            kernel.group_tiles = self.group_tiles
+            kernel.publish_ready = self.ready_groups is not None
+            kernel.publish_rdma_ready = self.rdma_return is not None
+            kernel.source_tokens = total_rows
+            kernel.prefetch_peers = options.intra_node_combine_prefetch_peers
+            lanes = 32
+            while (tile // vec) % lanes:
+                lanes //= 2
+            kernel.lanes_per_group = lanes
+            self.compiled = cute.compile(kernel, *self.arguments,
+                                         cuda.CUstream(self.stream.cuda_stream))
+        # Compilation/metadata uploads finish before any readiness-gated launch.
+        torch.cuda.synchronize(self.device)
+        self._warmup()
+        print(f"Intra-node combine: register-prefetch, rows_by_source="
+              f"{[(n, c) for n, _, c in self.domains]} CTAs={ctas}, "
+              f"outputs={'N-tile-major' if self.output_tile_n else 'row-major'} "
+              "in staging/RDMA input-row order; "
+              f"SM guard={'relaxed' if relax_sm_guard else 'cluster'}, "
+              f"down CTA budget={options.down_sm_count}", flush=True)
+
+    def _warmup(self):
+        """Exercise the compiled callable before readiness-gated GPU work starts.
+
+        Compilation alone does not exercise first-invocation runtime setup.
+        Cancellation lets the actual kernel run without waiting for returns or
+        reading their uninitialized payloads, and suppresses ready publication.
+        """
+        if self.compiled is None:
+            return
+        print(f"[gpu={self.exchange.down.up.cuda_device_id}] intra-node combine warmup begin",
+              flush=True)
+        with self.torch.cuda.stream(self.stream):
+            self.cancel.fill_(1)
+            self.compiled(*self.arguments, self.cuda.CUstream(self.stream.cuda_stream))
+            self.finished.record(self.stream)
+        # Do not clear cancellation until every warmup CTA has exited.
+        self.stream.synchronize()
+        with self.torch.cuda.stream(self.stream):
+            self.cancel.zero_()
+            if self.ready_groups is not None:
+                self.ready_groups.zero_()
+                self.completion_slots.zero_()
+        self.stream.synchronize()
+        print(f"[gpu={self.exchange.down.up.cuda_device_id}] intra-node combine warmup complete",
+              flush=True)
+
+    def prepare_iteration(self):
+        """Reset publication before allowing any work for the next iteration.
+
+        Caller has joined combine and all consumers from the previous iteration.
+        Returning guarantees zero is visible, including to other CUDA streams.
+        """
+        if self.launched:
+            raise RuntimeError("cannot reset intra-node readiness while combine is active")
+        if self.ready_groups is not None:
+            with self.torch.cuda.stream(self.control_stream):
+                self.ready_groups.zero_()
+                self.completion_slots.zero_()
+            self.control_stream.synchronize()
+
+    def launch(self):
+        # Called on the down stream after mapping/reset and down launch. This
+        # event was recorded BEFORE down launch, so it does not wait for down.
+        trace = self.exchange.down._log_combine_startup
+        trace("intra-node combine stream wait-event begin")
+        self.stream.wait_event(self.mapping_ready)
+        trace("intra-node combine stream wait-event returned")
+        self.launched = True
+        if self.compiled is not None:
+            trace("intra-node combine compiled invocation begin")
+            self.compiled(*self.arguments, self.cuda.CUstream(self.stream.cuda_stream))
+            trace("intra-node combine compiled invocation returned")
+        trace("intra-node combine finished-event record begin")
+        self.finished.record(self.stream)
+        trace("intra-node combine finished-event record returned")
+
+    def finish(self):
+        if self.launched:
+            self.finished.synchronize()
+            self.launched = False
+        if self.rdma_return is not None:
+            self.rdma_return.check()
+        if self.check_enabled:
+            if self.ready_groups is not None and self.ready_groups.item() != self.num_groups:
+                raise RuntimeError("intra-node output-ready prefix did not reach the final group")
+            self.check()
+
+    def check(self):
+        """Independent FP32 gather/add reference after all returns are complete."""
+        torch = self.torch
+        expected = torch.zeros((self.total_rows, self.width), dtype=torch.float32, device=self.device)
+        for node, peer, offset, index, buffer in self.entries:
+            count = index.numel()
+            if peer == self.exchange.rank:
+                source = self.exchange.down.up.source_pairs.index((node, peer))
+                actual_count = int(self.exchange.down.combine_valid_rows[source].item())
+                actual_index = self.exchange.down.combine_output_to_input[source, :count]
+                torch.testing.assert_close(actual_index, index, rtol=0, atol=0)
+            else:
+                actual_count = self.exchange.received_valid_rows[peer, node]
+            if count != actual_count:
+                raise RuntimeError("routing masks disagree with combine valid-row count")
+            if count:
+                values = (buffer.view(-1)[:count * self.width]
+                          .view(self.width // self.tile, count, self.tile)
+                          .permute(1, 0, 2).reshape(count, self.width))
+                expected[index + offset] += values.float()
+        for node, offset, count in self.domains:
+            actual = self.outputs[node]
+            if self.output_tile_n:
+                actual = actual.permute(1, 0, 2).reshape(count, self.width)
+            torch.testing.assert_close(actual, expected[offset:offset + count].to(self.output.dtype),
+                                       rtol=0, atol=0)
+        print("Intra-node combine reference check: PASSED", flush=True)
+
+    def abort(self):
+        # Unblock polling if a CPU proxy fails before publishing the final group.
+        if self.launched:
+            with self.torch.cuda.stream(self.control_stream):
+                self.cancel.fill_(1)
+            self.control_stream.synchronize()
+            self.stream.synchronize()
+            self.launched = False

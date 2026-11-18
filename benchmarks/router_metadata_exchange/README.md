@@ -1,0 +1,774 @@
+# CPU router metadata exchange benchmark
+
+This benchmark embeds a **C++ shared library** in each torchrun Python worker.
+`benchmark.py` parses options and rank environment variables, loads the library
+with `ctypes.CDLL`, and starts one proxy thread. C++ performs connection setup,
+input preparation, synchronization, serialization, exchange, validation, CPU
+installation, all timing, and report generation. Python performs no metadata
+processing or communication and the GIL is released during the native call.
+
+The experiment remains CPU-only: no CUDA, GPU allocations, actual
+token transfers, or GPU scheduler initialization. It reuses the main project's
+`RouterRouting` CPU generator, `protocol.cpp` serializers/deserializers, and
+`compute_chunks_from_token_indices()`. The standalone library does not initialize
+the full GPU/RDMA `Proxy` class. Binary array transfer is now the default. `--wire-format=text` retains the original
+text baseline. Self-table copying and full validation remain enabled. Changes
+are confined to this benchmark; the production proxy protocol is unchanged.
+
+## Build on both remote machines
+
+Run the examples in this guide from `benchmarks/router_metadata_exchange`. Build the native library before starting torchrun.
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+This produces `build/librouter_metadata_bench.so` on Linux (`.dylib` on macOS).
+The build needs a C++17 compiler, CMake, and POSIX sockets/threads; it requires
+no CUDA and does not modify the main proxy build. Libibverbs is optional for TCP;
+CMake enables RDMA when its headers and library are available. Build once
+before launching workers, not separately in every torchrun process. Rebuild on
+both nodes after native source changes.
+
+Python 3.9+ and torchrun are needed for launching; there is no Torch distributed
+process group. Override the shared-library location with `--library=/path/to/lib`
+or `ROUTER_METADATA_BENCH_LIBRARY`. The C ABI is declared in `native_proxy.h`;
+exceptions return a nonzero status and an error string to Python. Native sockets
+use deadlines and close via RAII on success or failure.
+
+## Optional RDMA transport (ABI 7, timing schema 9)
+
+`--transport=rdma` automatically enables binary same-index aggregation and local
+shared memory. TCP remains the default. RDMA requires Linux, libibverbs development
+headers/library and a working verbs-capable fabric; there is no mock or automatic
+TCP fallback. Rebuild on **both Hopper nodes**:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DROUTER_METADATA_REQUIRE_RDMA=ON
+cmake --build build -j
+```
+
+Set the device map on both nodes (this is the map used by the main project's
+Hopper configuration; adjust for your machines). One device name may also be
+provided to use the same NIC for every local proxy:
+
+```bash
+export RDMA_DEVICE_MAP=mlx5_bond_1,mlx5_bond_4,mlx5_bond_3,mlx5_bond_2,mlx5_bond_7,mlx5_bond_6,mlx5_bond_8,mlx5_bond_5
+# Node 0
+bash ./run_node0_torchrun.sh --transport=rdma --rdma-port=1 --rdma-gid-index=3 --disable-expert-index-validation --verify
+# Node 1, with the same environment and options
+bash ./run_node1_torchrun.sh --transport=rdma --rdma-port=1 --rdma-gid-index=3 --disable-expert-index-validation --verify
+```
+
+`--rdma-device-map=...` overrides the environment. Port defaults to 1 and GID
+index to 3; use a valid RoCE GID index for your fabric, or -1 for LID routing on
+InfiniBand. The reused production RC QP implementation selects path MTU 4096;
+the fabric must support that setting. Device maps and options currently must
+match across ranks. The host buffers need sufficient locked-memory allowance
+for registration. No GPU memory registration is involved.
+
+Each matching local-index pair establishes one RC QP per remote node. TCP
+connections exchange QP/MR descriptors and carry the existing control barriers;
+metadata uses RDMA Write With Immediate. Allocation, registration, connection
+setup and the initial receive WQE are outside timing. Each iteration packs the
+aggregate into a reusable registered send buffer and posts one signaled write
+per remote node. The NIC writes the frame/header/body directly into that peer's
+registered shared-memory ingress arena. A receive CQ completion is required
+before validating the frame and release-publishing the expert slices to local
+proxies. Send completion is required before reusing the send buffer. The global
+completion barrier prevents overwrite while any local consumer still reads.
+Receive credits are reposted inside timing. Sequence/length checks remain enabled
+when expert-index validation is disabled. `--verify` checks exact installed
+metadata outside timing and should be used for the first remote run.
+
+Reports identify `transport`. `rdma_pack_ms`, `rdma_post_ms`, `rdma_poll_ms` and
+`rdma_post_recv_ms` are disjoint timed work; `rdma_poll_calls`, `rdma_sent_bytes`
+and `rdma_received_bytes` report CQ polling and wire volume. The completion
+milestones `rdma_sends_complete_ms` and `rdma_work_complete_ms` overlap other
+measurements. TCP send/receive/poll diagnostics and TCP byte counters are zero
+for RDMA metadata. The configured TCP channel count includes retained bootstrap
+connections. `tcp_exchange_ms` remains a legacy alias for the general exchange
+stage, including RDMA and shared-memory work. The existing `shm_scan_after_socket_*`
+fields mean scans after this rank's **transport** completes in RDMA mode.
+`--receive-drain` applies only to TCP.
+
+For an instrumentation-matched comparison, rerun with `--transport=tcp
+--same-index-aggregation` and otherwise identical workload/validation options.
+Local tests cover TCP regressions and RDMA frame/layout validation; actual verbs
+transfer correctness and latency must be validated on the remote machines.
+
+## Run on two nodes
+
+From this directory, start the corresponding command on each machine:
+
+```bash
+# Node 0
+bash ./run_node0_torchrun.sh
+
+# Node 1
+bash ./run_node1_torchrun.sh
+```
+
+Defaults match the current proxy scripts: 8 processes per node, 20,480 tokens
+per process, 128 experts, top-8, hidden dimension 4,096, two-byte elements, and
+32 tokens per receive chunk. Each process represents one GPU proxy but does
+not access a GPU. There are 4 precomputed routing datasets, 5 warmup iterations,
+and 50 measured iterations.
+
+The launchers default to node addresses `28.59.80.49` and `29.162.224.226`, taken
+from the existing node configurations. Override addresses on **both nodes** if
+needed:
+
+```bash
+NODE0_HOST=10.0.0.10 NODE1_HOST=10.0.0.11 \
+  bash ./run_node0_torchrun.sh --iterations=100 --datasets=8
+
+NODE0_HOST=10.0.0.10 NODE1_HOST=10.0.0.11 \
+  bash ./run_node1_torchrun.sh --iterations=100 --datasets=8
+```
+
+Use identical workload options on both nodes. Supported launcher environment
+variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NODE0_HOST`, `NODE1_HOST` | Addresses above | TCP metadata node addresses |
+| `MASTER_ADDR` | `NODE0_HOST` | Torchrun rendezvous address |
+| `MASTER_PORT` | `29510` | Torchrun rendezvous port |
+| `NPROC_PER_NODE` | `8` | Processes representing GPUs on each node |
+| `METADATA_PORT_BASE` | `20515` | Listener port = base + local rank |
+| `TORCHRUN_BIN` | `torchrun` | Launcher executable |
+| `ROUTER_METADATA_BENCH_LIBRARY` | `build/librouter_metadata_bench.so` | Native library path |
+| `RESULT_JSON` | `results/metadata_exchange.json` in this directory | Rank-0 report |
+
+Only node 0 writes the report; the same path is overwritten on later runs.
+Use a different `RESULT_JSON` for each comparison. Choose unused rendezvous and
+metadata ports for concurrent jobs. TCP follows the OS route to these addresses,
+not the RDMA device mapping from the main proxy test. For meaningful measurements,
+use the intended network interface, an otherwise quiet machine, and consistent
+CPU/NUMA placement. This benchmark does not pin processes automatically.
+
+## Optional within-node shared memory
+
+Rebuild the library and update `benchmark.py` on both nodes (C ABI version 7).
+The default remains all-TCP. To replace local expert-metadata TCP connections
+with shared host memory, pass `--local-shared-memory` on **both nodes**:
+
+```bash
+# Node 0, from this benchmark directory
+RESULT_JSON=results/shared_memory.json bash ./run_node0_torchrun.sh \
+  --local-shared-memory --disable-expert-index-validation
+
+# Node 1
+bash ./run_node1_torchrun.sh \
+  --local-shared-memory --disable-expert-index-validation
+```
+
+This option requires binary mode. Remote expert metadata and x3/x4 still use
+TCP, self metadata still uses the existing local copy, and control collectives
+still use TCP outside timing. For eight proxies per node, each proxy replaces
+seven local expert channels, retaining eight remote expert channels and one
+remote x3/x4 channel. Use matching options on every rank; topology-affecting
+option mismatches can fail during connection setup before configuration checking.
+
+One POSIX shared-memory region is created per logical node. A unique identity
+is distributed through the control mesh; no manual run ID is required. Each
+source owns a cache-line-aligned arena containing packed destination slices,
+counts, and a release/acquire sequence counter. Capacity is bounded by
+`num_tokens * top_k` indices per source across all local destinations, rather
+than reserving that bound per destination. Default shared storage is about
+5 MiB per node. Local workers must share the same POSIX shared-memory namespace
+and permissions; Linux containers need sufficient `/dev/shm` capacity.
+
+Allocation, mapping, and producer-arena prefaulting occur before timing. Each
+iteration copies current dataset arrays into shared memory **inside timing**,
+then publishes them. Receivers copy their slices into reusable CPU records and
+apply the same validation policy as TCP reception. The existing global
+completion collective prevents overwrite until every reader has finished.
+The region is unlinked after all workers map it and unmapped on teardown;
+exception cleanup also unlinks a region owned by that worker. An uncatchable
+termination during initial setup can leave a named object, but a new run uses
+a different identity.
+
+While local arrivals are pending, the proxy scans sequence counters and polls
+remote sockets without blocking. After local reception completes, normal
+blocking socket polling resumes. This intentionally consumes CPU while waiting
+for local producers; keep CPU/NUMA placement consistent in comparisons.
+
+Reports include `local_shared_memory` in configuration. Per-iteration
+`shm_sent_bytes` / `shm_received_bytes` count offsets and indices copied through
+shared memory (excluding publication fields). Existing `sent_bytes` /
+`received_bytes` count only TCP metadata wire bytes. A single-node shared-memory
+run therefore has zero TCP metadata bytes, although control traffic remains.
+
+For compatibility, `tcp_exchange_ms` retains its field name but, with this
+option, measures **the combined TCP/shared-memory exchange stage**, including
+shared payload copies and readiness polling, excluding receive processing.
+Each per-rank record also exposes the same value as `exchange_ms`; these are
+aliases and must not be added together. The five existing stages still sum to
+`elapsed_ms`. Compare `critical_rank_ms` for end-to-end benefit rather than
+interpreting the legacy stage name as isolated TCP time.
+
+For correctness, add `--verify` on both nodes to compare every received table
+against source-specific expected data outside timing. Local subprocess tests
+cover repeated datasets, local-only and hybrid transports, empty lists,
+pre-serialized mode, disabled validation, one proxy per node, and 16 proxies
+with the default workload. These are CPU correctness tests, not Hopper
+performance measurements.
+
+## Protocol and input fidelity
+
+By default, every process establishes a full-duplex persistent expert-metadata connection
+with every other process. Matching local ranks on different nodes additionally
+establish a separate x3/x4 connection. Same-node expert messages use IPv4
+loopback; remote messages use `--hosts`. Control synchronization has separate
+connections to rank 0. All sockets use `TCP_NODELAY`.
+
+Input preparation follows the router's SplitMix64/start/stride generation,
+stable descending node-mask ordering, normalized expert offsets, and compact
+destination-buffer indexing. Seeds vary by source and dataset:
+`seed + source_rank + dataset_index * world_size`. Inputs are generated before
+measurement and cycled across iterations. This models changing routing without
+including route generation time or retaining an unbounded number of datasets.
+
+Each source sends only the eight destination experts' metadata (with the default
+topology) to each recipient. x3/x4 are sent only to matching local ranks on remote
+nodes. Self expert metadata is copied locally. For 16 processes, each iteration
+contains 240 directed expert messages and 16 directed x3/x4 messages.
+
+Binary mode sends the existing contiguous array storage directly with `sendmsg()`
+scatter/gather I/O. A message consists of three segments: the framing/protocol
+header, the first array, and the second array. No decimal conversion or packed
+array copy occurs on the sender. Partial sends advance across segment boundaries.
+Input datasets stay alive until all sends finish.
+
+The 16-byte network-order envelope contains payload length and iteration number.
+The binary header contains a magic/version word, message kind, identities,
+dimensions, and array counts, all as big-endian uint64 fields. Expert messages
+have 13 header words; x3/x4 messages have 14. Arrays follow immediately:
+
+| Message | First array | Second array |
+|---|---|---|
+| Expert metadata | Little-endian `int32` offsets | Little-endian `int32` indices |
+| x3/x4 | Little-endian `uint64` x3 indices | `uint8` x4 masks |
+
+The x3 width matches the existing CPU `vector<size_t>` representation. Binary
+mode explicitly requires little-endian hosts with 64-bit `size_t` (the target
+Hopper hosts satisfy this). It does not transmit raw C++ structs or pointers.
+Header/count/length checks run before allocations and array access. The receiver reads the fixed-size header first, checks its counts and envelope
+length, and receives each array directly into source-specific typed vectors.
+Their capacities are reserved once before warmup and retained across iterations.
+There is no full binary payload buffer and no payload-to-vector `memcpy`.
+Ordinary TCP still copies from kernel socket storage into application memory;
+this is not kernel-bypass or zero-copy networking.
+
+Expert index capacity is conservatively reserved at `num_tokens * top_k` entries
+per source, offsets at `experts_per_gpu + 1`, and x3/x4 at `num_tokens` each.
+This trades memory capacity for avoiding per-iteration reallocation. Vector
+lengths still change to match each message, and growth within reserved capacity
+can zero-initialize newly exposed elements. That work remains measured.
+Incomplete or invalid messages never reach computation/verification; validation
+runs only after both arrays finish arriving, before the exchange completes.
+
+Text mode uses production `router_expert_metadata_v1` / `router_x3_x4_v2` bodies
+with the same iteration envelope. All ranks must choose the same wire format;
+configuration exchange checks this before measurements. Neither benchmark mode
+is a wire-compatible endpoint for a running production proxy.
+
+A single nonblocking C++ `poll()` loop progresses sending and receiving on both
+metadata paths. They can overlap on the network; native header preparation/serialization and
+decoding execute serially on each proxy thread. Socket addresses use IPv4. Received expert lists are validated
+and attached to source-specific CPU records, including zeroed head/tail state.
+Received x3/x4 are validated, retained, and used to construct receive-chunk
+descriptions with the same fields as `compute_chunks_from_token_indices()`.
+No GPU `A_idx` allocation, gather-table publication, or H2D copy occurs.
+
+## Timing and output
+
+Each iteration has this sequence:
+
+1. Barrier on separate control sockets, outside timing.
+2. Start a local monotonic timer.
+3. Prepare binary headers, or serialize outgoing text in text mode.
+   `--preserialized` moves this preparation outside timing.
+4. Copy the self expert table; frame and exchange peer messages.
+5. Decode, validate, and install all received CPU metadata.
+6. Stop after all local sends and all local installations complete.
+7. Gather timing records and release all ranks, outside timing.
+
+Connection setup, CPU routing generation, warmup, result aggregation, logging,
+and disposal of the installed records after the iteration are excluded.
+Serialization, framing, poll descriptor setup, receive buffering, parsing, validation,
+self installation, and receive-chunk construction are included. Binary metadata records and typed storage are reused in place. Text-mode records
+are rebuilt; receive-chunk descriptors are still rebuilt in both modes.
+
+The report identifies `backend: "cpp"` and `wire_format: "binary"` or `"text"` (in configuration),
+and contains all measured per-rank/per-iteration records and:
+
+- `critical_rank_ms`: statistics of the **maximum rank-local elapsed time** for
+  each iteration (minimum, mean, median, nearest-rank p95/p99, maximum).
+- `critical_rank_stage_ms`: stage statistics from the same slowest-total-time
+  rank selected in each iteration, printed to the console as well as saved.
+  These are not independently selected stage maxima from different ranks.
+- `rank_summaries`: per-rank elapsed and stage statistics.
+- `sent_bytes` / `received_bytes`: wire bytes, including the 16-byte benchmark
+  envelopes but excluding handshakes and control traffic.
+- Installed expert and x3/x4 source counts for each rank.
+
+Every per-rank record contains five non-overlapping local wall-time stages:
+
+| Field | Included work |
+|---|---|
+| `serialize_ms` | Binary protocol-header construction or outgoing text serialization; cached-header/payload selection in pre-serialized mode |
+| `self_install_ms` | Local expert-table copy and construction of its CPU record |
+| `communication_prepare_ms` | Frame buffers, receive state, poll descriptor construction, deadline setup |
+| `tcp_exchange_ms` | Exchange-loop elapsed time excluding receive processing: socket waits, sends/receives, buffering, envelope checks, poll bookkeeping, and final completeness check |
+| `receive_process_ms` | Sum of incoming binary decoding or text parsing, validation, CPU installation, and receive-chunk construction |
+
+The five stages sum to `elapsed_ms` for each sample. For compatibility,
+`install_ms` remains the sum of `self_install_ms` and `receive_process_ms`;
+do not add it again. `tcp_exchange_ms` is computed as the exchange-loop interval
+minus the accumulated receive processing intervals; it includes C++/OS
+overhead and waiting for remote CPU work, not just network transfer latency.
+Instrumentation overhead is included in the measured stages.
+
+Stage means for the critical-rank records sum to the mean total. Their medians
+and percentiles generally do not sum, because each statistic can select different
+iterations. Network transfer can progress while another rank processes metadata;
+the stage split describes local wall time, not globally exclusive activities.
+
+### Receive-processing breakdown
+
+The console and JSON also report `critical_rank_receive_process_ms`, using the
+same slowest-total-time rank in each iteration. Per-rank summaries and individual
+records contain `receive_process_breakdown_ms`. These nine substages sum to
+`receive_process_ms` for each sample:
+
+| Field | Included work |
+|---|---|
+| `expert_deserialize_ms` | Binary header decoding, reserved-vector resizing, and array validation; or production text parsing/allocation/validation |
+| `expert_validate_ms` | Additional source/destination/topology checks and per-expert index ordering checks |
+| `expert_record_install_ms` | Text mode moves vectors into the source map; binary mode already receives into that record, so this boundary has only instrumentation overhead |
+| `expert_progress_init_ms` | Text mode allocates head/tail vectors and inserts a record; binary mode zeroes existing counters |
+| `x3x4_deserialize_ms` | Binary header decoding, reserved-vector resizing, and array validation; or production text parsing/allocation/validation |
+| `x3x4_validate_ms` | Additional source/destination/topology and tensor/chunk-configuration checks |
+| `chunk_build_ms` | `compute_chunks_from_token_indices()`: descriptor allocation/filling and copies of per-chunk source-token-index lists |
+| `x3x4_record_install_ms` | Stores/replaces chunk descriptors; text mode also moves parsed x3/x4 vectors into a new source record |
+| `overhead_ms` | Remaining time inside the parent receive-processing interval, including function entry/exit, temporary cleanup, and timing bookkeeping |
+
+The `*_deserialize_ms` names are retained in both modes. In binary mode they
+measure fixed-header decoding, resizing within reserved vector capacity, and validation;
+there is no decimal parsing. In text mode, validation and allocation are
+interleaved inside the production deserializers and remain timed as a unit. The explicit `*_validate_ms` fields cover only the additional checks after
+deserialization. Timers do not change the validation policy or wire format.
+Self installation is excluded from this breakdown and remains `self_install_ms`.
+Single-node runs have zero x3/x4 and chunk-build times because no such messages
+are exchanged. Rebuild the shared library on both nodes before rerunning; report
+configuration `timing_schema: 9` identifies the current instrumentation version.
+
+The maximum rank-local duration needs no synchronized clocks. It is not an exact
+global makespan: barrier-release and OS scheduling skew can influence it. A send
+finishing only means the local socket accepted its bytes; the corresponding
+receiver's measured interval includes installation. The post-exchange collective
+ensures all ranks have finished before another iteration starts.
+
+To exclude sender serialization, run both nodes with:
+
+```bash
+bash ./run_node0_torchrun.sh --preserialized
+bash ./run_node1_torchrun.sh --preserialized
+```
+
+In this mode binary headers or text payloads are precomputed; framing, socket
+I/O setup, and all receiver work remain timed. Binary arrays are already in DRAM
+in either mode, so `--preserialized` saves only small-header preparation for binary. `serialize_ms` is then only the negligible cached-payload selection cost.
+Do not interpret total time minus parsing time as pure network latency: work
+overlaps across ranks and socket progress includes C++ and OS overhead.
+
+## Scope of comparisons
+
+This measures a proposed repeated-exchange path. Unlike current initialization,
+TCP connections persist and x3/x4 is not separated from expert exchange by RDMA
+setup. Expert peers also progress concurrently rather than following the current
+sequential outgoing send loop. The production metadata generation/serialization
+and chunk-building code is reused, but this standalone transport and CPU record
+installation are benchmark implementations, not the full production proxy.
+
+All metadata arrays are native C++ vectors. Self installation copies the local
+expert vectors and initializes progress counters. Binary arrays are received into reusable source records and validated there;
+text-mode vectors are moved into records after parsing. Binary framing references the original arrays and copies only the small header;
+text mode still copies framed payloads and converts integers to/from text.
+Reference-only self installation remains a possible future optimization.
+GPU routing, D2H/H2D copies, and GPU scheduler initialization remain excluded.
+Compare C++ reports with prior Python reports as separate implementations; the
+Python selector implementation has been replaced by native `poll()`.
+
+Use `--verify` on both nodes to regenerate expected source-specific metadata in
+C++ before timing and check every received expert/x3/x4 table after timing.
+This is for correctness checks, not performance runs: it consumes extra memory
+and CPU and changes cache state, although verification itself is outside timing.
+
+## Local correctness tests
+
+```bash
+ctest --test-dir build --output-on-failure
+python3 -m unittest discover -s . -p 'test_benchmark.py' -v
+```
+
+Build the library first. Native codec tests check binary/text equivalence,
+malformed payload rejection, and partial scatter/gather sends. Subprocess tests
+cover both wire formats and empty arrays. Additional tests check expert membership after resolving compact indices, empty expert
+lists, malformed metadata rejection, chunk construction, and real subprocess
+exchanges through the Python wrapper and C++ library. The small native runs
+use `--verify`; an additional test checks native timeout propagation to Python.
+Transport smoke tests use four same-node ranks and two logical nodes
+with two ranks each, including pre-serialized mode. Both logical nodes use
+`127.0.0.1`, with `--node-port-stride=2` giving them distinct port ranges.
+The default stride is zero for real separate hosts.
+An additional test runs all 16 proxies with 20,480 tokens, 128 experts, and top-8.
+They need permission to bind loopback sockets. They do not measure remote-network
+performance and do not require torchrun.
+
+For a single-node torchrun smoke test:
+
+```bash
+torchrun --standalone --nproc_per_node=4 benchmark.py \
+  --hosts=127.0.0.1 --num-tokens=137 --num-experts=16 --top-k=4 \
+  --datasets=2 --warmup=1 --iterations=3 --output=/tmp/router_metadata_smoke.json
+```
+
+Run `python3 benchmark.py --help` for all benchmark arguments.
+
+`python_reference.py` is an independent metadata oracle for unit tests only;
+it is not imported by the benchmark worker.
+
+For a comparison, run both nodes once with the default binary mode and once with
+`--wire-format=text`, using different output paths. For example, on node 0:
+
+```bash
+RESULT_JSON=results/binary.json bash ./run_node0_torchrun.sh --wire-format=binary
+RESULT_JSON=results/text.json bash ./run_node0_torchrun.sh --wire-format=text
+```
+
+Run node 1 with the matching mode for each run. Upgrade/rebuild the library on
+both nodes: the Python/native C ABI is now version 7. Reports identify the wire
+format; timing field names remain stable for comparisons.
+
+For direct binary reception, time inside socket `recv()` calls belongs to
+`tcp_exchange_ms`. Header decoding/vector-length preparation and completed-array
+validation belong to the corresponding `*_deserialize_ms` field. The latter now
+sums work before and after the array transfers; it excludes waiting for bytes.
+`configuration.receive_storage` is `direct_reusable_vectors` for binary and
+`payload_buffer` for text. The binary wire format is unchanged; the current wrapper requires C ABI
+version 7. Rebuild both nodes for comparable timing/schema reports. Native tests check
+that receive-array addresses stay stable across changing routing datasets.
+
+### Isolated expert index-bounds scan
+
+In binary mode, `critical_rank_expert_index_bounds_ms` reports the time spent
+inside the existing `std::all_of` scan checking `0 <= index < num_tokens` for
+received expert indices. It uses the same slowest-total-time rank as the other
+critical-rank summaries. `expert_index_bounds_ms` is also present in each rank
+summary and per-iteration record.
+
+This is a **nested subcomponent of `expert_deserialize_ms`**, not an additional
+stage: do not add it to the receive-stage or total-stage sums. It excludes offset
+checks, header decoding, vector resizing, per-expert sorted-order checks, and
+error-message handling. No validation is skipped or duplicated. The measurement
+contains timer overhead; very short or empty scans may have zero measured duration.
+
+For the mean on the selected critical ranks, divide
+`critical_rank_expert_index_bounds_ms.mean` by
+`critical_rank_receive_process_ms.expert_deserialize_ms.mean` to estimate the
+fraction attributable to this scan. Text mode reports zero for the isolated
+field because its checks remain interleaved with parsing in the unchanged
+production deserializer; zero there means **not separately measured**.
+Rebuild on both nodes. The nested timing is also included in current `timing_schema: 7` reports.
+
+### Disable the two expert-index scans
+
+For binary-mode measurements, append this option on **both nodes**:
+
+```bash
+# Node 0
+bash ./run_node0_torchrun.sh --disable-expert-index-validation
+# Node 1
+bash ./run_node1_torchrun.sh --disable-expert-index-validation
+```
+
+This skips only the expert index-bounds scan (`0 <= index < num_tokens`) and
+per-expert sorted-order scans. Header, identity, topology, byte-length, capacity,
+and expert-offset checks remain enabled, as do x3/x4 checks. Validation is on
+by default. The option is binary-only: text mode keeps using the unchanged
+production deserializer and rejects this option rather than partially applying it.
+
+Console and JSON reports include `expert_index_validation_enabled: false`.
+`expert_index_bounds_ms` becomes exactly zero. `expert_deserialize_ms` still
+includes header/length handling and offset validation; `expert_validate_ms`
+still includes identity/configuration checks, so neither parent stage should
+be expected to become zero. If `--verify` is also enabled, exact-content checks
+still run outside the timed interval.
+
+Rebuild on both nodes before using the updated wrapper (C ABI version 7):
+
+```bash
+cmake --build build -j
+```
+
+This option changes only the benchmark. Production proxy validation
+and metadata exchange are unchanged.
+
+### Exchange completion and polling diagnostics (timing schema 5)
+
+Rebuild the native library on both nodes; update the wrapper as well (current C ABI version 7). No additional
+command-line flag is needed to collect diagnostics. The console and JSON now include
+`critical_rank_exchange_diagnostics`. Each iteration's diagnostics come from
+that iteration's slowest-total-time rank, just like the existing stage report.
+The JSON also contains `exchange_diagnostics` in individual records and in
+per-rank statistical summaries.
+
+| Field | Meaning |
+|---|---|
+| `local_expert_complete_ms` | Time until all other same-node expert tables are installed, through shared memory or TCP according to the selected mode; excludes self installation |
+| `remote_expert_complete_ms` | Time until all cross-node expert tables are installed |
+| `remote_x3x4_complete_ms` | Time until all remote x3/x4 tables and their receive chunks are installed |
+| `socket_sends_complete_ms` | Time until all metadata socket sends finish; means the local sockets accepted the bytes, not that peers installed them |
+| `poll_ms` | Accumulated wall time inside exchange-loop `poll()` calls, including zero-timeout calls and interrupted calls |
+| `poll_calls` | Number of exchange-loop `poll()` calls |
+| `poll_zero_returns` | Number of calls returning zero (no ready descriptors) |
+
+The four completion times share one origin: the start of the exchange stage,
+**after** serialization, self installation, and communication preparation, but
+**before** shared-memory publication. Each receive completion includes that
+path's validation and installation. A path with no peers has value zero.
+They overlap: do not sum them or add them to the existing stages. The latest
+completion in an individual record identifies the last completed path on that
+rank. Compare individual records as well as summary statistics; marginal
+medians/p95 values can come from different iterations.
+
+`poll_ms` is already included in `tcp_exchange_ms` / `exchange_ms`. It measures
+both waiting and the cost of polling; it is not pure network latency. The
+counters exclude connection setup and control collectives. A shared-memory-only
+exchange has zero socket polling, even if it spends time checking local sequence
+counters. Additional timestamps/counters add some measured overhead, so rebuild
+and rerun both transport modes for an instrumentation-matched comparison.
+
+
+### Socket I/O diagnostics and optional receive draining (timing schema 6)
+
+Update `benchmark.py` and rebuild the native library on **both nodes** (ABI 7).
+The new diagnostics are always collected, including in the unchanged default
+one-receive-step-per-socket mode. Enable the alternative with `--receive-drain`
+on both nodes; it supports binary and text modes, with or without local shared
+memory. Each readable socket advances through envelope, protocol header, and
+array/body reception until completion, a would-block/interrupted receive, or its
+step budget. The default budget is 16; `--receive-drain-max-steps=N` accepts
+1..1024. Each step performs at most one receive call and body/array calls remain
+capped at 256 KiB. After exhausting the budget, the loop services other sockets
+and returns to polling. Socket sends retain their existing progression.
+
+For an A/B comparison, rebuild once and run both modes with separate reports:
+
+```bash
+# Node 0: baseline, followed by draining in a separate two-node run
+RESULT_JSON=results/io_baseline.json bash ./run_node0_torchrun.sh \
+  --local-shared-memory --disable-expert-index-validation
+RESULT_JSON=results/io_drain.json bash ./run_node0_torchrun.sh \
+  --local-shared-memory --disable-expert-index-validation --receive-drain
+
+# Node 1: use the matching command for each run
+bash ./run_node1_torchrun.sh --local-shared-memory --disable-expert-index-validation
+bash ./run_node1_torchrun.sh --local-shared-memory --disable-expert-index-validation --receive-drain
+```
+
+The console/JSON `critical_rank_exchange_diagnostics` and corresponding per-rank
+records/summaries now also contain:
+
+| Fields | Meaning |
+|---|---|
+| `sendmsg_ms`, `recv_ms` | Accumulated wall time around the actual metadata socket system calls, including unsuccessful attempts; excludes segment construction, parsing, and validation |
+| `sendmsg_calls`, `recv_calls` | Number of metadata socket calls |
+| `sendmsg_would_block`, `recv_would_block` | Calls returning EAGAIN or EWOULDBLOCK |
+| `sendmsg_interrupted`, `recv_interrupted` | Calls returning EINTR, counted separately from would-block |
+| `shm_publish_ms` | Writing all local destination slices and counts, producer bookkeeping, and release publication; includes the shared-memory payload copies |
+| `shm_receive_copy_ms` | Copies of shared offsets/indices into receiver vectors; excludes resizing, validation, and installation |
+| `receive_budget_yields` | Draining visits that exhaust their step budget with an incomplete message and no would-block/interruption on the last step; zero with draining disabled |
+| `exchange_other_ms` | Residual exchange time after subtracting poll, socket calls, shared publication, and shared receive copies |
+
+For every record, these **non-overlapping durations** sum to `exchange_ms`
+(the legacy `tcp_exchange_ms` alias):
+
+```text
+poll_ms + sendmsg_ms + recv_ms + shm_publish_ms
+        + shm_receive_copy_ms + exchange_other_ms
+```
+
+Receive processing remains a separate stage. The residual includes readiness
+scans, framing checks, iovec construction, loop work, instrumentation bookkeeping,
+and scheduling delays outside the measured calls. System-call durations are wall
+time, not pure CPU cost or network latency. All diagnostic overhead is measured;
+compare baseline and draining using the same build. The existing completion
+milestones still overlap these durations and must not be added to them.
+
+Configuration records `receive_drain` and `receive_max_steps_per_socket`
+(effective budget, 1 when disabled). The ABI change rejects older native libraries
+in the Python wrapper. Tests exercise both receive modes, small budgets, empty
+arrays, text/binary messages, local-only/hybrid exchanges, the default 16-proxy
+workload, and nonblocking partial-I/O/backpressure counters.
+
+
+### Same-index TCP aggregation (timing schema 7, ABI 7)
+
+`--same-index-aggregation` enables binary aggregation and automatically enables
+local shared memory. Update the Python wrapper and rebuild the native library
+on **both nodes**. It is opt-in; omit it to retain the previous transport.
+Text mode is rejected. All ranks must use matching options.
+
+```bash
+# Build from this directory on both nodes
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+# Node 0
+RESULT_JSON=results/aggregate.json bash ./run_node0_torchrun.sh \
+  --same-index-aggregation --disable-expert-index-validation --receive-drain
+
+# Node 1
+bash ./run_node1_torchrun.sh \
+  --same-index-aggregation --disable-expert-index-validation --receive-drain
+```
+
+For each remote node, source proxy i sends **one message to proxy i** containing
+expert offsets/indices for every destination GPU on that node, followed by x3/x4.
+The message references the existing source arrays with up to 19 scatter/gather
+segments (including its header); there is no contiguous sender payload packing.
+There is one full-duplex metadata connection per matching-rank pair per node
+pair, and no separate x3/x4 connection. With two nodes and eight GPUs, this means
+8 cross-node metadata connections globally instead of 72, and one outgoing
+message per proxy instead of nine. Control connections remain separate.
+The implementation also supports more than two nodes.
+
+The iteration envelope and aggregate header identify source, destination node,
+topology, tensor/chunk dimensions, every destination index count, and x3 length.
+The receiver checks identities, counts, and total payload length before directing
+socket reception into its source-specific shared-memory arena. The body contains
+all destination offset arrays, all destination index arrays, uint64 x3, and uint8
+x4. Each arena has exactly one ingress writer and one immutable destination slice
+per consumer. All payload bytes must arrive before a release-store publishes the
+iteration sequence. Incomplete messages are never published.
+
+Every local proxy acquires the publication and copies its expert slice into its
+existing source-specific vectors, including the ingress proxy's own slice.
+Validation and progress initialization retain their existing policy. Expert
+slices are published before the ingress proxy copies/validates x3/x4 and builds
+receive chunks. That allows other local proxies to consume expert metadata while
+chunk construction runs. The ingress proxy consumes its own expert slice on a
+subsequent exchange-loop pass. The existing global completion barrier prevents
+arena reuse while any consumer still reads the previous iteration.
+
+Shared arenas are allocated and prefaulted before measurements, using the same
+unique run identity, mapping barrier, early unlink, and RAII teardown as the
+local-only shared transport. Aggregation reserves one arena per source rank;
+default two-node shared storage is approximately 12.8 MiB **per node**. Local
+workers must share a POSIX shared-memory namespace. Network bytes are received
+directly into these arenas; ordinary socket reception still performs the kernel
+to user-memory copy. The extra shared-memory-to-record copies are timed.
+
+The report identifies `same_index_aggregation: true`,
+`receive_storage: "shared_aggregate_arenas"`, and
+`metadata_tcp_channels_per_rank` (1 for the default two-node aggregate run).
+Existing socket counters report actual calls: one message is not a guarantee of
+one send or receive syscall. The 256 KiB receive cap and partial I/O may require
+multiple body calls. `--receive-drain` and `--preserialized` both remain supported.
+Pre-serialization caches only aggregate headers; all transfers and consumer copies
+remain timed.
+
+In this mode, `shm_sent_bytes` counts expert-array bytes **published for local
+consumers**, including remotely received slices, and `shm_received_bytes` counts
+consumer expert-array copies. These logical shared-distribution bytes balance
+across ranks; they do not represent an additional producer memcpy for the remote
+payload. TCP wire-byte counts include the aggregate header/envelope. The x3/x4
+copy from the ingress arena belongs to `x3x4_deserialize_ms`; expert consumer
+copies belong to `shm_receive_copy_ms`. Aggregate-header decoding is also included
+in `x3x4_deserialize_ms`. The release publication of remote expert slices is part
+of `exchange_other_ms`; `shm_publish_ms` still measures local-source publication.
+Completion milestones retain their meanings: `remote_expert_complete_ms` waits
+for installation from **all remote source ranks**, not just the same-index peer.
+
+Use `--verify` on all ranks for content checks outside timing. Tests cover
+changing datasets, empty destination slices, eight-destination source-specific
+oracles, multiple remote nodes, single-GPU nodes, partial 19-segment sends,
+malformed aggregate headers, and both aggregate receive progression modes.
+Compare performance against the non-aggregated transport using the same build,
+CPU placement, workload, and validation settings.
+
+While any shared expert slice is pending, including slices published by other
+ingress proxies, the aggregate exchange scans shared sequence counters and uses
+nonblocking socket polls. This avoids sleeping through a shared-memory-only
+publication but can increase CPU use while remote arrivals are pending. Keep CPU
+placement consistent when evaluating the latency change.
+
+### Publication, observation, and readiness scans (timing schema 8)
+
+Rebuild on both nodes and run the same commands; these diagnostics are always
+collected. The C ABI is now 7. Upgrade all workers together because the shared
+arena layout and internal timing-record format have changed.
+
+Each per-rank iteration record now contains `exchange_start_ns` and a
+`shared_source_observations` array, with one entry per consumed shared expert
+slice. Each entry identifies `source_rank` and `ingress_rank` and includes:
+
+| Field | Meaning |
+|---|---|
+| `ingress_exchange_start_ns` | Ingress proxy's exchange-stage start |
+| `receive_complete_ns` | Ingress detects that the entire aggregate body has arrived; zero for locally generated metadata |
+| `publish_ns` | Timestamp immediately before the release-store publishing the slice |
+| `observe_ns` | Consumer's first successful acquire observation of this iteration |
+| `install_complete_ns` | Consumer has copied, validated, and installed the expert slice |
+| `ingress_receive_complete_ms` | Aggregate arrival relative to the ingress proxy's exchange start; remote sources only |
+| `receive_to_publish_ms` | Time from aggregate arrival detection to publication timestamp; remote sources only |
+| `publish_from_consumer_start_ms`, `observe_from_consumer_start_ms`, `install_from_consumer_start_ms` | Each event relative to the consuming proxy's exchange start |
+| `observation_delay_ms` | Observation minus publication timestamp |
+| `consume_delay_ms` | Installation completion minus observation |
+
+These timestamps use **CLOCK_MONOTONIC on the receiving host**. No sender clock
+is used, and timestamps from different physical nodes must not be subtracted.
+The publication time relative to a consumer's start can be negative when another
+local process publishes before that consumer starts its exchange. Raw nanosecond
+values are integer timestamps, not durations. The sequence release/acquire makes
+the accompanying timestamp fields visible with the payload; the completion
+barrier protects them from overwrite.
+
+The publication timestamp precedes the release-store, so observation delay also
+includes any preemption between timestamp capture and that store. It should not
+be interpreted as a pure cache-coherence latency. Similarly, receive completion
+is the ingress thread's detection of completion, not a NIC arrival timestamp.
+
+Additional fields appear in `critical_rank_exchange_diagnostics`, per-rank
+summaries, and individual records:
+
+| Field | Meaning |
+|---|---|
+| `shm_scan_ms` | Total readiness-scan wall time, excluding intervals consuming ready slices |
+| `shm_scan_after_socket_ms` | Subset of scan time after this proxy has completed all its own sends and incoming socket installations |
+| `shm_scan_passes`, `shm_scan_after_socket_passes` | Total scan passes and the subset after socket work finishes |
+| `shm_sequence_checks`, `shm_not_ready_checks` | Acquire checks and checks that did not see this iteration |
+| `remote_observation_delay_max_ms` | Largest publication-to-observation delay among remote-source slices consumed in this iteration |
+| `remote_consume_delay_max_ms` | Largest observation-to-installation delay among remote-source slices consumed in this iteration |
+| `socket_work_complete_ms` | Completion of all local socket transfers and incoming socket installation, relative to exchange-stage start; zero if there are no socket channels |
+
+Scan time includes scanning completed/ineligible source entries and bookkeeping,
+but excludes ready-slice copying, validation, installation, and per-source
+observation recording. It is a **subset of `exchange_other_ms`**, not an additional
+stage. After-socket scan time is a subset of total scan time. Maximum-delay fields
+are zero if no remote slices are distributed through shared memory. They can
+refer to different source ranks; consult the per-source records for attribution.
+
+To diagnose the last-finishing remote source, select the entry with the largest
+`install_from_consumer_start_ms` among remote sources in the critical-rank record.
+Its publish, observe, and install times separate late ingress publication from
+late consumer observation and consumption. Join `ingress_rank` to the same
+iteration's rank record to inspect that ingress proxy's socket timings. Console
+summaries expose the maxima and scan totals; retain the full JSON report for this
+per-source analysis. All timestamp/counter overhead remains included in timings.

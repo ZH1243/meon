@@ -1,0 +1,189 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace rdma_proxy {
+
+enum class DataType {
+    kBF16,
+    kFP16,
+    kFP32,
+};
+
+enum class NvlinkForwardNotificationFlagUpdateMode {
+    kMemcpy,
+    kStreamWrite,
+};
+
+struct PeerAddress {
+    int node_rank{-1};
+    std::string host;
+    uint16_t port{0};
+};
+
+struct NvlinkForwardDestination {
+    int gpu_index{-1};
+    int cuda_device_id{-1};
+    uint64_t buffer_addr{0};
+    std::size_t buffer_bytes{0};
+};
+
+struct ProxyConfig {
+    int node_rank{0};
+    int num_nodes{1};
+    int local_gpu_index{0};
+    int num_gpus_per_node{8};
+    std::size_t num_tokens{0};
+    std::size_t token_dimension{0};
+    std::size_t tokens_per_chunk{1};
+    int num_qps_per_peer{1};
+    // Opt-in two-node RDMA-only QP selection before measured iterations.
+    bool rdma_qp_calibration_enabled{false};
+    double min_bandwidth_gbps_needed{340.0};
+    int rdma_qp_calibration_warmup_iterations{2};
+    int rdma_qp_calibration_sample_iterations{5};
+    int rdma_qp_calibration_max_attempts{10};
+    uint64_t rdma_qp_calibration_timeout_ms{300000};
+
+    std::string rdma_device_name;
+    std::string rdma_device_name2; // Empty preserves the single-device path.
+    uint8_t rdma_port2{0}; // Zero inherits rdma_port.
+    int gid_index2{-2}; // -2 inherits gid_index; -1 disables global addressing.
+    uint8_t rdma_port{1};
+    int gid_index{-1};
+    int cuda_device_id{0};
+    uint16_t listen_port{18515};
+    uint16_t connection_manager_port{18515};
+
+    int completion_poll_batch_size{16};
+    int data_signal_interval{1};
+    int max_in_flight_chunks_per_qp{1};
+    bool rdma_chunk_per_token_sge_enabled{false};
+    bool rdma_discontinuous_token_payload_enabled{false};
+    bool router_routing_enabled{false};
+    bool router_weighted_contributions_enabled{false};
+    int router_num_experts{0};
+    int router_top_k{0};
+    uint64_t router_seed{1234};
+    uint16_t router_metadata_port_base{19515};
+    int send_queue_depth{128};
+    int recv_queue_depth{128};
+    int cq_depth{256};
+    std::size_t num_iterations{1};
+    uint64_t completion_timeout_ms{30000};
+
+    DataType dtype{DataType::kBF16};
+    bool mock_mode{false};
+    bool fill_test_data{true};
+    bool validate_data{true};
+    bool sequential_peer_transfers{false};
+    // Prime the first sequential remote transfer before draining the local
+    // router-staging source. Remote NVLink forwarding remains gated behind
+    // completion of the local source.
+    bool local_forwarding_rdma_overlap_enabled{false};
+    bool nvlink_forwarding_enabled{false};
+    // Opt-in CPU preparation pipeline. n must be chosen explicitly; legacy
+    // thresholds are ignored in this mode (including local staging batches).
+    bool nvlink_forward_preparation_enabled{false};
+    bool nvlink_forward_ping_pong2_enabled{false};
+    // One copy submitter and one ordered epilogue consumer; shared ring depth.
+    bool nvlink_forward_submit_epilogue_enabled{false};
+    // Route local staging through the same prepared ring, before remote batches.
+    bool nvlink_forward_local_staging_prepared_enabled{false};
+    bool nvlink_forward_prepared_atomic_ring_enabled{false};
+    std::string nvlink_forward_completion_mode{"stream_sync"};
+    bool nvlink_forward_prepared_nvtx_enabled{false};
+    std::size_t nvlink_forward_prepared_batch_chunks{0};
+    std::size_t nvlink_forward_prepared_queue_depth{2};
+    std::size_t nvlink_forward_threshold_tokens{0};
+    std::size_t nvlink_forward_threshold_chunks{0};
+    std::size_t nvlink_forward_min_threshold_chunks{0};
+    std::size_t nvlink_forward_max_threshold_chunks{0};
+    bool nvlink_forward_out_of_order_chunks_enabled{false};
+    std::size_t nvlink_forward_chunk_tokens{0};
+    bool nvlink_forward_use_batch_api{true};
+    bool nvlink_forward_stream_nonblocking{true};
+    bool nvlink_forward_synchronize_batches{false};
+    bool nvlink_forward_completion_notifications_enabled{false};
+    bool nvlink_return_completion_notifications_enabled{false};
+    // Align same-node return submissions: one column group to every local peer.
+    bool nvlink_return_local_batch_sync_enabled{false};
+    bool nvlink_return_ready_gpu_publication_enabled{false};
+    bool nvlink_forward_notification_flush_only_enabled{false};
+    bool nvlink_forward_notification_flush_per_entry_enabled{false};
+    // Readiness scheduling is independent of per-entry/coalesced publication.
+    // complete_round waits for explicit completion knowledge from every source.
+    std::string nvlink_forward_notification_scheduling_mode{"per_notification"};
+    bool nvlink_forward_notification_scheduling_diagnostics{false};
+    // Limit QuACK's gather inputs to remote-node buffers. Cross-local-GPU
+    // inputs are populated by NVLink forwarding; same-local-GPU inputs alias
+    // the corresponding direct RDMA receive buffers.
+    bool router_computation_forwarded_inputs_only{false};
+    // Populate the otherwise-unused local-node source descriptors from the
+    // shared router send buffer and include them in the QuACK input set.
+    bool router_local_input_staging_enabled{false};
+    // Request receiver publication of the already-staged own-GPU input at
+    // iteration activation, concurrently with forwarding. Other sources still
+    // need copy-completion notifications.
+    bool router_local_input_early_ready_enabled{false};
+    NvlinkForwardNotificationFlagUpdateMode
+        nvlink_forward_notification_flag_update_mode{
+            NvlinkForwardNotificationFlagUpdateMode::kStreamWrite};
+    // QuACK MMA M tile, not rows per CTA. SM100 two-CTA MMA splits this
+    // across a CTA pair; expert_gemm_cluster_rows() defines descriptor capacity.
+    std::size_t expert_gemm_m_tile{128};
+    int expert_gemm_device_capacity{9};
+    std::size_t expert_gemm_n_tile{256};
+    std::size_t expert_gemm_dimension{8192};
+    std::size_t expert_gemm_cluster_m{1};
+    std::size_t expert_gemm_max_swizzle_size{8};
+    // Receiver ring entries; also pending dispatch batches in ping-pong/prepared modes.
+    std::size_t nvlink_forward_notification_queue_depth{1024};
+    bool nvlink_forward_notification_log_enabled{false};
+    std::string nvlink_forward_notification_log_dir{"/tmp/rdma_cpu_proxy_nvlink_notifications"};
+    bool nvlink_forward_local_batch_sync_enabled{false};
+    // Alternate remote router batches between two submitters on one stream.
+    bool nvlink_forward_ping_pong_enabled{false};
+    // One-based index of the copy API call that triggers the next submitter.
+    std::size_t nvlink_forward_ping_pong_handoff_copy{1};
+    bool nvlink_forward_synchronize_iteration{true};
+    bool nvlink_forward_log_batches{false};
+    bool log_qp_reports{false};
+    bool log_marker_wait_reports{false};
+    bool nvlink_forward_use_round_robin{false};
+    double nvlink_routing_probability{0.5};
+    uint64_t nvlink_routing_seed{1};
+    std::string nvlink_forward_exchange_dir{"/tmp/rdma_cpu_proxy_nvlink"};
+    bool local_iteration_sync_enabled{false};
+    std::string local_iteration_sync_dir{"/tmp/rdma_cpu_proxy_local_iteration_sync"};
+    std::string local_iteration_sync_run_id;
+    std::string rdma_bandwidth_summary_dir{"/tmp/rdma_cpu_proxy_results"};
+    std::string cpu_affinity;
+    std::string log_level{"info"};
+    std::vector<PeerAddress> peers;
+    std::vector<NvlinkForwardDestination> nvlink_forward_destinations;
+};
+
+std::size_t dtype_size(DataType dtype);
+std::string to_string(DataType dtype);
+DataType dtype_from_string(const std::string& value);
+std::string to_string(NvlinkForwardNotificationFlagUpdateMode mode);
+NvlinkForwardNotificationFlagUpdateMode
+nvlink_forward_notification_flag_update_mode_from_string(
+    const std::string& value);
+bool nvlink_forward_dynamic_threshold_enabled(const ProxyConfig& config);
+std::size_t effective_nvlink_forward_threshold_tokens(const ProxyConfig& config);
+bool effective_rdma_chunk_per_token_sge_enabled(const ProxyConfig& config);
+bool effective_rdma_discontinuous_token_payload_enabled(const ProxyConfig& config);
+std::size_t expert_gemm_cta_m_tile(const ProxyConfig& config);
+std::size_t expert_gemm_cluster_rows(const ProxyConfig& config);
+
+ProxyConfig load_config_file(const std::string& path);
+ProxyConfig load_config(int argc, char** argv);
+void validate_config(const ProxyConfig& config);
+std::string config_summary(const ProxyConfig& config);
+
+}  // namespace rdma_proxy

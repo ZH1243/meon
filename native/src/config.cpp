@@ -1,0 +1,1503 @@
+#include "config.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <limits>
+#include <map>
+#include <sstream>
+#include <stdexcept>
+#include <variant>
+
+namespace rdma_proxy {
+namespace {
+
+struct Json {
+    using Object = std::map<std::string, Json>;
+    using Array = std::vector<Json>;
+    std::variant<std::nullptr_t, bool, double, std::string, Object, Array> value;
+};
+
+class JsonParser {
+public:
+    explicit JsonParser(std::string input) : input_(std::move(input)) {}
+
+    Json parse() {
+        auto json = parse_value();
+        skip_ws();
+        if (pos_ != input_.size()) {
+            throw std::runtime_error("unexpected trailing characters in JSON config");
+        }
+        return json;
+    }
+
+private:
+    Json parse_value() {
+        skip_ws();
+        if (pos_ >= input_.size()) throw std::runtime_error("unexpected end of JSON");
+        const char c = input_[pos_];
+        if (c == '{') return Json{parse_object()};
+        if (c == '[') return Json{parse_array()};
+        if (c == '"') return Json{parse_string()};
+        if (c == 't') return parse_literal("true", Json{true});
+        if (c == 'f') return parse_literal("false", Json{false});
+        if (c == 'n') return parse_literal("null", Json{nullptr});
+        if (c == '-' || std::isdigit(static_cast<unsigned char>(c))) return Json{parse_number()};
+        throw std::runtime_error("invalid JSON value");
+    }
+
+    Json::Object parse_object() {
+        expect('{');
+        Json::Object object;
+        skip_ws();
+        if (peek('}')) {
+            ++pos_;
+            return object;
+        }
+        while (true) {
+            skip_ws();
+            const auto key = parse_string();
+            skip_ws();
+            expect(':');
+            object.emplace(key, parse_value());
+            skip_ws();
+            if (peek('}')) {
+                ++pos_;
+                break;
+            }
+            expect(',');
+        }
+        return object;
+    }
+
+    Json::Array parse_array() {
+        expect('[');
+        Json::Array array;
+        skip_ws();
+        if (peek(']')) {
+            ++pos_;
+            return array;
+        }
+        while (true) {
+            array.push_back(parse_value());
+            skip_ws();
+            if (peek(']')) {
+                ++pos_;
+                break;
+            }
+            expect(',');
+        }
+        return array;
+    }
+
+    std::string parse_string() {
+        expect('"');
+        std::string out;
+        while (pos_ < input_.size()) {
+            const char c = input_[pos_++];
+            if (c == '"') return out;
+            if (c == '\\') {
+                if (pos_ >= input_.size()) throw std::runtime_error("invalid JSON escape");
+                const char e = input_[pos_++];
+                switch (e) {
+                    case '"':
+                    case '\\':
+                    case '/':
+                        out.push_back(e);
+                        break;
+                    case 'b':
+                        out.push_back('\b');
+                        break;
+                    case 'f':
+                        out.push_back('\f');
+                        break;
+                    case 'n':
+                        out.push_back('\n');
+                        break;
+                    case 'r':
+                        out.push_back('\r');
+                        break;
+                    case 't':
+                        out.push_back('\t');
+                        break;
+                    default:
+                        throw std::runtime_error("unsupported JSON escape sequence");
+                }
+            } else {
+                out.push_back(c);
+            }
+        }
+        throw std::runtime_error("unterminated JSON string");
+    }
+
+    double parse_number() {
+        const std::size_t begin = pos_;
+        if (peek('-')) ++pos_;
+        while (pos_ < input_.size() && std::isdigit(static_cast<unsigned char>(input_[pos_]))) ++pos_;
+        if (peek('.')) {
+            ++pos_;
+            while (pos_ < input_.size() && std::isdigit(static_cast<unsigned char>(input_[pos_]))) ++pos_;
+        }
+        if (peek('e') || peek('E')) {
+            ++pos_;
+            if (peek('+') || peek('-')) ++pos_;
+            while (pos_ < input_.size() && std::isdigit(static_cast<unsigned char>(input_[pos_]))) ++pos_;
+        }
+        return std::stod(input_.substr(begin, pos_ - begin));
+    }
+
+    Json parse_literal(const char* text, Json value) {
+        const std::string literal(text);
+        if (input_.compare(pos_, literal.size(), literal) != 0) {
+            throw std::runtime_error("invalid JSON literal");
+        }
+        pos_ += literal.size();
+        return value;
+    }
+
+    void skip_ws() {
+        while (pos_ < input_.size() && std::isspace(static_cast<unsigned char>(input_[pos_]))) ++pos_;
+    }
+
+    bool peek(char c) const {
+        return pos_ < input_.size() && input_[pos_] == c;
+    }
+
+    void expect(char c) {
+        skip_ws();
+        if (!peek(c)) {
+            throw std::runtime_error(std::string("expected JSON character '") + c + "'");
+        }
+        ++pos_;
+    }
+
+    std::string input_;
+    std::size_t pos_{0};
+};
+
+const Json::Object& as_object(const Json& json, const std::string& name) {
+    if (!std::holds_alternative<Json::Object>(json.value)) {
+        throw std::runtime_error(name + " must be a JSON object");
+    }
+    return std::get<Json::Object>(json.value);
+}
+
+const Json::Array& as_array(const Json& json, const std::string& name) {
+    if (!std::holds_alternative<Json::Array>(json.value)) {
+        throw std::runtime_error(name + " must be a JSON array");
+    }
+    return std::get<Json::Array>(json.value);
+}
+
+bool has(const Json::Object& object, const std::string& key) {
+    return object.find(key) != object.end();
+}
+
+const Json& get_required(const Json::Object& object, const std::string& key) {
+    auto it = object.find(key);
+    if (it == object.end()) throw std::runtime_error("missing required config key: " + key);
+    return it->second;
+}
+
+std::string get_string(const Json::Object& object, const std::string& key, const std::string& fallback = {}) {
+    if (!has(object, key)) return fallback;
+    const auto& json = get_required(object, key);
+    if (!std::holds_alternative<std::string>(json.value)) throw std::runtime_error(key + " must be a string");
+    return std::get<std::string>(json.value);
+}
+
+double get_number(const Json::Object& object, const std::string& key, double fallback = 0) {
+    if (!has(object, key)) return fallback;
+    const auto& json = get_required(object, key);
+    if (!std::holds_alternative<double>(json.value)) throw std::runtime_error(key + " must be a number");
+    return std::get<double>(json.value);
+}
+
+bool get_bool(const Json::Object& object, const std::string& key, bool fallback = false) {
+    if (!has(object, key)) return fallback;
+    const auto& json = get_required(object, key);
+    if (!std::holds_alternative<bool>(json.value)) throw std::runtime_error(key + " must be a boolean");
+    return std::get<bool>(json.value);
+}
+
+uint64_t parse_u64(const std::string& value, const std::string& key) {
+    std::size_t consumed = 0;
+    const int base = value.rfind("0x", 0) == 0 || value.rfind("0X", 0) == 0 ? 16 : 10;
+    const auto parsed = std::stoull(value, &consumed, base);
+    if (consumed != value.size()) {
+        throw std::runtime_error(key + " must be an unsigned integer string");
+    }
+    return static_cast<uint64_t>(parsed);
+}
+
+uint64_t get_u64_string_or_number(const Json::Object& object, const std::string& key, uint64_t fallback = 0) {
+    if (!has(object, key)) return fallback;
+    const auto& json = get_required(object, key);
+    if (std::holds_alternative<std::string>(json.value)) {
+        return parse_u64(std::get<std::string>(json.value), key);
+    }
+    if (std::holds_alternative<double>(json.value)) {
+        const double value = std::get<double>(json.value);
+        if (value < 0 || value > static_cast<double>(std::numeric_limits<uint64_t>::max())) {
+            throw std::runtime_error(key + " out of uint64 range");
+        }
+        return static_cast<uint64_t>(value);
+    }
+    throw std::runtime_error(key + " must be a string or number");
+}
+
+template <typename T>
+T number_as(const Json::Object& object, const std::string& key, T fallback = {}) {
+    return static_cast<T>(get_number(object, key, static_cast<double>(fallback)));
+}
+
+void apply_arg(ProxyConfig& config, const std::string& key, const std::string& value) {
+    if (key == "node_rank") config.node_rank = std::stoi(value);
+    else if (key == "num_nodes") config.num_nodes = std::stoi(value);
+    else if (key == "local_gpu_index") config.local_gpu_index = std::stoi(value);
+    else if (key == "num_gpus_per_node") config.num_gpus_per_node = std::stoi(value);
+    else if (key == "num_tokens") config.num_tokens = static_cast<std::size_t>(std::stoull(value));
+    else if (key == "token_dimension") config.token_dimension = static_cast<std::size_t>(std::stoull(value));
+    else if (key == "tokens_per_chunk") config.tokens_per_chunk = static_cast<std::size_t>(std::stoull(value));
+    else if (key == "num_qps_per_peer") config.num_qps_per_peer = std::stoi(value);
+    else if (key == "rdma_qp_calibration_enabled") config.rdma_qp_calibration_enabled = (value == "1" || value == "true" || value == "yes");
+    else if (key == "min_bandwidth_gbps_needed") config.min_bandwidth_gbps_needed = std::stod(value);
+    else if (key == "rdma_qp_calibration_warmup_iterations") config.rdma_qp_calibration_warmup_iterations = std::stoi(value);
+    else if (key == "rdma_qp_calibration_sample_iterations") config.rdma_qp_calibration_sample_iterations = std::stoi(value);
+    else if (key == "rdma_qp_calibration_max_attempts") config.rdma_qp_calibration_max_attempts = std::stoi(value);
+    else if (key == "rdma_qp_calibration_timeout_ms") config.rdma_qp_calibration_timeout_ms = std::stoull(value);
+    else if (key == "rdma_device_name") config.rdma_device_name = value;
+    else if (key == "rdma_device_name2") config.rdma_device_name2 = value;
+    else if (key == "rdma_port2") {
+        const int port = std::stoi(value);
+        if (port < 0 || port > 255) throw std::runtime_error("invalid rdma_port2");
+        config.rdma_port2 = static_cast<uint8_t>(port);
+    }
+    else if (key == "gid_index2") config.gid_index2 = std::stoi(value);
+    else if (key == "rdma_port") config.rdma_port = static_cast<uint8_t>(std::stoi(value));
+    else if (key == "gid_index") config.gid_index = std::stoi(value);
+    else if (key == "cuda_device_id") config.cuda_device_id = std::stoi(value);
+    else if (key == "listen_port") {
+        config.listen_port = static_cast<uint16_t>(std::stoi(value));
+        for (auto& peer : config.peers) {
+            peer.port = config.listen_port;
+        }
+    }
+    else if (key == "connection_manager_port") config.connection_manager_port = static_cast<uint16_t>(std::stoi(value));
+    else if (key == "peer_port") {
+        const auto port = static_cast<uint16_t>(std::stoi(value));
+        for (auto& peer : config.peers) {
+            peer.port = port;
+        }
+    }
+    else if (key == "peer_host") {
+        if (config.peers.size() != 1) {
+            throw std::runtime_error("--peer_host is only supported when the config has exactly one peer");
+        }
+        config.peers[0].host = value;
+    }
+    else if (key == "completion_poll_batch_size") config.completion_poll_batch_size = std::stoi(value);
+    else if (key == "data_signal_interval") config.data_signal_interval = std::stoi(value);
+    else if (key == "max_in_flight_chunks_per_qp") config.max_in_flight_chunks_per_qp = std::stoi(value);
+    else if (key == "rdma_chunk_per_token_sge_enabled") {
+        config.rdma_chunk_per_token_sge_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "rdma_discontinuous_token_payload_enabled") {
+        config.rdma_discontinuous_token_payload_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "router_routing_enabled") {
+        config.router_routing_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "num_experts" || key == "router_num_experts") {
+        config.router_num_experts = std::stoi(value);
+    }
+    else if (key == "top_k" || key == "router_top_k") {
+        config.router_top_k = std::stoi(value);
+    }
+    else if (key == "router_weighted_contributions_enabled") {
+        config.router_weighted_contributions_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "router_seed") {
+        config.router_seed = static_cast<uint64_t>(std::stoull(value));
+    }
+    else if (key == "router_metadata_port_base") {
+        config.router_metadata_port_base = static_cast<uint16_t>(std::stoul(value));
+    }
+    else if (key == "send_queue_depth") config.send_queue_depth = std::stoi(value);
+    else if (key == "recv_queue_depth") config.recv_queue_depth = std::stoi(value);
+    else if (key == "cq_depth") config.cq_depth = std::stoi(value);
+    else if (key == "num_iterations") config.num_iterations = static_cast<std::size_t>(std::stoull(value));
+    else if (key == "completion_timeout_ms") config.completion_timeout_ms = static_cast<uint64_t>(std::stoull(value));
+    else if (key == "dtype") config.dtype = dtype_from_string(value);
+    else if (key == "mock_mode") config.mock_mode = (value == "1" || value == "true" || value == "yes");
+    else if (key == "fill_test_data") config.fill_test_data = (value == "1" || value == "true" || value == "yes");
+    else if (key == "validate_data") config.validate_data = (value == "1" || value == "true" || value == "yes");
+    else if (key == "sequential_peer_transfers") {
+        config.sequential_peer_transfers = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "local_forwarding_rdma_overlap_enabled") {
+        config.local_forwarding_rdma_overlap_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forwarding_enabled" || key == "nvlink_forwarding_enable") {
+        config.nvlink_forwarding_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_preparation_enabled") {
+        config.nvlink_forward_preparation_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_ping_pong2_enabled") {
+        config.nvlink_forward_ping_pong2_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_submit_epilogue_enabled") {
+        config.nvlink_forward_submit_epilogue_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_local_staging_prepared_enabled") {
+        config.nvlink_forward_local_staging_prepared_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_completion_mode") config.nvlink_forward_completion_mode = value;
+    else if (key == "nvlink_forward_prepared_atomic_ring_enabled") {
+        config.nvlink_forward_prepared_atomic_ring_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_prepared_nvtx_enabled") {
+        config.nvlink_forward_prepared_nvtx_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_prepared_batch_chunks") {
+        config.nvlink_forward_prepared_batch_chunks = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_prepared_queue_depth") {
+        config.nvlink_forward_prepared_queue_depth = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_threshold_tokens") {
+        config.nvlink_forward_threshold_tokens = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_threshold_chunks") {
+        config.nvlink_forward_threshold_chunks = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_min_threshold_chunks") {
+        config.nvlink_forward_min_threshold_chunks = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_max_threshold_chunks") {
+        config.nvlink_forward_max_threshold_chunks = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_out_of_order_chunks_enabled") {
+        config.nvlink_forward_out_of_order_chunks_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_chunk_tokens") {
+        config.nvlink_forward_chunk_tokens = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_use_batch_api") {
+        config.nvlink_forward_use_batch_api = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_stream_nonblocking") {
+        config.nvlink_forward_stream_nonblocking = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_synchronize_batches") {
+        config.nvlink_forward_synchronize_batches = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_completion_notifications_enabled") {
+        config.nvlink_forward_completion_notifications_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_return_ready_gpu_publication_enabled") {
+        config.nvlink_return_ready_gpu_publication_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_return_completion_notifications_enabled") {
+        config.nvlink_return_completion_notifications_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_return_local_batch_sync_enabled") {
+        config.nvlink_return_local_batch_sync_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_notification_flush_only_enabled") {
+        config.nvlink_forward_notification_flush_only_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_notification_flush_per_entry_enabled") {
+        config.nvlink_forward_notification_flush_per_entry_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_notification_scheduling_mode") {
+        config.nvlink_forward_notification_scheduling_mode = value;
+    }
+    else if (key == "nvlink_forward_notification_scheduling_diagnostics") {
+        config.nvlink_forward_notification_scheduling_diagnostics =
+            (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "router_computation_forwarded_inputs_only") {
+        config.router_computation_forwarded_inputs_only =
+            (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "router_local_input_staging_enabled") {
+        config.router_local_input_staging_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "router_local_input_early_ready_enabled") {
+        config.router_local_input_early_ready_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_notification_flag_update_mode") {
+        config.nvlink_forward_notification_flag_update_mode =
+            nvlink_forward_notification_flag_update_mode_from_string(value);
+    }
+    else if (key == "expert_gemm_m_tile") {
+        config.expert_gemm_m_tile = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "expert_gemm_device_capacity") {
+        config.expert_gemm_device_capacity = std::stoi(value);
+    }
+    else if (key == "expert_gemm_n_tile") {
+        config.expert_gemm_n_tile = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "expert_gemm_dimension") {
+        config.expert_gemm_dimension = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "expert_gemm_cluster_m") {
+        config.expert_gemm_cluster_m = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "expert_gemm_max_swizzle_size") {
+        config.expert_gemm_max_swizzle_size = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_notification_queue_depth") {
+        config.nvlink_forward_notification_queue_depth = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_notification_log_enabled") {
+        config.nvlink_forward_notification_log_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_notification_log_dir") {
+        config.nvlink_forward_notification_log_dir = value;
+    }
+    else if (key == "nvlink_forward_ping_pong_enabled") {
+        config.nvlink_forward_ping_pong_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_ping_pong_handoff_copy") {
+        config.nvlink_forward_ping_pong_handoff_copy = static_cast<std::size_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_local_batch_sync_enabled") {
+        config.nvlink_forward_local_batch_sync_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_synchronize_iteration") {
+        config.nvlink_forward_synchronize_iteration = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_log_batches") {
+        config.nvlink_forward_log_batches = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "log_qp_reports") {
+        config.log_qp_reports = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "log_marker_wait_reports") {
+        config.log_marker_wait_reports = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_forward_use_round_robin") {
+        config.nvlink_forward_use_round_robin = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "nvlink_routing_probability") {
+        config.nvlink_routing_probability = std::stod(value);
+    }
+    else if (key == "nvlink_routing_seed") {
+        config.nvlink_routing_seed = static_cast<uint64_t>(std::stoull(value));
+    }
+    else if (key == "nvlink_forward_exchange_dir") config.nvlink_forward_exchange_dir = value;
+    else if (key == "local_iteration_sync_enabled") {
+        config.local_iteration_sync_enabled = (value == "1" || value == "true" || value == "yes");
+    }
+    else if (key == "local_iteration_sync_dir") config.local_iteration_sync_dir = value;
+    else if (key == "local_iteration_sync_run_id") config.local_iteration_sync_run_id = value;
+    else if (key == "rdma_bandwidth_summary_dir") config.rdma_bandwidth_summary_dir = value;
+    else if (key == "cpu_affinity") config.cpu_affinity = value;
+    else if (key == "log_level") config.log_level = value;
+}
+
+}  // namespace
+
+std::size_t expert_gemm_cta_m_tile(const ProxyConfig& config) {
+    if (config.expert_gemm_device_capacity != 9 &&
+        config.expert_gemm_device_capacity != 10) {
+        throw std::runtime_error("expert_gemm_device_capacity must be 9 (Hopper) or 10 (Blackwell)");
+    }
+    if (config.expert_gemm_m_tile == 0 || config.expert_gemm_cluster_m == 0) {
+        throw std::runtime_error("expert GEMM M tile and cluster M must be > 0");
+    }
+    // Keep aligned with quack.gemm_config.cta_tile_shape_m for non-blockscaled
+    // SM90/SM100 GEMMs. The worker passes MMA geometry, so applying the Hopper
+    // product directly here would leave half the routes in a descriptor unused.
+    const bool two_cta_mma = config.expert_gemm_device_capacity == 10 &&
+        config.expert_gemm_cluster_m % 2 == 0 &&
+        (config.expert_gemm_m_tile == 128 || config.expert_gemm_m_tile == 256);
+    return config.expert_gemm_m_tile / (two_cta_mma ? 2 : 1);
+}
+
+std::size_t expert_gemm_cluster_rows(const ProxyConfig& config) {
+    const auto cta_rows = expert_gemm_cta_m_tile(config);
+    if (cta_rows > std::numeric_limits<std::size_t>::max() / config.expert_gemm_cluster_m) {
+        throw std::runtime_error("expert GEMM CTA M tile * cluster M overflows size_t");
+    }
+    return cta_rows * config.expert_gemm_cluster_m;
+}
+
+std::size_t dtype_size(DataType dtype) {
+    switch (dtype) {
+        case DataType::kBF16:
+        case DataType::kFP16:
+            return 2;
+        case DataType::kFP32:
+            return 4;
+    }
+    return 2;
+}
+
+std::string to_string(DataType dtype) {
+    switch (dtype) {
+        case DataType::kBF16:
+            return "bf16";
+        case DataType::kFP16:
+            return "fp16";
+        case DataType::kFP32:
+            return "fp32";
+    }
+    return "bf16";
+}
+
+DataType dtype_from_string(const std::string& value) {
+    std::string v = value;
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (v == "bf16" || v == "bfloat16") return DataType::kBF16;
+    if (v == "fp16" || v == "half") return DataType::kFP16;
+    if (v == "fp32" || v == "float") return DataType::kFP32;
+    throw std::runtime_error("unsupported dtype: " + value);
+}
+
+std::string to_string(NvlinkForwardNotificationFlagUpdateMode mode) {
+    switch (mode) {
+        case NvlinkForwardNotificationFlagUpdateMode::kMemcpy:
+            return "memcpy";
+        case NvlinkForwardNotificationFlagUpdateMode::kStreamWrite:
+            return "stream-write";
+    }
+    return "stream-write";
+}
+
+NvlinkForwardNotificationFlagUpdateMode
+nvlink_forward_notification_flag_update_mode_from_string(
+    const std::string& value) {
+    std::string normalized = value;
+    std::transform(
+        normalized.begin(), normalized.end(), normalized.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (normalized == "memcpy") {
+        return NvlinkForwardNotificationFlagUpdateMode::kMemcpy;
+    }
+    if (normalized == "stream-write" || normalized == "stream_write") {
+        return NvlinkForwardNotificationFlagUpdateMode::kStreamWrite;
+    }
+    throw std::runtime_error(
+        "unsupported NVLink notification flag update mode: " + value +
+        "; expected memcpy or stream-write");
+}
+
+bool nvlink_forward_dynamic_threshold_enabled(const ProxyConfig& config) {
+    return config.nvlink_forward_min_threshold_chunks != 0 ||
+           config.nvlink_forward_max_threshold_chunks != 0;
+}
+
+std::size_t effective_nvlink_forward_threshold_tokens(const ProxyConfig& config) {
+    if (config.nvlink_forward_preparation_enabled) {
+        if (config.tokens_per_chunk != 0 && config.nvlink_forward_prepared_batch_chunks >
+            std::numeric_limits<std::size_t>::max() / config.tokens_per_chunk) {
+            throw std::runtime_error("nvlink_forward_prepared_batch_chunks * tokens_per_chunk overflows size_t");
+        }
+        return config.nvlink_forward_prepared_batch_chunks * config.tokens_per_chunk;
+    }
+    if (config.nvlink_forward_threshold_chunks == 0) {
+        return config.nvlink_forward_threshold_tokens;
+    }
+    if (config.tokens_per_chunk != 0 &&
+        config.nvlink_forward_threshold_chunks >
+            std::numeric_limits<std::size_t>::max() / config.tokens_per_chunk) {
+        throw std::runtime_error("nvlink_forward_threshold_chunks * tokens_per_chunk overflows size_t");
+    }
+    return config.nvlink_forward_threshold_chunks * config.tokens_per_chunk;
+}
+
+bool effective_rdma_chunk_per_token_sge_enabled(const ProxyConfig& config) {
+    return config.rdma_chunk_per_token_sge_enabled || config.router_routing_enabled;
+}
+
+bool effective_rdma_discontinuous_token_payload_enabled(const ProxyConfig& config) {
+    return config.rdma_discontinuous_token_payload_enabled || config.router_routing_enabled;
+}
+
+static ProxyConfig parse_config_file(const std::string& path) {
+    std::ifstream input(path);
+    if (!input) throw std::runtime_error("failed to open config file: " + path);
+    std::ostringstream ss;
+    ss << input.rdbuf();
+
+    const auto root = JsonParser(ss.str()).parse();
+    const auto& object = as_object(root, "config root");
+
+    ProxyConfig config;
+    config.node_rank = number_as<int>(object, "node_rank", config.node_rank);
+    config.num_nodes = number_as<int>(object, "num_nodes", config.num_nodes);
+    config.local_gpu_index = number_as<int>(object, "local_gpu_index", config.local_gpu_index);
+    config.num_gpus_per_node = number_as<int>(object, "num_gpus_per_node", config.num_gpus_per_node);
+    config.num_tokens = number_as<std::size_t>(object, "num_tokens", config.num_tokens);
+    config.token_dimension = number_as<std::size_t>(object, "token_dimension", config.token_dimension);
+    config.tokens_per_chunk = number_as<std::size_t>(object, "tokens_per_chunk", config.tokens_per_chunk);
+    config.num_qps_per_peer = number_as<int>(object, "num_qps_per_peer", config.num_qps_per_peer);
+    config.rdma_qp_calibration_enabled = get_bool(object, "rdma_qp_calibration_enabled", config.rdma_qp_calibration_enabled);
+    config.min_bandwidth_gbps_needed = number_as<double>(object, "min_bandwidth_gbps_needed", config.min_bandwidth_gbps_needed);
+    config.rdma_qp_calibration_warmup_iterations = number_as<int>(object, "rdma_qp_calibration_warmup_iterations", config.rdma_qp_calibration_warmup_iterations);
+    config.rdma_qp_calibration_sample_iterations = number_as<int>(object, "rdma_qp_calibration_sample_iterations", config.rdma_qp_calibration_sample_iterations);
+    config.rdma_qp_calibration_max_attempts = number_as<int>(object, "rdma_qp_calibration_max_attempts", config.rdma_qp_calibration_max_attempts);
+    config.rdma_qp_calibration_timeout_ms = number_as<uint64_t>(object, "rdma_qp_calibration_timeout_ms", config.rdma_qp_calibration_timeout_ms);
+    config.rdma_device_name = get_string(object, "rdma_device_name", config.rdma_device_name);
+    config.rdma_device_name2 = get_string(object, "rdma_device_name2", config.rdma_device_name2);
+    const int port2 = number_as<int>(object, "rdma_port2", config.rdma_port2);
+    if (port2 < 0 || port2 > 255) throw std::runtime_error("invalid rdma_port2");
+    config.rdma_port2 = static_cast<uint8_t>(port2);
+    config.gid_index2 = number_as<int>(object, "gid_index2", config.gid_index2);
+    config.rdma_port = number_as<uint8_t>(object, "rdma_port", config.rdma_port);
+    config.gid_index = number_as<int>(object, "gid_index", config.gid_index);
+    config.cuda_device_id = number_as<int>(object, "cuda_device_id", config.cuda_device_id);
+    config.listen_port = number_as<uint16_t>(object, "listen_port", config.listen_port);
+    config.connection_manager_port = number_as<uint16_t>(object, "connection_manager_port", config.connection_manager_port);
+    config.completion_poll_batch_size = number_as<int>(object, "completion_poll_batch_size", config.completion_poll_batch_size);
+    config.data_signal_interval = number_as<int>(object, "data_signal_interval", config.data_signal_interval);
+    config.max_in_flight_chunks_per_qp = number_as<int>(
+        object, "max_in_flight_chunks_per_qp", config.max_in_flight_chunks_per_qp);
+    config.rdma_chunk_per_token_sge_enabled = get_bool(
+        object, "rdma_chunk_per_token_sge_enabled", config.rdma_chunk_per_token_sge_enabled);
+    config.rdma_discontinuous_token_payload_enabled = get_bool(
+        object, "rdma_discontinuous_token_payload_enabled", config.rdma_discontinuous_token_payload_enabled);
+    config.router_routing_enabled = get_bool(
+        object, "router_routing_enabled", config.router_routing_enabled);
+    config.router_num_experts = number_as<int>(
+        object, "num_experts", number_as<int>(object, "router_num_experts", config.router_num_experts));
+    config.router_top_k = number_as<int>(
+        object, "top_k", number_as<int>(object, "router_top_k", config.router_top_k));
+    config.router_weighted_contributions_enabled = get_bool(
+        object, "router_weighted_contributions_enabled", config.router_weighted_contributions_enabled);
+    config.router_seed = number_as<uint64_t>(object, "router_seed", config.router_seed);
+    config.router_metadata_port_base = number_as<uint16_t>(
+        object, "router_metadata_port_base", config.router_metadata_port_base);
+    config.send_queue_depth = number_as<int>(object, "send_queue_depth", config.send_queue_depth);
+    config.recv_queue_depth = number_as<int>(object, "recv_queue_depth", config.recv_queue_depth);
+    config.cq_depth = number_as<int>(object, "cq_depth", config.cq_depth);
+    config.num_iterations = number_as<std::size_t>(object, "num_iterations", config.num_iterations);
+    config.completion_timeout_ms = number_as<uint64_t>(
+        object, "completion_timeout_ms", config.completion_timeout_ms);
+    config.dtype = dtype_from_string(get_string(object, "dtype", to_string(config.dtype)));
+    config.mock_mode = get_bool(object, "mock_mode", config.mock_mode);
+    config.fill_test_data = get_bool(object, "fill_test_data", config.fill_test_data);
+    config.validate_data = get_bool(object, "validate_data", config.validate_data);
+    config.sequential_peer_transfers = get_bool(
+        object, "sequential_peer_transfers", config.sequential_peer_transfers);
+    config.local_forwarding_rdma_overlap_enabled = get_bool(
+        object,
+        "local_forwarding_rdma_overlap_enabled",
+        config.local_forwarding_rdma_overlap_enabled);
+    config.nvlink_forwarding_enabled = get_bool(
+        object, "nvlink_forwarding_enabled", config.nvlink_forwarding_enabled);
+    config.nvlink_forward_preparation_enabled = get_bool(
+        object, "nvlink_forward_preparation_enabled", config.nvlink_forward_preparation_enabled);
+    config.nvlink_forward_ping_pong2_enabled = get_bool(
+        object, "nvlink_forward_ping_pong2_enabled", config.nvlink_forward_ping_pong2_enabled);
+    config.nvlink_forward_submit_epilogue_enabled = get_bool(
+        object, "nvlink_forward_submit_epilogue_enabled", config.nvlink_forward_submit_epilogue_enabled);
+    config.nvlink_forward_local_staging_prepared_enabled = get_bool(
+        object, "nvlink_forward_local_staging_prepared_enabled", config.nvlink_forward_local_staging_prepared_enabled);
+    config.nvlink_forward_completion_mode = get_string(
+        object, "nvlink_forward_completion_mode", config.nvlink_forward_completion_mode);
+    config.nvlink_forward_prepared_atomic_ring_enabled = get_bool(
+        object, "nvlink_forward_prepared_atomic_ring_enabled", config.nvlink_forward_prepared_atomic_ring_enabled);
+    config.nvlink_forward_prepared_nvtx_enabled = get_bool(
+        object, "nvlink_forward_prepared_nvtx_enabled", config.nvlink_forward_prepared_nvtx_enabled);
+    config.nvlink_forward_prepared_batch_chunks = number_as<std::size_t>(
+        object, "nvlink_forward_prepared_batch_chunks", config.nvlink_forward_prepared_batch_chunks);
+    config.nvlink_forward_prepared_queue_depth = number_as<std::size_t>(
+        object, "nvlink_forward_prepared_queue_depth", config.nvlink_forward_prepared_queue_depth);
+    config.nvlink_forward_threshold_tokens = number_as<std::size_t>(
+        object, "nvlink_forward_threshold_tokens", config.nvlink_forward_threshold_tokens);
+    config.nvlink_forward_threshold_chunks = number_as<std::size_t>(
+        object, "nvlink_forward_threshold_chunks", config.nvlink_forward_threshold_chunks);
+    config.nvlink_forward_min_threshold_chunks = number_as<std::size_t>(
+        object, "nvlink_forward_min_threshold_chunks", config.nvlink_forward_min_threshold_chunks);
+    config.nvlink_forward_max_threshold_chunks = number_as<std::size_t>(
+        object, "nvlink_forward_max_threshold_chunks", config.nvlink_forward_max_threshold_chunks);
+    config.nvlink_forward_out_of_order_chunks_enabled = get_bool(
+        object,
+        "nvlink_forward_out_of_order_chunks_enabled",
+        config.nvlink_forward_out_of_order_chunks_enabled);
+    config.nvlink_forward_chunk_tokens = number_as<std::size_t>(
+        object, "nvlink_forward_chunk_tokens", config.nvlink_forward_chunk_tokens);
+    config.nvlink_forward_use_batch_api = get_bool(
+        object, "nvlink_forward_use_batch_api", config.nvlink_forward_use_batch_api);
+    config.nvlink_forward_stream_nonblocking = get_bool(
+        object, "nvlink_forward_stream_nonblocking", config.nvlink_forward_stream_nonblocking);
+    config.nvlink_forward_synchronize_batches = get_bool(
+        object, "nvlink_forward_synchronize_batches", config.nvlink_forward_synchronize_batches);
+    config.nvlink_return_ready_gpu_publication_enabled = get_bool(
+        object, "nvlink_return_ready_gpu_publication_enabled",
+        config.nvlink_return_ready_gpu_publication_enabled);
+    config.nvlink_return_completion_notifications_enabled = get_bool(
+        object, "nvlink_return_completion_notifications_enabled",
+        config.nvlink_return_completion_notifications_enabled);
+    config.nvlink_return_local_batch_sync_enabled = get_bool(
+        object, "nvlink_return_local_batch_sync_enabled",
+        config.nvlink_return_local_batch_sync_enabled);
+    config.nvlink_forward_completion_notifications_enabled = get_bool(
+        object,
+        "nvlink_forward_completion_notifications_enabled",
+        config.nvlink_forward_completion_notifications_enabled);
+    config.nvlink_forward_notification_flush_only_enabled = get_bool(
+        object,
+        "nvlink_forward_notification_flush_only_enabled",
+        config.nvlink_forward_notification_flush_only_enabled);
+    config.nvlink_forward_notification_flush_per_entry_enabled = get_bool(
+        object,
+        "nvlink_forward_notification_flush_per_entry_enabled",
+        config.nvlink_forward_notification_flush_per_entry_enabled);
+    config.nvlink_forward_notification_scheduling_mode = get_string(
+        object, "nvlink_forward_notification_scheduling_mode",
+        config.nvlink_forward_notification_scheduling_mode);
+    config.nvlink_forward_notification_scheduling_diagnostics = get_bool(
+        object, "nvlink_forward_notification_scheduling_diagnostics",
+        config.nvlink_forward_notification_scheduling_diagnostics);
+    config.nvlink_forward_notification_flag_update_mode =
+        nvlink_forward_notification_flag_update_mode_from_string(get_string(
+            object,
+            "nvlink_forward_notification_flag_update_mode",
+            to_string(config.nvlink_forward_notification_flag_update_mode)));
+    config.router_computation_forwarded_inputs_only = get_bool(
+        object,
+        "router_computation_forwarded_inputs_only",
+        config.router_computation_forwarded_inputs_only);
+    config.router_local_input_staging_enabled = get_bool(
+        object,
+        "router_local_input_staging_enabled",
+        config.router_local_input_staging_enabled);
+    config.router_local_input_early_ready_enabled = get_bool(
+        object,
+        "router_local_input_early_ready_enabled",
+        config.router_local_input_early_ready_enabled);
+    config.expert_gemm_m_tile = number_as<std::size_t>(
+        object, "expert_gemm_m_tile", config.expert_gemm_m_tile);
+    config.expert_gemm_device_capacity = number_as<int>(
+        object, "expert_gemm_device_capacity", config.expert_gemm_device_capacity);
+    config.expert_gemm_n_tile = number_as<std::size_t>(
+        object, "expert_gemm_n_tile", config.expert_gemm_n_tile);
+    config.expert_gemm_dimension = number_as<std::size_t>(
+        object, "expert_gemm_dimension", config.expert_gemm_dimension);
+    config.expert_gemm_cluster_m = number_as<std::size_t>(
+        object, "expert_gemm_cluster_m", config.expert_gemm_cluster_m);
+    config.expert_gemm_max_swizzle_size = number_as<std::size_t>(
+        object, "expert_gemm_max_swizzle_size", config.expert_gemm_max_swizzle_size);
+    config.nvlink_forward_notification_queue_depth = number_as<std::size_t>(
+        object,
+        "nvlink_forward_notification_queue_depth",
+        config.nvlink_forward_notification_queue_depth);
+    config.nvlink_forward_notification_log_enabled = get_bool(
+        object,
+        "nvlink_forward_notification_log_enabled",
+        config.nvlink_forward_notification_log_enabled);
+    config.nvlink_forward_notification_log_dir = get_string(
+        object,
+        "nvlink_forward_notification_log_dir",
+        config.nvlink_forward_notification_log_dir);
+    config.nvlink_forward_ping_pong_enabled = get_bool(
+        object, "nvlink_forward_ping_pong_enabled", config.nvlink_forward_ping_pong_enabled);
+    config.nvlink_forward_ping_pong_handoff_copy = number_as<std::size_t>(
+        object, "nvlink_forward_ping_pong_handoff_copy", config.nvlink_forward_ping_pong_handoff_copy);
+    config.nvlink_forward_local_batch_sync_enabled = get_bool(
+        object, "nvlink_forward_local_batch_sync_enabled", config.nvlink_forward_local_batch_sync_enabled);
+    config.nvlink_forward_synchronize_iteration = get_bool(
+        object, "nvlink_forward_synchronize_iteration", config.nvlink_forward_synchronize_iteration);
+    config.nvlink_forward_log_batches = get_bool(
+        object, "nvlink_forward_log_batches", config.nvlink_forward_log_batches);
+    config.log_qp_reports = get_bool(object, "log_qp_reports", config.log_qp_reports);
+    config.log_marker_wait_reports = get_bool(
+        object, "log_marker_wait_reports", config.log_marker_wait_reports);
+    config.nvlink_forward_use_round_robin = get_bool(
+        object, "nvlink_forward_use_round_robin", config.nvlink_forward_use_round_robin);
+    config.nvlink_routing_probability = get_number(
+        object, "nvlink_routing_probability", config.nvlink_routing_probability);
+    config.nvlink_routing_seed = number_as<uint64_t>(
+        object, "nvlink_routing_seed", config.nvlink_routing_seed);
+    config.nvlink_forward_exchange_dir = get_string(
+        object, "nvlink_forward_exchange_dir", config.nvlink_forward_exchange_dir);
+    config.local_iteration_sync_enabled = get_bool(
+        object, "local_iteration_sync_enabled", config.local_iteration_sync_enabled);
+    config.local_iteration_sync_dir = get_string(
+        object, "local_iteration_sync_dir", config.local_iteration_sync_dir);
+    config.local_iteration_sync_run_id = get_string(
+        object, "local_iteration_sync_run_id", config.local_iteration_sync_run_id);
+    config.rdma_bandwidth_summary_dir = get_string(
+        object, "rdma_bandwidth_summary_dir", config.rdma_bandwidth_summary_dir);
+    config.cpu_affinity = get_string(object, "cpu_affinity", config.cpu_affinity);
+    config.log_level = get_string(object, "log_level", config.log_level);
+
+    if (has(object, "peers")) {
+        for (const auto& entry : as_array(get_required(object, "peers"), "peers")) {
+            const auto& peer_obj = as_object(entry, "peer");
+            PeerAddress peer;
+            peer.node_rank = number_as<int>(peer_obj, "node_rank", -1);
+            peer.host = get_string(peer_obj, "host");
+            peer.port = number_as<uint16_t>(peer_obj, "port", config.connection_manager_port);
+            config.peers.push_back(peer);
+        }
+    }
+    if (has(object, "nvlink_forward_destinations")) {
+        for (const auto& entry : as_array(
+                 get_required(object, "nvlink_forward_destinations"), "nvlink_forward_destinations")) {
+            const auto& dst_obj = as_object(entry, "nvlink_forward_destination");
+            NvlinkForwardDestination dst;
+            dst.gpu_index = number_as<int>(dst_obj, "gpu_index", -1);
+            dst.cuda_device_id = number_as<int>(dst_obj, "cuda_device_id", dst.gpu_index);
+            dst.buffer_addr = get_u64_string_or_number(dst_obj, "buffer_addr", 0);
+            dst.buffer_bytes = number_as<std::size_t>(dst_obj, "buffer_bytes", 0);
+            config.nvlink_forward_destinations.push_back(dst);
+        }
+    }
+
+    return config;
+}
+
+ProxyConfig load_config_file(const std::string& path) {
+    auto config = parse_config_file(path);
+    validate_config(config);
+    return config;
+}
+
+ProxyConfig load_config(int argc, char** argv) {
+    std::string path;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg(argv[i]);
+        if ((arg == "--config" || arg == "-c") && i + 1 < argc) {
+            path = argv[++i];
+        }
+    }
+    if (path.empty()) {
+        throw std::runtime_error("usage: rdma_cpu_proxy --config config/example_config.json [--key=value ...]");
+    }
+
+    // Validate the effective configuration only after applying all CLI overrides.
+    auto config = parse_config_file(path);
+    for (int i = 1; i < argc; ++i) {
+        std::string arg(argv[i]);
+        if (arg == "--config" || arg == "-c") {
+            ++i;
+            continue;
+        }
+        if (arg.rfind("--", 0) == 0) {
+            arg = arg.substr(2);
+            const auto eq = arg.find('=');
+            if (eq == std::string::npos) throw std::runtime_error("expected --key=value argument: --" + arg);
+            apply_arg(config, arg.substr(0, eq), arg.substr(eq + 1));
+        }
+    }
+    validate_config(config);
+    return config;
+}
+
+void validate_config(const ProxyConfig& config) {
+    // Validate this even when the scheduler is disabled, so misspelled or
+    // unsupported architectures never silently survive a CLI/JSON load.
+    if (config.expert_gemm_device_capacity != 9 &&
+        config.expert_gemm_device_capacity != 10) {
+        throw std::runtime_error("expert_gemm_device_capacity must be 9 (Hopper) or 10 (Blackwell)");
+    }
+    if (config.gid_index2 < -2) throw std::runtime_error("invalid gid_index2");
+    if (!config.rdma_device_name2.empty() &&
+        (config.rdma_device_name.empty() || config.rdma_device_name == config.rdma_device_name2 ||
+         config.num_qps_per_peer < 2 || config.num_qps_per_peer % 2))
+        throw std::runtime_error("two RDMA devices require distinct explicit names and an even num_qps_per_peer >= 2");
+    if (config.rdma_qp_calibration_enabled) {
+        if (config.num_nodes != 2 || config.nvlink_forwarding_enabled) {
+            throw std::runtime_error("rdma_qp_calibration_enabled requires two nodes and nvlink_forwarding_enabled=false");
+        }
+        if (!std::isfinite(config.min_bandwidth_gbps_needed) || config.min_bandwidth_gbps_needed <= 0 ||
+            config.rdma_qp_calibration_warmup_iterations < 0 ||
+            config.rdma_qp_calibration_warmup_iterations > 10000 ||
+            config.rdma_qp_calibration_sample_iterations < 1 ||
+            config.rdma_qp_calibration_sample_iterations > 10000 ||
+            config.rdma_qp_calibration_max_attempts < 1 ||
+            config.rdma_qp_calibration_max_attempts > 10000 ||
+            config.rdma_qp_calibration_timeout_ms < 1 ||
+            config.rdma_qp_calibration_timeout_ms > 86400000) {
+            throw std::runtime_error("invalid RDMA QP calibration settings: require finite positive bandwidth, warmups in [0,10000], samples/attempts in [1,10000], timeout in [1,86400000] ms");
+        }
+    }
+
+    if (config.num_nodes < 1) throw std::runtime_error("num_nodes must be >= 1");
+    if (config.node_rank < 0 || config.node_rank >= config.num_nodes) throw std::runtime_error("node_rank out of range");
+    if (config.local_gpu_index < 0 || config.local_gpu_index >= config.num_gpus_per_node) {
+        throw std::runtime_error("local_gpu_index out of range");
+    }
+    if (config.num_tokens == 0) throw std::runtime_error("num_tokens must be > 0");
+    if (config.token_dimension == 0) throw std::runtime_error("token_dimension must be > 0");
+    if (config.tokens_per_chunk == 0) throw std::runtime_error("tokens_per_chunk must be > 0");
+    if (config.num_qps_per_peer <= 0) throw std::runtime_error("num_qps_per_peer must be > 0");
+    if (config.completion_poll_batch_size <= 0) throw std::runtime_error("completion_poll_batch_size must be > 0");
+    if (config.data_signal_interval < 0) throw std::runtime_error("data_signal_interval must be >= 0");
+    if (config.max_in_flight_chunks_per_qp <= 0) {
+        throw std::runtime_error("max_in_flight_chunks_per_qp must be > 0");
+    }
+    if (effective_rdma_chunk_per_token_sge_enabled(config) &&
+        config.tokens_per_chunk > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("tokens_per_chunk exceeds verbs num_sge range for per-token SGE mode");
+    }
+    if (config.rdma_discontinuous_token_payload_enabled && !config.rdma_chunk_per_token_sge_enabled) {
+        throw std::runtime_error(
+            "rdma_discontinuous_token_payload_enabled requires rdma_chunk_per_token_sge_enabled=true");
+    }
+    if (config.rdma_discontinuous_token_payload_enabled && config.nvlink_forwarding_enabled) {
+        throw std::runtime_error(
+            "rdma_discontinuous_token_payload_enabled is only supported when NVLink forwarding is disabled");
+    }
+    if (config.router_weighted_contributions_enabled && !config.router_routing_enabled)
+        throw std::runtime_error("router_weighted_contributions_enabled requires router_routing_enabled");
+    if (config.router_routing_enabled) {
+        if (config.num_gpus_per_node < 2 || config.num_gpus_per_node > 8) {
+            throw std::runtime_error("router_routing_enabled requires num_gpus_per_node in [2, 8]");
+        }
+        if (config.router_num_experts <= 0 || config.router_num_experts > 1024) {
+            throw std::runtime_error("num_experts must be in [1, 1024] when router routing is enabled");
+        }
+        if (config.router_top_k <= 0 || config.router_top_k > config.router_num_experts) {
+            throw std::runtime_error("top_k must be in [1, num_experts] when router routing is enabled");
+        }
+        const auto total_gpus = static_cast<int64_t>(config.num_nodes) * config.num_gpus_per_node;
+        if (config.router_num_experts % total_gpus != 0) {
+            throw std::runtime_error(
+                "num_experts must be divisible by num_nodes * num_gpus_per_node in router mode");
+        }
+        if (config.num_tokens > static_cast<std::size_t>(std::numeric_limits<int32_t>::max()) ||
+            config.num_tokens > static_cast<std::size_t>(
+                std::numeric_limits<int32_t>::max() / config.router_top_k)) {
+            throw std::runtime_error("num_tokens * top_k must fit in int32 in router mode");
+        }
+        if (config.nvlink_forwarding_enabled &&
+            (config.router_metadata_port_base == 0 ||
+             static_cast<unsigned>(config.router_metadata_port_base) +
+                     static_cast<unsigned>(config.num_gpus_per_node - 1) >
+                 std::numeric_limits<uint16_t>::max())) {
+            throw std::runtime_error(
+                "router_metadata_port_base does not leave one valid TCP port per local GPU");
+        }
+    }
+    if (config.send_queue_depth <= 0 || config.recv_queue_depth <= 0 || config.cq_depth <= 0) {
+        throw std::runtime_error("queue and CQ depths must be > 0");
+    }
+    if (config.max_in_flight_chunks_per_qp > config.send_queue_depth) {
+        throw std::runtime_error("max_in_flight_chunks_per_qp must be <= send_queue_depth");
+    }
+    if (config.completion_timeout_ms == 0) throw std::runtime_error("completion_timeout_ms must be > 0");
+    if (config.local_forwarding_rdma_overlap_enabled &&
+        !config.sequential_peer_transfers) {
+        throw std::runtime_error(
+            "local_forwarding_rdma_overlap_enabled requires "
+            "sequential_peer_transfers=true");
+    }
+    if (config.num_nodes > 1 && static_cast<int>(config.peers.size()) != config.num_nodes - 1) {
+        throw std::runtime_error("peers must contain exactly num_nodes - 1 entries");
+    }
+    if (config.local_iteration_sync_enabled && config.local_iteration_sync_dir.empty()) {
+        throw std::runtime_error(
+            "local_iteration_sync_dir must be non-empty when local iteration synchronization is enabled");
+    }
+    if (config.nvlink_forward_local_staging_prepared_enabled &&
+        (!config.nvlink_forward_submit_epilogue_enabled || !config.router_local_input_staging_enabled)) {
+        throw std::runtime_error(
+            std::string("nvlink_forward_local_staging_prepared_enabled requires ") +
+            "nvlink_forward_submit_epilogue_enabled=true and router_local_input_staging_enabled=true; got " +
+            "nvlink_forward_submit_epilogue_enabled=" +
+            (config.nvlink_forward_submit_epilogue_enabled ? "true" : "false") +
+            ", router_local_input_staging_enabled=" +
+            (config.router_local_input_staging_enabled ? "true" : "false"));
+    }
+    if (config.nvlink_forward_ping_pong2_enabled && !config.nvlink_forward_preparation_enabled) {
+        throw std::runtime_error("nvlink_forward_ping_pong2_enabled requires nvlink_forward_preparation_enabled=true");
+    }
+    if (config.nvlink_forward_completion_mode != "stream_sync" &&
+        config.nvlink_forward_completion_mode != "stream_query") {
+        throw std::runtime_error("nvlink_forward_completion_mode must be stream_sync or stream_query");
+    }
+    if (config.nvlink_forward_completion_mode == "stream_query" &&
+        !config.nvlink_forward_submit_epilogue_enabled) {
+        throw std::runtime_error("stream_query completion requires nvlink_forward_submit_epilogue_enabled=true");
+    }
+    if (config.nvlink_return_ready_gpu_publication_enabled &&
+        !config.nvlink_return_completion_notifications_enabled)
+        throw std::runtime_error("nvlink_return_ready_gpu_publication_enabled requires "
+                                 "nvlink_return_completion_notifications_enabled=true");
+    if (config.nvlink_return_local_batch_sync_enabled &&
+        !config.nvlink_return_completion_notifications_enabled)
+        throw std::runtime_error("nvlink_return_local_batch_sync_enabled requires "
+                                 "nvlink_return_completion_notifications_enabled=true");
+    if (config.nvlink_return_completion_notifications_enabled &&
+        (!config.nvlink_forward_submit_epilogue_enabled ||
+         !config.nvlink_forward_completion_notifications_enabled ||
+         !config.router_routing_enabled || config.num_gpus_per_node < 2 || config.num_iterations == 0)) {
+        throw std::runtime_error("nvlink_return_completion_notifications_enabled requires "
+            "submit/epilogue forwarding, forward notifications, router routing, "
+            "at least two local GPUs and a finite iteration count");
+    }
+    if (config.nvlink_forward_prepared_atomic_ring_enabled &&
+        !config.nvlink_forward_submit_epilogue_enabled) {
+        throw std::runtime_error("nvlink_forward_prepared_atomic_ring_enabled requires nvlink_forward_submit_epilogue_enabled=true");
+    }
+    if (config.nvlink_forward_submit_epilogue_enabled &&
+        (!config.nvlink_forward_preparation_enabled ||
+         config.nvlink_forward_ping_pong2_enabled || config.nvlink_forward_ping_pong_enabled)) {
+        throw std::runtime_error("nvlink_forward_submit_epilogue_enabled requires preparation=true and both ping-pong modes=false");
+    }
+    if (config.nvlink_forward_preparation_enabled) {
+        std::string conflicts;
+        const auto require_flag = [&](const char* name, bool actual, bool required) {
+            if (actual == required) return;
+            if (!conflicts.empty()) conflicts += "; ";
+            conflicts += std::string(name) + "=" + (actual ? "true" : "false") +
+                " (requires " + (required ? "true" : "false") + ")";
+        };
+        require_flag("nvlink_forwarding_enabled", config.nvlink_forwarding_enabled, true);
+        require_flag("router_routing_enabled", config.router_routing_enabled, true);
+        require_flag("nvlink_forward_use_round_robin", config.nvlink_forward_use_round_robin, false);
+        require_flag("nvlink_forward_out_of_order_chunks_enabled",
+                     config.nvlink_forward_out_of_order_chunks_enabled, false);
+        require_flag("nvlink_forward_ping_pong_enabled", config.nvlink_forward_ping_pong_enabled, false);
+        require_flag("nvlink_forward_use_batch_api", config.nvlink_forward_use_batch_api, true);
+        require_flag("nvlink_forward_synchronize_batches", config.nvlink_forward_synchronize_batches, true);
+        // Without notification draining, the iteration barrier protects local
+        // destination buffers from reuse while another source is still copying.
+        if (!config.nvlink_forward_completion_notifications_enabled) {
+            require_flag("local_iteration_sync_enabled", config.local_iteration_sync_enabled, true);
+        }
+        if (!conflicts.empty()) {
+            throw std::runtime_error(
+                "nvlink_forward_preparation_enabled=true has incompatible settings: " + conflicts);
+        }
+        if (config.nvlink_forward_prepared_batch_chunks == 0 ||
+            config.nvlink_forward_prepared_batch_chunks >
+                std::numeric_limits<std::size_t>::max() / config.tokens_per_chunk) {
+            throw std::runtime_error("nvlink_forward_prepared_batch_chunks must be > 0 and fit in tokens");
+        }
+        if (config.nvlink_forward_prepared_queue_depth < 2) {
+            throw std::runtime_error("nvlink_forward_prepared_queue_depth must be >= 2");
+        }
+    }
+    if (config.nvlink_forward_ping_pong_enabled) {
+        if (!config.router_routing_enabled || config.nvlink_forward_use_round_robin ||
+            config.nvlink_forward_out_of_order_chunks_enabled ||
+            !config.nvlink_forward_use_batch_api ||
+            !config.nvlink_forward_local_batch_sync_enabled ||
+            !config.nvlink_forward_completion_notifications_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_ping_pong_enabled requires ordered router forwarding, "
+                "nvlink_forward_use_batch_api=true, nvlink_forward_local_batch_sync_enabled=true, "
+                "and nvlink_forward_completion_notifications_enabled=true");
+        }
+        if (config.nvlink_forward_ping_pong_handoff_copy == 0) {
+            throw std::runtime_error("nvlink_forward_ping_pong_handoff_copy must be > 0");
+        }
+    }
+    if (config.nvlink_forward_local_batch_sync_enabled) {
+        if (!config.nvlink_forwarding_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_local_batch_sync_enabled requires nvlink_forwarding_enabled=true");
+        }
+        if (!config.nvlink_forward_synchronize_batches) {
+            throw std::runtime_error(
+                "nvlink_forward_local_batch_sync_enabled requires nvlink_forward_synchronize_batches=true");
+        }
+        if (config.local_iteration_sync_dir.empty()) {
+            throw std::runtime_error(
+                "local_iteration_sync_dir must be non-empty when NVLink local batch synchronization is enabled");
+        }
+    }
+    if (config.nvlink_forward_completion_notifications_enabled) {
+        if (!config.nvlink_forwarding_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_completion_notifications_enabled requires nvlink_forwarding_enabled=true");
+        }
+        if (!config.nvlink_forward_synchronize_batches) {
+            throw std::runtime_error(
+                "nvlink_forward_completion_notifications_enabled requires nvlink_forward_synchronize_batches=true");
+        }
+        if (config.nvlink_forward_notification_queue_depth == 0) {
+            throw std::runtime_error(
+                "nvlink_forward_notification_queue_depth must be > 0 when NVLink completion notifications are enabled");
+        }
+        if (config.nvlink_forward_notification_queue_depth >
+            static_cast<std::size_t>(std::numeric_limits<uint32_t>::max())) {
+            throw std::runtime_error("nvlink_forward_notification_queue_depth exceeds uint32 range");
+        }
+        if (config.router_routing_enabled) {
+            if (config.expert_gemm_m_tile == 0 || config.expert_gemm_n_tile == 0 ||
+                config.expert_gemm_dimension == 0 || config.expert_gemm_cluster_m == 0 ||
+                config.expert_gemm_max_swizzle_size == 0) {
+                throw std::runtime_error(
+                    "expert_gemm_m_tile, expert_gemm_n_tile, expert_gemm_dimension, "
+                    "expert_gemm_cluster_m, and expert_gemm_max_swizzle_size "
+                    "must be > 0 for router completion notifications");
+            }
+            (void)expert_gemm_cluster_rows(config);
+            const auto clusters_n =
+                config.expert_gemm_dimension / config.expert_gemm_n_tile +
+                (config.expert_gemm_dimension % config.expert_gemm_n_tile != 0 ? 1 : 0);
+            if (clusters_n >
+                static_cast<std::size_t>(std::numeric_limits<int32_t>::max())) {
+                throw std::runtime_error(
+                    "QuACK gather-table cid_n_base exceeds int32 range");
+            }
+            const auto group_size =
+                std::min(config.expert_gemm_max_swizzle_size, clusters_n);
+            if (group_size == 0 || clusters_n % group_size != 0) {
+                throw std::runtime_error(
+                    "QuACK gather-table scheduling requires ceil(expert_gemm_dimension / "
+                    "expert_gemm_n_tile) to be divisible by the effective swizzle group size");
+            }
+        }
+    }
+    if (config.nvlink_forward_notification_scheduling_mode != "per_notification" &&
+        config.nvlink_forward_notification_scheduling_mode != "complete_round") {
+        throw std::runtime_error(
+            "nvlink_forward_notification_scheduling_mode must be per_notification or complete_round");
+    }
+    if (config.nvlink_forward_notification_scheduling_mode == "complete_round") {
+        if (!config.router_routing_enabled ||
+            !config.nvlink_forward_completion_notifications_enabled) {
+            throw std::runtime_error(
+                "complete_round scheduling requires router_routing_enabled=true and "
+                "nvlink_forward_completion_notifications_enabled=true");
+        }
+        if (config.nvlink_forward_notification_flush_only_enabled) {
+            throw std::runtime_error(
+                "complete_round scheduling cannot be combined with "
+                "nvlink_forward_notification_flush_only_enabled");
+        }
+    }
+    if (config.nvlink_forward_notification_scheduling_diagnostics &&
+        (!config.router_routing_enabled ||
+         !config.nvlink_forward_completion_notifications_enabled)) {
+        throw std::runtime_error(
+            "nvlink_forward_notification_scheduling_diagnostics requires "
+            "router_routing_enabled=true and nvlink_forward_completion_notifications_enabled=true");
+    }
+    if (config.nvlink_forward_notification_flush_only_enabled) {
+        if (!config.nvlink_forward_completion_notifications_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_notification_flush_only_enabled requires "
+                "nvlink_forward_completion_notifications_enabled=true");
+        }
+        if (!config.router_routing_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_notification_flush_only_enabled requires "
+                "router_routing_enabled=true");
+        }
+    }
+    if (config.nvlink_forward_notification_flush_per_entry_enabled) {
+        if (!config.nvlink_forward_completion_notifications_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_notification_flush_per_entry_enabled requires "
+                "nvlink_forward_completion_notifications_enabled=true");
+        }
+        if (!config.router_routing_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_notification_flush_per_entry_enabled requires "
+                "router_routing_enabled=true");
+        }
+        if (config.nvlink_forward_notification_flush_only_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_notification_flush_per_entry_enabled cannot be combined "
+                "with nvlink_forward_notification_flush_only_enabled");
+        }
+    }
+    if (config.router_local_input_staging_enabled) {
+        if (!config.router_routing_enabled || !config.nvlink_forwarding_enabled) {
+            throw std::runtime_error(
+                "router_local_input_staging_enabled requires router_routing_enabled=true "
+                "and nvlink_forwarding_enabled=true");
+        }
+        if (!config.nvlink_forward_completion_notifications_enabled &&
+            !config.nvlink_forward_preparation_enabled) {
+            throw std::runtime_error(
+                "router_local_input_staging_enabled requires "
+                "nvlink_forward_completion_notifications_enabled=true or "
+                "nvlink_forward_preparation_enabled=true");
+        }
+        if (config.fill_test_data) {
+            throw std::runtime_error(
+                "router_local_input_staging_enabled requires fill_test_data=false; "
+                "the staged local input is intentionally reused across iterations");
+        }
+        if (!config.nvlink_forward_destinations.empty()) {
+            throw std::runtime_error(
+                "router_local_input_staging_enabled requires automatic CUDA-IPC "
+                "destinations; manual nvlink_forward_destinations do not identify "
+                "source-node-specific buffers");
+        }
+    }
+    if (config.router_local_input_early_ready_enabled) {
+        if (!config.router_local_input_staging_enabled ||
+            !config.nvlink_forward_completion_notifications_enabled) {
+            throw std::runtime_error(
+                "router_local_input_early_ready_enabled requires "
+                "router_local_input_staging_enabled=true and "
+                "nvlink_forward_completion_notifications_enabled=true");
+        }
+        if (config.nvlink_forward_notification_flush_only_enabled) {
+            throw std::runtime_error(
+                "router_local_input_early_ready_enabled cannot be combined with "
+                "nvlink_forward_notification_flush_only_enabled");
+        }
+    }
+    if (config.nvlink_forward_notification_log_enabled) {
+        if (!config.nvlink_forward_completion_notifications_enabled) {
+            throw std::runtime_error(
+                "nvlink_forward_notification_log_enabled requires "
+                "nvlink_forward_completion_notifications_enabled=true");
+        }
+        if (config.nvlink_forward_notification_log_dir.empty()) {
+            throw std::runtime_error(
+                "nvlink_forward_notification_log_dir must be non-empty when notification logging is enabled");
+        }
+    }
+    if (config.nvlink_forwarding_enabled) {
+        const auto dynamic_threshold = nvlink_forward_dynamic_threshold_enabled(config);
+        const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config);
+        if (config.num_gpus_per_node <= 1) {
+            throw std::runtime_error("nvlink_forwarding_enabled requires num_gpus_per_node > 1");
+        }
+        if (config.num_gpus_per_node > 8) {
+            throw std::runtime_error("nvlink_forwarding_enabled supports at most 8 local GPUs");
+        }
+        if (config.router_routing_enabled && config.nvlink_forward_use_round_robin) {
+            throw std::runtime_error(
+                "router-driven NVLink forwarding uses x4 and does not support round-robin forwarding");
+        }
+        if (config.router_routing_enabled && config.nvlink_forward_out_of_order_chunks_enabled) {
+            throw std::runtime_error(
+                "router-driven NVLink forwarding requires ordered chunks and does not support "
+                "nvlink_forward_out_of_order_chunks_enabled=true");
+        }
+        if (!config.nvlink_forward_preparation_enabled) {
+            if (dynamic_threshold) {
+                if (config.nvlink_forward_min_threshold_chunks == 0 ||
+                    config.nvlink_forward_max_threshold_chunks == 0) {
+                    throw std::runtime_error(
+                        "dynamic NVLink forwarding requires both "
+                        "nvlink_forward_min_threshold_chunks and nvlink_forward_max_threshold_chunks to be > 0");
+                }
+                if (config.nvlink_forward_min_threshold_chunks > config.nvlink_forward_max_threshold_chunks) {
+                    throw std::runtime_error(
+                        "nvlink_forward_min_threshold_chunks must be <= nvlink_forward_max_threshold_chunks");
+                }
+                if (config.nvlink_forward_use_round_robin) {
+                    throw std::runtime_error(
+                        "dynamic NVLink forwarding chunk thresholds do not support round-robin forwarding");
+                }
+                if (config.nvlink_forward_out_of_order_chunks_enabled && config.num_iterations == 0) {
+                    throw std::runtime_error(
+                        "nvlink_forward_out_of_order_chunks_enabled requires finite num_iterations");
+                }
+            } else if (forward_threshold_tokens == 0) {
+                throw std::runtime_error(
+                    "nvlink_forward_threshold_tokens or nvlink_forward_threshold_chunks must be > 0 when "
+                    "NVLink forwarding is enabled");
+            }
+            if (config.nvlink_forward_out_of_order_chunks_enabled && !dynamic_threshold) {
+                throw std::runtime_error(
+                    "nvlink_forward_out_of_order_chunks_enabled requires dynamic chunk thresholds");
+            }
+            if (!dynamic_threshold &&
+                config.nvlink_forward_threshold_tokens != 0 &&
+                config.nvlink_forward_threshold_chunks != 0 &&
+                config.nvlink_forward_threshold_tokens != forward_threshold_tokens) {
+                throw std::runtime_error(
+                    "nvlink_forward_threshold_tokens must equal "
+                    "nvlink_forward_threshold_chunks * tokens_per_chunk when both are set");
+            }
+            if (config.nvlink_forward_chunk_tokens == 0) {
+                throw std::runtime_error("nvlink_forward_chunk_tokens must be > 0 when NVLink forwarding is enabled");
+            }
+            if (!dynamic_threshold && config.nvlink_forward_use_round_robin) {
+                const auto expected_threshold =
+                    config.nvlink_forward_chunk_tokens * static_cast<std::size_t>(config.num_gpus_per_node - 1);
+                if (forward_threshold_tokens != expected_threshold) {
+                    throw std::runtime_error(
+                        "round-robin NVLink forwarding requires the effective forwarding threshold to equal "
+                        "nvlink_forward_chunk_tokens * (num_gpus_per_node - 1)");
+                }
+            }
+            if (!dynamic_threshold && forward_threshold_tokens > config.num_tokens) {
+                throw std::runtime_error(
+                    "effective NVLink forwarding threshold must be <= num_tokens when NVLink forwarding is enabled");
+            }
+            if (!dynamic_threshold && !config.router_routing_enabled &&
+                config.num_tokens % forward_threshold_tokens != 0) {
+                throw std::runtime_error(
+                    "unsupported NVLink forwarding configuration: num_tokens must be an exact multiple of "
+                    "the effective NVLink forwarding threshold");
+            }
+        }
+        if (config.nvlink_routing_probability < 0.0 || config.nvlink_routing_probability > 1.0) {
+            throw std::runtime_error("nvlink_routing_probability must be in [0, 1]");
+        }
+        if (config.nvlink_forward_exchange_dir.empty()) {
+            throw std::runtime_error("nvlink_forward_exchange_dir must be non-empty when NVLink forwarding is enabled");
+        }
+        if (!config.nvlink_forward_destinations.empty() &&
+            config.nvlink_forward_destinations.size() != static_cast<std::size_t>(config.num_gpus_per_node - 1)) {
+            throw std::runtime_error(
+                "manual nvlink_forward_destinations must contain exactly one entry for each non-source local GPU");
+        }
+        std::vector<bool> seen(static_cast<std::size_t>(config.num_gpus_per_node), false);
+        const auto required_bytes =
+            config.num_tokens * config.token_dimension * dtype_size(config.dtype) * config.peers.size();
+        for (const auto& dst : config.nvlink_forward_destinations) {
+            if (dst.gpu_index < 0 || dst.gpu_index >= config.num_gpus_per_node) {
+                throw std::runtime_error("NVLink forwarding destination gpu_index out of range");
+            }
+            if (dst.gpu_index == config.local_gpu_index) {
+                throw std::runtime_error("NVLink forwarding destinations must not include the source GPU");
+            }
+            if (seen[static_cast<std::size_t>(dst.gpu_index)]) {
+                throw std::runtime_error("duplicate NVLink forwarding destination gpu_index");
+            }
+            seen[static_cast<std::size_t>(dst.gpu_index)] = true;
+            if (dst.cuda_device_id < 0) {
+                throw std::runtime_error("NVLink forwarding destination cuda_device_id must be >= 0");
+            }
+            if (dst.buffer_addr == 0) {
+                throw std::runtime_error("NVLink forwarding destination buffer_addr must be non-zero");
+            }
+            if (dst.buffer_bytes < required_bytes) {
+                throw std::runtime_error("NVLink forwarding destination buffer_bytes is smaller than forwarding buffer");
+            }
+        }
+    }
+}
+
+std::string config_summary(const ProxyConfig& config) {
+    std::ostringstream out;
+    out << "rank=" << config.node_rank << "/" << config.num_nodes
+        << " gpu=" << config.local_gpu_index
+        << " tokens=" << config.num_tokens
+        << " dim=" << config.token_dimension
+        << " chunk_tokens=" << config.tokens_per_chunk
+        << " qps_per_peer=" << config.num_qps_per_peer
+        << " rdma_devices=" << config.rdma_device_name
+        << (config.rdma_device_name2.empty() ? "" : "+" + config.rdma_device_name2)
+        << " data_signal_interval=" << config.data_signal_interval
+        << " max_in_flight_chunks_per_qp=" << config.max_in_flight_chunks_per_qp
+        << " rdma_chunk_per_token_sge_enabled="
+        << (config.rdma_chunk_per_token_sge_enabled ? "true" : "false")
+        << " rdma_discontinuous_token_payload_enabled="
+        << (config.rdma_discontinuous_token_payload_enabled ? "true" : "false")
+        << " router_routing_enabled=" << (config.router_routing_enabled ? "true" : "false")
+        << " num_experts=" << config.router_num_experts
+        << " top_k=" << config.router_top_k
+        << " router_weighted_contributions_enabled=" << (config.router_weighted_contributions_enabled ? "true" : "false")
+        << " router_seed=" << config.router_seed
+        << " router_metadata_port_base=" << config.router_metadata_port_base
+        << " iterations=" << config.num_iterations
+        << " dtype=" << to_string(config.dtype)
+        << " sequential_peer_transfers=" << (config.sequential_peer_transfers ? "true" : "false")
+        << " local_forwarding_rdma_overlap_enabled="
+        << (config.local_forwarding_rdma_overlap_enabled ? "true" : "false")
+        << " nvlink_forwarding_enabled=" << (config.nvlink_forwarding_enabled ? "true" : "false")
+        << " nvlink_forward_preparation_enabled=" << (config.nvlink_forward_preparation_enabled ? "true" : "false")
+        << " nvlink_forward_local_staging_prepared_enabled=" << (config.nvlink_forward_local_staging_prepared_enabled ? "true" : "false")
+        << " nvlink_forward_ping_pong2_enabled=" << (config.nvlink_forward_ping_pong2_enabled ? "true" : "false")
+        << " nvlink_forward_submit_epilogue_enabled=" << (config.nvlink_forward_submit_epilogue_enabled ? "true" : "false")
+        << " nvlink_forward_completion_mode=" << config.nvlink_forward_completion_mode
+        << " nvlink_forward_prepared_atomic_ring_enabled=" << (config.nvlink_forward_prepared_atomic_ring_enabled ? "true" : "false")
+        << " nvlink_forward_prepared_nvtx_enabled=" << (config.nvlink_forward_prepared_nvtx_enabled ? "true" : "false")
+        << " nvlink_forward_prepared_batch_chunks=" << config.nvlink_forward_prepared_batch_chunks
+        << " nvlink_forward_prepared_queue_depth=" << config.nvlink_forward_prepared_queue_depth
+        << " nvlink_forward_threshold_tokens=" << config.nvlink_forward_threshold_tokens
+        << " nvlink_forward_threshold_chunks=" << config.nvlink_forward_threshold_chunks
+        << " nvlink_forward_min_threshold_chunks=" << config.nvlink_forward_min_threshold_chunks
+        << " nvlink_forward_max_threshold_chunks=" << config.nvlink_forward_max_threshold_chunks
+        << " nvlink_forward_out_of_order_chunks_enabled="
+        << (config.nvlink_forward_out_of_order_chunks_enabled ? "true" : "false")
+        << " nvlink_forward_effective_threshold_tokens="
+        << effective_nvlink_forward_threshold_tokens(config)
+        << " nvlink_forward_chunk_tokens=" << config.nvlink_forward_chunk_tokens
+        << " nvlink_forward_use_batch_api=" << (config.nvlink_forward_use_batch_api ? "true" : "false")
+        << " nvlink_forward_synchronize_batches="
+        << (config.nvlink_forward_synchronize_batches ? "true" : "false")
+        << " nvlink_return_ready_gpu_publication_enabled="
+        << (config.nvlink_return_ready_gpu_publication_enabled ? "true" : "false")
+        << " nvlink_return_completion_notifications_enabled="
+        << (config.nvlink_return_completion_notifications_enabled ? "true" : "false")
+        << " nvlink_return_local_batch_sync_enabled="
+        << (config.nvlink_return_local_batch_sync_enabled ? "true" : "false")
+        << " nvlink_forward_completion_notifications_enabled="
+        << (config.nvlink_forward_completion_notifications_enabled ? "true" : "false")
+        << " nvlink_forward_notification_flush_only_enabled="
+        << (config.nvlink_forward_notification_flush_only_enabled ? "true" : "false")
+        << " nvlink_forward_notification_flush_per_entry_enabled="
+        << (config.nvlink_forward_notification_flush_per_entry_enabled ? "true" : "false")
+        << " nvlink_forward_notification_scheduling_mode="
+        << config.nvlink_forward_notification_scheduling_mode
+        << " nvlink_forward_notification_scheduling_diagnostics="
+        << (config.nvlink_forward_notification_scheduling_diagnostics ? "true" : "false")
+        << " router_computation_forwarded_inputs_only="
+        << (config.router_computation_forwarded_inputs_only ? "true" : "false")
+        << " router_local_input_staging_enabled="
+        << (config.router_local_input_staging_enabled ? "true" : "false")
+        << " router_local_input_early_ready_enabled="
+        << (config.router_local_input_early_ready_enabled ? "true" : "false")
+        << " nvlink_forward_notification_flag_update_mode="
+        << to_string(config.nvlink_forward_notification_flag_update_mode)
+        << " expert_gemm_m_tile=" << config.expert_gemm_m_tile
+        << " expert_gemm_device_capacity=" << config.expert_gemm_device_capacity
+        << " expert_gemm_n_tile=" << config.expert_gemm_n_tile
+        << " expert_gemm_dimension=" << config.expert_gemm_dimension
+        << " expert_gemm_cluster_m=" << config.expert_gemm_cluster_m
+        << " expert_gemm_max_swizzle_size=" << config.expert_gemm_max_swizzle_size
+        << " nvlink_forward_notification_queue_depth="
+        << config.nvlink_forward_notification_queue_depth
+        << " nvlink_forward_notification_log_enabled="
+        << (config.nvlink_forward_notification_log_enabled ? "true" : "false")
+        << " nvlink_forward_notification_log_dir="
+        << config.nvlink_forward_notification_log_dir
+        << " nvlink_forward_ping_pong_enabled="
+        << (config.nvlink_forward_ping_pong_enabled ? "true" : "false")
+        << " nvlink_forward_ping_pong_handoff_copy=" << config.nvlink_forward_ping_pong_handoff_copy
+        << " nvlink_forward_local_batch_sync_enabled="
+        << (config.nvlink_forward_local_batch_sync_enabled ? "true" : "false")
+        << " nvlink_forward_synchronize_iteration="
+        << (config.nvlink_forward_synchronize_iteration ? "true" : "false")
+        << " nvlink_forward_log_batches=" << (config.nvlink_forward_log_batches ? "true" : "false")
+        << " log_qp_reports=" << (config.log_qp_reports ? "true" : "false")
+        << " log_marker_wait_reports=" << (config.log_marker_wait_reports ? "true" : "false")
+        << " nvlink_forward_use_round_robin=" << (config.nvlink_forward_use_round_robin ? "true" : "false")
+        << " nvlink_routing_probability=" << config.nvlink_routing_probability
+        << " nvlink_routing_seed=" << config.nvlink_routing_seed
+        << " nvlink_forward_exchange_dir=" << config.nvlink_forward_exchange_dir
+        << " local_iteration_sync_enabled=" << (config.local_iteration_sync_enabled ? "true" : "false")
+        << " local_iteration_sync_dir=" << config.local_iteration_sync_dir
+        << " local_iteration_sync_run_id="
+        << (config.local_iteration_sync_run_id.empty() ? "default" : config.local_iteration_sync_run_id)
+        << " rdma_bandwidth_summary_dir=" << config.rdma_bandwidth_summary_dir
+        << " cpu_affinity=" << (config.cpu_affinity.empty() ? "none" : config.cpu_affinity)
+        << " mock_mode=" << (config.mock_mode ? "true" : "false");
+    if (config.rdma_qp_calibration_enabled) {
+        out << " rdma_qp_calibration_enabled=true"
+            << " min_bandwidth_gbps_needed=" << config.min_bandwidth_gbps_needed
+            << " rdma_qp_calibration_warmup_iterations=" << config.rdma_qp_calibration_warmup_iterations
+            << " rdma_qp_calibration_sample_iterations=" << config.rdma_qp_calibration_sample_iterations
+            << " rdma_qp_calibration_max_attempts=" << config.rdma_qp_calibration_max_attempts
+            << " rdma_qp_calibration_timeout_ms=" << config.rdma_qp_calibration_timeout_ms;
+    }
+    return out.str();
+}
+
+}  // namespace rdma_proxy

@@ -1,0 +1,469 @@
+#pragma once
+
+#include "config.hpp"
+#include "cuda_buffers.hpp"
+#include "down_ready_trace.hpp"
+#include "return_group_progress.hpp"
+#include "protocol.hpp"
+#include "qp_worker.hpp"
+#include "rdma_connection.hpp"
+#include "rdma_context.hpp"
+#include "router_routing.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <deque>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace rdma_proxy {
+
+class Proxy {
+public:
+    explicit Proxy(ProxyConfig config);
+    ~Proxy();
+
+    Proxy(const Proxy&) = delete;
+    Proxy& operator=(const Proxy&) = delete;
+
+    void set_external_device_buffer_allocator(ExternalDeviceBufferAllocator allocator);
+    void initialize();
+    void run();
+    void run_once();
+    void prepare_iteration_step(uint64_t iteration);
+    void run_iteration_step(uint64_t iteration);
+    void record_router_computation_end(uint64_t iteration, uintptr_t cuda_stream);
+    float router_computation_elapsed_ms(uint64_t iteration);
+    std::size_t router_computation_num_tokens() const;
+    void configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config);
+    void configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes);
+    void configure_cpu_scatter_deferred(std::size_t bytes);
+    void configure_cpu_scatter_threaded(std::size_t bytes);
+    void wait_cpu_scatter_ready(uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms);
+    const std::vector<int32_t>& original_router_experts() const;
+    const std::vector<float>& original_router_weights() const;
+    void finish_run();
+    uintptr_t configure_down_ready_trace(int groups);
+    std::vector<std::pair<int32_t, double>> read_down_ready_trace(uint64_t iteration);
+    int return_ready_prefix(uint64_t iteration) const;
+    std::pair<uintptr_t, uintptr_t> return_ready_publication_addresses() const;
+    void configure_return_copies(const RdmaProxyReturnCopy* copies, std::size_t count,
+                                const int64_t* rows, std::size_t row_count, std::size_t width,
+                                std::size_t tile, std::size_t group_tiles,
+                                std::size_t element_bytes, bool per_group, uintptr_t down_done);
+    void arm_return_copies(uint64_t iteration);
+    std::vector<uint8_t> intra_node_source_masks(int source_node) const;
+    const std::vector<std::size_t>& outgoing_token_indices(int destination_node) const;
+    std::size_t rdma_return_receive_rows(int peer) const;
+    uintptr_t configure_rdma_returns(const RdmaProxyNetworkReturnBuffer* buffers, std::size_t count,
+        std::size_t width, std::size_t tile, std::size_t group_tiles, std::size_t element_bytes,
+        std::size_t chunk_bytes, uint64_t timeout_ms);
+    void check_rdma_return(int peer, const std::string& sent, const std::string& received) const;
+    void shutdown();
+    const RouterExpertMetadata& router_expert_metadata_for_source(
+        int source_node_rank,
+        int source_gpu_index) const;
+    RouterExpertTokenHeadState router_expert_token_head_state_for_source(
+        int source_node_rank,
+        int source_gpu_index) const;
+    RouterComputationSchedulerState router_computation_scheduler_state() const;
+    const RouterNotificationPublicationBuffers&
+    router_notification_publication_buffers() const;
+
+private:
+    struct RdmaReturnPeer {
+        std::size_t peer_index{0};
+        MemoryRegionInfo source, destination, remote;
+        MemoryRegionInfo source2, destination2, remote2;
+        std::vector<std::vector<ChunkDescriptor>> chunks;
+        std::size_t next_group{0};
+    };
+    struct RdmaReturnState {
+        int32_t* host_prefix{nullptr};
+        uintptr_t device_prefix{0};
+        uint64_t iteration{0}, timeout_ms{0};
+        std::size_t groups{0};
+        bool active{false}, complete{true};
+        std::vector<RdmaReturnPeer> peers;
+    };
+    std::unique_ptr<RdmaReturnState> rdma_returns_;
+    void prepare_rdma_returns(uint64_t iteration);
+    void service_rdma_returns() const;
+    void finish_rdma_returns() const;
+    void release_rdma_returns();
+    DownReadyTrace down_ready_trace_;
+    friend struct PreparedForwardingTestAccess;
+    friend struct ReturnNotificationsTestAccess;
+    friend struct QpCalibrationTestAccess;
+    friend struct RdmaReturnsTestAccess;
+    friend struct DualRdmaTestAccess;
+    struct PeerState {
+        int peer_rank{-1};
+        int remote_gpu_index{-1};
+        MemoryRegionInfo local_send_mr;
+        MemoryRegionInfo local_recv_mr;
+        MemoryRegionInfo remote_recv_mr;
+        MemoryRegionInfo local_send_mr2, local_recv_mr2, remote_recv_mr2;
+        std::vector<ChunkDescriptor> receive_chunks;
+        std::vector<uint8_t> router_x4;
+        std::vector<uint8_t> forwarding_routing_table;
+        std::vector<std::unique_ptr<RdmaQueuePair>> qps;
+        std::vector<std::unique_ptr<QPWorker>> workers;
+    };
+
+    struct QPCompletionBaseline {
+        uint64_t sends{0};
+        uint64_t recvs{0};
+        uint64_t send_markers{0};
+        uint64_t recv_markers{0};
+        uint64_t post_errors{0};
+        uint64_t cq_errors{0};
+        uint64_t unexpected_imms{0};
+        std::vector<uint64_t> immediate_counts;
+    };
+
+    struct ForwardDestinationBufferState {
+        int source_node_rank{-1};
+        void* ptr{nullptr};
+        std::size_t bytes{0};
+        bool imported_cuda_ipc{false};
+        // cudaIpcOpenMemHandle returns the allocation base; ptr may include a
+        // PyTorch storage offset and therefore cannot be passed to close.
+        void* imported_cuda_ipc_base{nullptr};
+    };
+
+    struct ForwardDestinationState {
+        int gpu_index{-1};
+        int cuda_device_id{-1};
+        std::vector<ForwardDestinationBufferState> source_buffers;
+    };
+
+    struct ForwardingIterationStats {
+        std::size_t batch_count{0};
+        std::size_t bandwidth_sample_count{0};
+        std::size_t total_bytes{0};
+        double total_seconds{0.0};
+        double sum_batch_bandwidth_gbytes_per_sec{0.0};
+        double sum_batch_bandwidth_gbits_per_sec{0.0};
+    };
+
+    struct ForwardingOutOfOrderPeerState {
+        std::unique_ptr<std::atomic<int8_t>[]> chunk_status;
+        std::unique_ptr<std::atomic<uint64_t>[]> arrivals_by_chunk;
+        std::size_t total_chunks{0};
+        std::size_t chunks_per_iteration{0};
+        uint64_t applied_batch_sequence{0};
+    };
+
+    struct LocalIterationSyncHeader;
+    struct LocalIterationSyncSlot;
+    enum class LocalNvlinkBatchSyncPhase : uint64_t {
+        kLocalInputStaging,
+        kRemoteForwarding,
+    };
+    struct NvlinkForwardNotification;
+    struct NvlinkForwardNotificationHeader;
+    struct NvlinkForwardNotificationQueue;
+    struct NvlinkForwardNotificationDispatchState;
+    struct ForwardingRoundState;
+    std::unique_ptr<ForwardingRoundState> forwarding_rounds_;
+    // Receiver owns the collector; coordinator only exchanges release/acquire epochs.
+    std::atomic<uint64_t> forwarding_round_requested_{0};
+    std::atomic<uint64_t> forwarding_round_completed_{0};
+    std::atomic<bool> forwarding_notification_failed_{false};
+    void initialize_forwarding_rounds();
+    void begin_forwarding_round_iteration();
+    void collect_forwarding_round_notification(const NvlinkForwardNotification& notification);
+    void complete_forwarding_round_records(NvlinkForwardNotification* entries, std::size_t& count,
+        uint64_t iteration, int source_node, std::size_t peer_slot, bool has_batch, bool final);
+    void complete_forwarding_round_records(std::vector<NvlinkForwardNotification>& entries,
+        uint64_t iteration, int source_node, std::size_t peer_slot, bool final);
+    void enqueue_empty_forwarding_phases(uint64_t iteration);
+    struct ForwardingBatchCompletion;
+    struct ForwardingPingPongState;
+    struct PreparedForwardingBatch;
+    struct PreparedForwardingState;
+    void initialize_prepared_forwarding();
+    void prepare_forwarding_batch(PreparedForwardingBatch& batch, std::size_t peer_index,
+                                 uint64_t iteration, std::size_t first_chunk, std::size_t chunks);
+    void prepared_forwarding_ready_loop();
+    void prepared_forwarding_loop();
+    void submit_forwarding_loop();
+    void epilogue_forwarding_loop();
+    void ping_pong2_ready_loop();
+    void ping_pong2_forwarding_loop(int lane);
+    void enqueue_prepared_notifications(const NvlinkForwardNotification* notifications, std::size_t count,
+                                        int lane = -1, uint64_t sequence = 0);
+    struct ForwardNotificationDestinationState {
+        int gpu_index{-1};
+        NvlinkForwardNotificationHeader* header{nullptr};
+        std::size_t bytes{0};
+        int fd{-1};
+    };
+
+    PeerConnectionInfo make_local_peer_info(const PeerState& peer) const;
+    void setup_peer(PeerGpuBuffers& buffers);
+    void calibrate_rdma_qps();
+    void recreate_peer_qps(PeerState& peer);
+    bool calibration_local_all(bool value, uint64_t signature);
+    uint64_t calibration_remaining_ms() const;
+    bool rdma_qp_calibration_complete_{false};
+    uint64_t calibration_barrier_sequence_{0};
+    std::chrono::steady_clock::time_point calibration_deadline_;
+    RouterX3Metadata exchange_router_receive_metadata(
+        const PeerAddress& peer_addr);
+    void exchange_router_expert_metadata_all_to_all();
+    void synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const;
+    void initialize_local_iteration_sync();
+    void release_local_iteration_sync();
+    std::string local_iteration_sync_shm_name() const;
+    LocalIterationSyncSlot* local_iteration_sync_slot(int gpu_index) const;
+    void initialize_nvlink_forward_notifications();
+    void release_nvlink_forward_notifications();
+    std::string nvlink_forward_notification_shm_name(int gpu_index) const;
+    NvlinkForwardNotificationQueue* nvlink_forward_notification_queue_for_source(
+        NvlinkForwardNotificationHeader* header,
+        int source_gpu, bool returning = false) const;
+    NvlinkForwardNotification* nvlink_forward_notification_entry(
+        NvlinkForwardNotificationHeader* header,
+        NvlinkForwardNotificationQueue* queue,
+        uint64_t position, bool returning = false) const;
+    void prepare_forwarding_notification_destinations();
+    void initialize_nvlink_forward_notification_dispatch();
+    void enqueue_forward_completion_notifications(
+        std::vector<NvlinkForwardNotification>&& notifications,
+        std::shared_ptr<CudaForwardEvent> event = {});
+    void wait_for_forward_event(const std::shared_ptr<CudaForwardEvent>& event) const;
+    void drain_forwarding_iteration_notifications(uint64_t iteration);
+    void publish_forward_completion_notification(const NvlinkForwardNotification& notification);
+    void mark_forward_notification_senders_done();
+    bool nvlink_forward_notification_queues_complete() const;
+    void nvlink_forward_notification_dispatch_loop();
+    void enqueue_return_group_notification(uint64_t iteration, int group);
+    void dispatch_return_group_notification(uint64_t iteration, int group);
+    void drain_return_notifications();
+    bool return_notifications_complete(uint64_t iteration) const;
+    void configure_local_nvlink_return_batch_sync(
+        int groups, std::size_t width, std::size_t tile,
+        std::size_t group_tiles, std::size_t element_bytes);
+    bool poll_local_nvlink_return_batch_start(uint64_t iteration, int group);
+    void cancel_local_nvlink_return_batch_sync() noexcept;
+    void nvlink_forward_notification_loop();
+    void drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQueue* queue);
+    std::string format_nvlink_forward_notification_log(
+        const NvlinkForwardNotification& notification,
+        uint64_t dequeue_timestamp_ns) const;
+    void enqueue_nvlink_forward_notification_log(
+        const NvlinkForwardNotification& notification,
+        uint64_t dequeue_timestamp_ns);
+    void flush_nvlink_forward_notification_log_queue();
+    std::size_t synchronize_prepared_nvlink_batch_start(
+        LocalNvlinkBatchSyncPhase phase, uint64_t iteration,
+        uint64_t batch_round, std::size_t batch_chunks, int lane = -1) const;
+    std::size_t synchronize_local_nvlink_batch_start(
+        LocalNvlinkBatchSyncPhase phase,
+        uint64_t iteration,
+        std::size_t batch_index_in_iteration,
+        uint64_t batch_round,
+        std::size_t available_batch_chunks) const;
+    void mark_local_nvlink_batch_phase_complete(
+        LocalNvlinkBatchSyncPhase phase,
+        uint64_t iteration) const;
+    void run_iteration(uint64_t iteration);
+    void synchronize_iteration_start(uint64_t iteration) const;
+    void synchronize_iteration(uint64_t iteration) const;
+    void synchronize_local_iteration_phase(const std::string& phase, uint64_t iteration) const;
+    void fill_iteration_send_buffers(uint64_t iteration);
+    std::vector<std::size_t> sequential_peer_order() const;
+    std::vector<ChunkDescriptor> make_chunks(int peer_rank = -1) const;
+    std::vector<QPCompletionBaseline> capture_baselines(
+        const PeerState& peer,
+        const std::vector<ChunkDescriptor>& chunks) const;
+    std::shared_ptr<DynamicChunkDistributor> enqueue_chunks(
+        PeerState& peer,
+        const PeerGpuBuffers& buffers,
+        const std::vector<ChunkDescriptor>& chunks);
+    void wait_for_iteration(
+        const PeerState& peer,
+        const std::vector<QPCompletionBaseline>& baselines,
+        const std::shared_ptr<DynamicChunkDistributor>& distributor) const;
+    void wait_for_outgoing_transfer(
+        const PeerState& peer,
+        const std::vector<QPCompletionBaseline>& baselines,
+        const std::shared_ptr<DynamicChunkDistributor>& distributor) const;
+    void start_forwarding_thread();
+    void stop_forwarding_thread();
+    void prepare_forwarding_routing_tables();
+    void prepare_forwarding_destinations();
+    void publish_local_nvlink_receive_buffers() const;
+    ForwardDestinationState load_forward_destination(int dst_gpu) const;
+    const ForwardDestinationBufferState& forward_destination_buffer(
+        const ForwardDestinationState& destination,
+        int source_node_rank) const;
+    std::string nvlink_exchange_file(int gpu_index) const;
+    void forwarding_loop(int lane = 0);
+    std::vector<std::size_t> nvlink_forward_peer_order() const;
+    std::size_t forwarding_tokens_for_peer(const PeerState& peer) const;
+    bool forwarding_batch_available(
+        const PeerState& peer,
+        const std::vector<ChunkDescriptor>& chunks,
+        std::size_t batch_start_token,
+        std::size_t batch_tokens,
+        uint64_t required_count) const;
+    bool forwarding_chunk_available(
+        const PeerState& peer,
+        const ChunkDescriptor& chunk,
+        uint64_t required_count) const;
+    ForwardingBatchCompletion issue_forwarding_batch(
+        const PeerState& peer,
+        const PeerGpuBuffers& buffers,
+        uint64_t iteration,
+        std::size_t batch_index_in_iteration,
+        std::size_t batch_start_token,
+        std::size_t batch_tokens);
+    void issue_local_router_forwarding_batch(
+        uint64_t iteration,
+        std::size_t batch_index_in_iteration,
+        std::size_t batch_start_token,
+        std::size_t batch_tokens);
+    void process_local_router_forwarding_iteration(uint64_t iteration);
+    void request_local_router_input_ready(uint64_t iteration);
+    bool consume_local_router_input_ready();
+    void wait_for_local_router_input_ready(uint64_t iteration) const;
+    void forwarding_ready_loop();
+    void record_out_of_order_forwarding_arrival(std::size_t peer_index, std::size_t chunk_index);
+    void wait_for_forwarding_iteration(uint64_t iteration);
+    void set_forwarding_error(const std::string& error);
+    void check_forwarding_error() const;
+    std::size_t verify_immediates(
+        const PeerState& peer,
+        const std::vector<ChunkDescriptor>& chunks,
+        const std::vector<QPCompletionBaseline>& baselines,
+        const IterationAssignment& assignment,
+        uint64_t iteration) const;
+    std::size_t validate_received_data(uint64_t iteration) const;
+    void report_rdma_bandwidth_summary();
+    void report_iteration(
+        uint64_t iteration,
+        std::chrono::steady_clock::time_point start,
+        double seconds,
+        std::size_t total_bytes,
+        const std::vector<std::vector<QPCompletionBaseline>>& baselines,
+        const std::vector<IterationAssignment>& assignments,
+        std::size_t verification_errors,
+        std::size_t validation_errors);
+
+    ProxyConfig config_;
+    CudaBuffers cuda_buffers_;
+    RouterRouting router_routing_;
+    RdmaContext rdma_context_;
+    std::unique_ptr<RdmaContext> rdma_context2_;
+    bool second_device(int qp) const;
+    ProxyConfig qp_config(int qp) const;
+    RdmaContext& qp_context(int qp);
+    void configure_distributor_memory(DynamicChunkDistributor& distributor, std::size_t qps,
+        const MemoryRegionInfo& source, const MemoryRegionInfo& remote,
+        const MemoryRegionInfo& source2, const MemoryRegionInfo& remote2) const;
+    ConnectionManager connection_manager_;
+    std::vector<PeerState> peers_;
+    std::atomic<bool> forwarding_stop_{false};
+    std::unique_ptr<PreparedForwardingState> prepared_forwarding_;
+    std::thread forwarding_thread_;
+    std::thread forwarding_second_thread_;
+    std::unique_ptr<ForwardingPingPongState> forwarding_ping_pong_;
+    std::atomic<std::size_t> forwarding_batches_in_flight_{0};
+    std::thread forwarding_ready_thread_;
+    void* forwarding_stream_{nullptr};
+    // Initialized before forwarding threads start; immutable while they run.
+    bool forwarding_rdma_owner_flush_required_{false};
+    std::unique_ptr<CudaForwardEventPool> forwarding_event_pool_;
+    mutable std::mutex forwarding_mutex_;
+    std::vector<std::size_t> forwarding_next_batch_by_peer_;
+    std::vector<std::size_t> forwarding_next_chunk_by_peer_;
+    // Router-driven forwarding compacts each destination independently. These
+    // cursors are owned by the forwarding thread (preparation thread in the
+    // opt-in prepared mode) and reset at iteration
+    // boundaries; keeping the source cursor as well makes ordered forwarding
+    // an explicit invariant instead of an assumption of the copy layout.
+    std::vector<uint64_t> forwarding_compaction_iteration_by_peer_;
+    std::vector<std::size_t> forwarding_compaction_next_source_token_by_peer_;
+    std::vector<std::vector<std::size_t>> forwarding_compaction_next_destination_token_by_peer_;
+    std::vector<uint64_t> forwarding_out_of_order_next_batch_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_ready_batches_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_ready_chunks_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_out_of_order_current_start_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_out_of_order_current_end_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_out_of_order_current_length_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_out_of_order_current_tail_ready_by_peer_;
+    std::unique_ptr<std::atomic<uint64_t>[]> forwarding_out_of_order_current_version_by_peer_;
+    std::unique_ptr<std::atomic<uint64_t>[]> forwarding_out_of_order_ready_next_batch_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_out_of_order_command_start_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_out_of_order_command_length_by_peer_;
+    std::unique_ptr<std::atomic<uint64_t>[]> forwarding_out_of_order_command_sequence_by_peer_;
+    std::unique_ptr<std::atomic<uint64_t>[]> forwarding_out_of_order_command_ack_by_peer_;
+    std::unique_ptr<std::atomic<std::size_t>[]> forwarding_out_of_order_issued_chunks_by_peer_;
+    std::size_t forwarding_ready_peer_count_{0};
+    std::vector<ForwardingOutOfOrderPeerState> forwarding_out_of_order_peer_states_;
+    std::vector<ForwardDestinationState> forwarding_destinations_;
+    std::vector<ForwardNotificationDestinationState> forwarding_notification_destinations_;
+    std::vector<ForwardingIterationStats> forwarding_iteration_stats_;
+    std::vector<ChunkDescriptor> local_router_forwarding_chunks_;
+    std::vector<uint8_t> local_router_forwarding_routing_table_;
+    std::vector<std::size_t> local_router_next_destination_token_;
+    const GpuBuffer* local_router_staging_buffer_{nullptr};
+    std::mutex forwarding_stream_mutex_;
+    std::atomic<uint64_t> local_router_forwarding_completed_iterations_{0};
+    bool local_router_input_staged_{false};
+    // Separate coordinator -> notification-receiver mailbox: epoch=iteration+1,
+    // zero means no request. Payload is immutable from release-request through
+    // acquire-completion; the shared notification queues remain single-producer.
+    std::atomic<uint64_t> local_router_input_early_ready_requested_{0};
+    std::atomic<uint64_t> local_router_input_early_ready_completed_{0};
+    std::size_t local_router_input_early_ready_tokens_{0};
+    // Installed only by the friend fixture before the receiver can consume work.
+    std::function<void()> local_router_input_early_ready_test_hook_;
+    std::string forwarding_error_;
+    std::atomic<uint64_t> forwarding_batch_available_calls_{0};
+    std::atomic<uint64_t> forwarding_batch_available_total_ns_{0};
+    std::atomic<uint64_t> forwarding_batches_issued_{0};
+    std::thread nvlink_forward_notification_thread_;
+    std::thread nvlink_forward_notification_dispatch_thread_;
+    NvlinkForwardNotificationHeader* nvlink_forward_notification_header_{nullptr};
+    std::size_t nvlink_forward_notification_size_{0};
+    int nvlink_forward_notification_fd_{-1};
+    std::string nvlink_forward_notification_name_;
+    std::unique_ptr<NvlinkForwardNotificationDispatchState> nvlink_forward_notification_dispatch_;
+    std::atomic<bool> nvlink_forward_notification_dispatch_stop_{false};
+    std::atomic<bool> nvlink_forward_notification_receiver_stop_{false};
+    std::atomic<uint64_t> nvlink_forward_notifications_enqueued_{0};
+    std::atomic<uint64_t> nvlink_forward_notifications_sent_{0};
+    std::atomic<uint64_t> nvlink_forward_notifications_received_{0};
+    std::atomic<uint64_t> nvlink_forward_notifications_dropped_{0};
+    ReturnGroupProgress return_group_progress_;
+    int return_notification_groups_{0};
+    bool return_copies_configured_{false};
+    std::atomic<uint64_t> return_notifications_sent_{0}; // Completed group envelopes.
+    // Only the notification receiver polls this state, under DownReadyTrace's lock.
+    uint64_t return_batch_wait_iteration_{std::numeric_limits<uint64_t>::max()};
+    int return_batch_wait_group_{-1};
+    std::chrono::steady_clock::time_point return_batch_wait_start_;
+    std::mutex nvlink_forward_notification_log_mutex_;
+    std::deque<std::string> nvlink_forward_notification_log_queue_;
+    std::vector<double> rdma_iteration_bandwidth_gbps_;
+    std::vector<std::string> metadata_exchange_reports_;
+    std::vector<std::string> rdma_bandwidth_reports_;
+    bool iteration_prepared_{false};
+    uint64_t prepared_iteration_{0};
+    LocalIterationSyncHeader* local_iteration_sync_header_{nullptr};
+    std::size_t local_iteration_sync_size_{0};
+    int local_iteration_sync_fd_{-1};
+    std::string local_iteration_sync_name_;
+    bool initialized_{false};
+};
+
+}  // namespace rdma_proxy

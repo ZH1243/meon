@@ -1,0 +1,63 @@
+# One routed iteration
+
+Follow one token owned by GPU `g` on node A. It can select experts on several GPUs and nodes. The forward path delivers an input row once per selected destination domain. The down path produces a contribution for each expert assignment. Returns and reductions reconstruct one row at the original token position.
+
+```mermaid
+flowchart TD
+  R["Original token and top-k assignments"] --> M["x3 token IDs, x4 GPU masks, per-expert indices"]
+  M --> L["Local x3 staging"]
+  M --> N["Same-index GPU on another node via RDMA"]
+  L --> F["Direct or compact inputs on each computing GPU"]
+  N --> F
+  F --> P["Completion receiver publishes gather descriptors and ready prefix"]
+  P --> U["Streamed QuACK up GEMM and activation"]
+  P --> S["Scatter addresses and optional route weights"]
+  U --> D["Down GEMM and local expert reduction"]
+  S --> D
+  D --> C["Return peer partials via NVLink and combine on the source-index GPU"]
+  C --> B["Return remote node sums via reverse RDMA"]
+  B --> T["Combine in original token order"]
+  C --> T
+```
+
+## Processes, storage and setup
+
+The torchrun launcher assigns one Python process to each local rank. The worker maps logical ranks to CUDA devices and NICs, loads PyTorch and the shared library into the same process, and installs a device allocator before native initialization. C++ requests typed buffers through a versioned callback. Python retains the tensors and callback, including aliases, until native teardown. The standalone executable uses the same `Proxy` implementation with its own allocation path. [Worker and allocator](../python/rdma_proxy_worker.py) · [Embedding contract](../include/rdma_proxy_c_api.h)
+
+Across nodes, GPU `g` exchanges with GPU `g`. TCP exchanges connection/registration information and routing metadata. Each RC QP has a send worker and a CQ poller. The poller decodes immediate records and reposts receive WRs. With two NICs per GPU each PD registers the buffers separately. A claimed chunk uses the claiming QP's matching key pair. Within a node, CUDA IPC lets a source submit copies into the receiving GPU's allocations. [Connections](../native/src/rdma_connection.cpp) · [QP workers](../native/src/qp_worker.cpp) · [Hardware diagram](system_arch_graph_01.md)
+
+The benchmark fixes its routing table during setup. `R[token, slot]` names a global expert. The production CUDA node-mask path bins and scans 256-token chunks, emits stable destination-node lists and rebuilds the expert lists. In each node slice, `x3` is the original token ID and the corresponding byte in `x4` encodes the GPUs selected on that node. Sorting is by descending source-relative mask with stable token order for ties. Bit `(g - destination_gpu) mod gpus_per_node` represents a destination; the native routing layer also provides normalized masks for consumers. Per-expert offsets delimit indices into the destination's input rows. For same-index traffic, those indices address the full x3 slice in the RDMA buffer. For other GPUs they address the x4-filtered compact sequence. Optional FP32 weights align with individual positions in the expert lists, including multiple experts for the same token. [Routing adapter](../native/src/router_routing.cpp) · [CUDA and CuTe metadata contracts](../metadata/README.md)
+
+The checkout contains three ways to exercise metadata: the raw CUDA entry points linked into the proxy, a PyTorch extension built from that same CUDA translation unit, and CuTe implementations used by the metadata experiments. The GPU exchange experiment also has a one-node specialization. The two exchange benchmarks have separate runtime ABIs and processes. [CPU exchange](../benchmarks/router_metadata_exchange/README.md) · [GPU exchange](../benchmarks/router_metadata_exchange2/README.md)
+
+## Prepare, forward and publish
+
+1. **Reset this generation.** Python resets the optional combine prefix/slots after the previous consumers have joined. Native preparation resets the iteration's gather state, ready flags, cursors, counters and return state as configured. Local iteration synchronization can span the GPU processes. A Python coordinator thread and the main thread cross a two-party barrier, allowing native communication to progress while Python submits work on its compute stream.
+2. **Move input rows.** With local staging, the own-node x3 payload was gathered once before iteration zero. Each iteration forwards selected rows from that input to other local GPUs. Remote RDMA writes pack x3 rows into the same-index peer receive buffer. Local staging can overlap the first remote RDMA send. Remote NVLink forwarding waits for the local drain in this mode. Direct same-index inputs alias the RDMA receive allocation. Forwarded inputs have separate compact cursors per global source and destination. CUDA copy streams, the optional preparation/submit/epilogue threads and the notification receiver run independently. [Forwarding implementation](../native/src/proxy.cpp)
+3. **Establish visibility.** Forward completion requires the configured copy completion event/synchronization. Direct RDMA consumers also require owner visibility, including a GPUDirect flush where the platform needs it. Only then can the sender expose a completed range through the destination's per-source FIFO. With early-local readiness the receiver can schedule the already-staged own x3 range after the iteration barrier. A separate mailbox preserves the FIFO's single producer. Later local completions still account for peer copies and round retirement.
+4. **Select and publish work.** The receiver updates contiguous source readiness. The default schedules eligible work after each data notification. Complete-round mode collects completions across sources for one iteration, phase, source-node context and batch ordinal, then schedules once. Zero-length and end markers distinguish an empty destination or exhausted source from a delayed producer. Future records are drained without exposing their rows early. Both policies schedule complete expert M clusters and an eligible final partial cluster. The receiver uploads the descriptors, then updates the ready-row prefix on the publication stream. Per-entry and coalesced publication change how many writes expose the same ordered descriptors. Published rows are immutable for the iteration. [Scheduler and protocol details](runtime.md#optional-complete-round-gather-scheduling)
+
+## Up, scatter and down
+
+The multi-input up table contains `[expert, cid_n_base, start_0, end_0, …]`. The second column is the first N-cluster index of the swizzle group. Each half-open range addresses that source's padded int32 `A_idx` array. Source order must agree across tables, indices, weights and input buffers. A descriptor's packed output begins at the sum of the starts. N groups repeat the same M work. The persistent up kernel waits for ready rows and gathers from those sources while more transfers are in flight.
+
+Native allocation and QuACK must agree on `cta_tile_m * cluster_m`. Hopper uses its per-CTA M tile. On Blackwell, the supported two-CTA MMA configurations split M across a pair. The worker resolves actual device capacity before table allocation. For SwiGLU the GEMM computes twice the requested activation width. Down consumes the activated rows on the same compute stream. A separate four-column down gather table, expert waves, bulk-row stores and ready publication are available. Explicit up/down CTA budgets and combine residency checks matter when a persistent consumer spins on another kernel's progress. [Worker runners](../python/rdma_proxy_worker.py) · [Geometry and residency](features.md)
+
+GPU scatter preparation decodes one copy of each M descriptor from the completed up table, preserves the exact source/list position for weights, and compacts distinct used input rows in ascending order per source. Contributions from several local experts selected by one token reduce into the same destination. With N-tile-major output the next tile starts at a stride based on the **valid row count**. Padding/capacity does not participate in the reduction. Weighted down multiplies each FP32 accumulator by its route weight before conversion to the output type and additive store. Later combines sum those partials without applying the weight again.
+
+CPU scatter borrows the final device address/weight storage. Per-batch publication copies each M batch's metadata before its gather readiness. Deferred mode packs from the completed host table. Threaded mode packs committed prefixes on a persistent native thread, outside the scheduler lock. Both one-copy modes wait for final gather submission and complete packing, upload the slab on the publication stream, then record an event. Before down, the main host thread waits for **this iteration's record submission**, then queues a compute-stream wait for that event. The native coordinator continues driving communication during the bounded host wait. Staging, the event and the owning tensors survive the transfer. [Scatter ABI](../include/rdma_proxy_c_api.h) · [Publication tests](../tests/python/test_cpu_scatter_publication.py)
+
+## Return, reduce and retire
+
+| Stage | Producer, consumer and completion evidence |
+| --- | --- |
+| Down → same-node returns | The worker schedules valid counts before down, or reuses the fixed CPU counts. Whole-buffer return waits for the recorded down-done event. Per-group return can start from the mapped, system-release down prefix. Return copies run on a dedicated stream. Each logical producer visits peers cyclically starting at its successor, keeping all source-node spans for a destination together. |
+| Return synchronization → intra-node combine | Optional batch-start synchronization covers one column group across **all** local producers, including empty groups. A waiting receiver retries while servicing forward notifications. Copy completion precedes return notification. The receiving proxy aggregates complete incoming group prefixes and can publish them to the GPU. The combine stream waits on the mapping-ready event and gates reads on readiness while down continues. It sums retained local output and returned peers in computing-GPU order. |
+| Intra-node combine → reverse RDMA | Each source node has its own packed output domain. The combine CTAs publish a completed column-group prefix after stores, including the mapped prefix needed by native RDMA. Existing QP workers send groups over registered memory after their forward work. The coordinator waits for outgoing and incoming markers and required receive visibility. |
+| Node sums → original token order | For each original source GPU, the final kernel inverts its outgoing x3 lists, reads the local sum and any remote sums, and writes a dense row per original token. An absent contribution is zero. Single-node mode uses the local domain directly. |
+
+[Return copies](../native/src/return_copies.cpp) · [IPC exchange](../python/rdma_return_exchange.py) · [Reverse RDMA](../native/src/rdma_return.cpp) · [Intra-node combine](../python/intra_node_combine.py) · [Original-token combine](../python/inter_node_combine.py)
+
+After native completion, the worker joins the compute event, reads any requested readiness trace, completes the same-node return exchange, joins the combine work and waits for peer readers. Optional projection validation uses chunked FP32 references, the actual descriptors and independent source assignments where available. With end-of-iteration reset, it clears down destinations **after** all these readers and checks, waits for that reset even on the final iteration, and charges it to the completed iteration. The default clears before down. Wave and ready-prefix resets retain their separate ordering. [Numerical reference](../python/projection_validation.py) · [Repeated composition tests](../tests/python/test_worker_composition.py)
+
+The worker aborts an active combine when unwinding, synchronizes the compute stream, joins the coordinator and shuts down/destroys the native handle while the borrowed storage is still alive. Native workers must retire pending copies/packing and propagate timeout or cancellation. Successful IPC teardown waits for workers to stop, closes imported handles, waits for peers to close theirs, then releases exports. Partial setup or failed shutdown retains potentially shared allocations for the process lifetime. [Exceptional teardown tests](../tests/python/test_return_exchange_cleanup.py)

@@ -1,0 +1,1109 @@
+#include "config.hpp"
+
+#include <cassert>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+
+int main(int argc, char** argv) {
+    assert(argc == 2);
+    const auto config = rdma_proxy::load_config_file(argv[1]);
+
+    assert(config.node_rank == 0);
+    assert(config.num_nodes == 4);
+    assert(config.local_gpu_index == 0);
+    assert(config.num_gpus_per_node == 8);
+    assert(config.num_tokens == 5000);
+    assert(config.token_dimension == 128);
+    assert(config.tokens_per_chunk == 32);
+    assert(config.num_qps_per_peer == 10);
+    assert(config.rdma_device_name2.empty());
+    assert(config.rdma_port2 == 0 && config.gid_index2 == -2);
+    const char* dual_args[] = {"rdma_cpu_proxy", "--config", argv[1],
+        "--rdma_device_name=nic0", "--rdma_device_name2=nic1", "--num_qps_per_peer=20",
+        "--rdma_port2=2", "--gid_index2=7"};
+    const auto dual = rdma_proxy::load_config(8, const_cast<char**>(dual_args));
+    assert(dual.rdma_device_name2 == "nic1" && dual.num_qps_per_peer == 20 &&
+           dual.rdma_port2 == 2 && dual.gid_index2 == 7);
+    {
+        std::ofstream out("dual_device_config.json");
+        out << R"({"num_nodes":1, "num_gpus_per_node":1, "num_tokens":64, "token_dimension":8,
+                   "rdma_device_name":"nic0", "rdma_device_name2":"nic1",
+                   "num_qps_per_peer":20, "rdma_port2":2, "gid_index2":7,
+                   "expert_gemm_device_capacity":10, "expert_gemm_m_tile":128,
+                   "expert_gemm_cluster_m":2})";
+    }
+    const auto dual_json = rdma_proxy::load_config_file("dual_device_config.json");
+    assert(dual_json.rdma_device_name2 == "nic1" && dual_json.rdma_port2 == 2 &&
+           dual_json.gid_index2 == 7);
+    assert(dual_json.expert_gemm_device_capacity == 10);
+    assert(rdma_proxy::expert_gemm_cta_m_tile(dual_json) == 64);
+    assert(rdma_proxy::expert_gemm_cluster_rows(dual_json) == 128);
+    assert(config.data_signal_interval == 16);
+    assert(config.max_in_flight_chunks_per_qp == 4);
+    assert(!config.rdma_chunk_per_token_sge_enabled);
+    assert(!config.rdma_discontinuous_token_payload_enabled);
+    assert(!config.router_routing_enabled);
+    assert(config.router_num_experts == 256);
+    assert(config.router_top_k == 8);
+    assert(config.router_seed == 1234);
+    assert(config.router_metadata_port_base == 19515);
+    assert(config.num_iterations == 1);
+    assert(config.completion_timeout_ms == 30000);
+    assert(config.dtype == rdma_proxy::DataType::kBF16);
+    assert(config.mock_mode);
+    assert(config.fill_test_data);
+    assert(config.validate_data);
+    assert(!config.sequential_peer_transfers);
+    assert(!config.local_forwarding_rdma_overlap_enabled);
+    assert(!config.nvlink_forwarding_enabled);
+    assert(config.nvlink_forward_threshold_tokens == 700);
+    assert(config.nvlink_forward_threshold_chunks == 0);
+    assert(config.nvlink_forward_min_threshold_chunks == 0);
+    assert(config.nvlink_forward_max_threshold_chunks == 0);
+    assert(!config.nvlink_forward_out_of_order_chunks_enabled);
+    assert(!rdma_proxy::nvlink_forward_dynamic_threshold_enabled(config));
+    assert(rdma_proxy::effective_nvlink_forward_threshold_tokens(config) == 700);
+    assert(config.nvlink_forward_chunk_tokens == 100);
+    assert(config.nvlink_forward_use_batch_api);
+    assert(config.nvlink_forward_stream_nonblocking);
+    assert(!config.nvlink_forward_synchronize_batches);
+    assert(!config.nvlink_forward_completion_notifications_enabled);
+    assert(!config.nvlink_return_completion_notifications_enabled);
+    assert(!config.nvlink_return_local_batch_sync_enabled);
+    assert(!config.nvlink_return_ready_gpu_publication_enabled);
+    assert(!config.nvlink_forward_notification_flush_only_enabled);
+    assert(!config.nvlink_forward_notification_flush_per_entry_enabled);
+    assert(config.nvlink_forward_notification_scheduling_mode == "per_notification");
+    assert(!config.nvlink_forward_notification_scheduling_diagnostics);
+    assert(!config.router_local_input_staging_enabled);
+    assert(!config.router_local_input_early_ready_enabled);
+    assert(config.nvlink_forward_notification_flag_update_mode ==
+           rdma_proxy::NvlinkForwardNotificationFlagUpdateMode::kStreamWrite);
+    assert(rdma_proxy::to_string(
+               rdma_proxy::NvlinkForwardNotificationFlagUpdateMode::kMemcpy) ==
+           "memcpy");
+    bool rejected_invalid_flag_update_mode = false;
+    try {
+        (void)rdma_proxy::nvlink_forward_notification_flag_update_mode_from_string(
+            "invalid");
+    } catch (const std::runtime_error&) {
+        rejected_invalid_flag_update_mode = true;
+    }
+    assert(rejected_invalid_flag_update_mode);
+    assert(config.expert_gemm_m_tile == 128);
+    assert(config.expert_gemm_device_capacity == 9);
+    assert(config.expert_gemm_n_tile == 256);
+    assert(config.expert_gemm_dimension == 8192);
+    assert(config.expert_gemm_cluster_m == 1);
+    assert(config.expert_gemm_max_swizzle_size == 8);
+    assert(config.nvlink_forward_notification_queue_depth == 1024);
+    assert(!config.nvlink_forward_notification_log_enabled);
+    assert(config.nvlink_forward_notification_log_dir == "/tmp/rdma_cpu_proxy_nvlink_notifications");
+    assert(!config.nvlink_forward_local_batch_sync_enabled);
+    assert(!config.nvlink_forward_ping_pong_enabled);
+    assert(config.nvlink_forward_ping_pong_handoff_copy == 1);
+    assert(config.nvlink_forward_synchronize_iteration);
+    assert(!config.nvlink_forward_log_batches);
+    assert(!config.log_qp_reports);
+    assert(!config.log_marker_wait_reports);
+    assert(!config.nvlink_forward_use_round_robin);
+    assert(config.nvlink_routing_probability == 0.5);
+    assert(config.nvlink_routing_seed == 1);
+    assert(config.nvlink_forward_exchange_dir == "/tmp/rdma_cpu_proxy_nvlink");
+    assert(!config.local_iteration_sync_enabled);
+    assert(config.local_iteration_sync_dir == "/tmp/rdma_cpu_proxy_local_iteration_sync");
+    assert(config.local_iteration_sync_run_id.empty());
+    assert(config.rdma_bandwidth_summary_dir == "/tmp/rdma_cpu_proxy_results");
+    assert(config.nvlink_forward_destinations.empty());
+    assert(config.cpu_affinity == "auto");
+    assert(config.peers.size() == 3);
+    assert(config.peers[0].node_rank == 1);
+    assert(config.peers[0].host == "node-b.example.com");
+
+    const char* multi_peer_cli_args[] = {
+        "test_config",
+        "--config",
+        argv[1],
+        "--listen_port=18520",
+    };
+    const auto multi_peer_cli_config = rdma_proxy::load_config(4, const_cast<char**>(multi_peer_cli_args));
+    assert(multi_peer_cli_config.listen_port == 18520);
+    for (const auto& peer : multi_peer_cli_config.peers) {
+        assert(peer.port == 18520);
+    }
+
+    const char* single_peer_config = "single_peer_cli_config.json";
+    {
+        std::ofstream out(single_peer_config);
+        out << R"json({
+  "node_rank": 0,
+  "num_nodes": 2,
+  "local_gpu_index": 0,
+  "num_gpus_per_node": 8,
+  "num_tokens": 5000,
+  "token_dimension": 128,
+  "tokens_per_chunk": 32,
+  "num_qps_per_peer": 10,
+  "rdma_device_name": "mlx5_0",
+  "rdma_port": 1,
+  "gid_index": 3,
+  "cuda_device_id": 0,
+  "listen_port": 18515,
+  "connection_manager_port": 18515,
+  "completion_poll_batch_size": 16,
+  "data_signal_interval": 0,
+  "max_in_flight_chunks_per_qp": 2,
+  "send_queue_depth": 256,
+  "recv_queue_depth": 256,
+  "cq_depth": 512,
+  "dtype": "bf16",
+  "mock_mode": true,
+  "log_level": "info",
+  "peers": [
+    {
+      "node_rank": 1,
+      "host": "node-b.example.com",
+      "port": 18515
+    }
+  ]
+})json";
+    }
+
+    const char* cli_args[] = {
+        "test_config",
+        "--config",
+        single_peer_config,
+        "--listen_port=18516",
+        "--peer_host=node-b-gpu1.example.com",
+    };
+    const auto cli_config = rdma_proxy::load_config(5, const_cast<char**>(cli_args));
+    assert(cli_config.listen_port == 18516);
+    assert(cli_config.peers.size() == 1);
+    assert(cli_config.peers[0].port == 18516);
+    assert(cli_config.peers[0].host == "node-b-gpu1.example.com");
+
+    const char* peer_port_args[] = {
+        "test_config",
+        "--config",
+        argv[1],
+        "--peer_port=18521",
+        "--num_iterations=3",
+        "--completion_timeout_ms=1000",
+        "--validate_data=false",
+        "--sequential_peer_transfers=true",
+        "--local_forwarding_rdma_overlap_enabled=true",
+        "--log_qp_reports=true",
+        "--log_marker_wait_reports=true",
+        "--nvlink_forward_local_batch_sync_enabled=false",
+        "--nvlink_forward_ping_pong_enabled=false",
+        "--nvlink_forward_ping_pong_handoff_copy=5",
+        "--local_iteration_sync_enabled=true",
+        "--local_iteration_sync_dir=/tmp/rdma_cpu_proxy_test_local_sync",
+        "--local_iteration_sync_run_id=test_cli",
+        "--rdma_bandwidth_summary_dir=/tmp/rdma_cpu_proxy_test_results",
+        "--nvlink_forward_threshold_chunks=5",
+        "--nvlink_forward_min_threshold_chunks=2",
+        "--nvlink_forward_max_threshold_chunks=6",
+        "--nvlink_forward_out_of_order_chunks_enabled=true",
+        "--expert_gemm_m_tile=64",
+        "--expert_gemm_device_capacity=10",
+        "--expert_gemm_n_tile=128",
+        "--expert_gemm_dimension=4096",
+        "--expert_gemm_cluster_m=2",
+        "--expert_gemm_max_swizzle_size=4",
+        "--nvlink_forward_notification_flush_per_entry_enabled=false",
+        "--nvlink_forward_notification_flag_update_mode=memcpy",
+        "--cpu_affinity=0-95,192-287",
+    };
+    const auto peer_port_config = rdma_proxy::load_config(
+        static_cast<int>(sizeof(peer_port_args) / sizeof(peer_port_args[0])),
+        const_cast<char**>(peer_port_args));
+    for (const auto& peer : peer_port_config.peers) {
+        assert(peer.port == 18521);
+    }
+    assert(peer_port_config.num_iterations == 3);
+    assert(peer_port_config.completion_timeout_ms == 1000);
+    assert(!peer_port_config.validate_data);
+    assert(peer_port_config.sequential_peer_transfers);
+    assert(peer_port_config.local_forwarding_rdma_overlap_enabled);
+    assert(peer_port_config.log_qp_reports);
+    assert(peer_port_config.log_marker_wait_reports);
+    assert(peer_port_config.local_iteration_sync_enabled);
+    assert(peer_port_config.local_iteration_sync_dir == "/tmp/rdma_cpu_proxy_test_local_sync");
+    assert(peer_port_config.local_iteration_sync_run_id == "test_cli");
+    assert(peer_port_config.rdma_bandwidth_summary_dir == "/tmp/rdma_cpu_proxy_test_results");
+    assert(peer_port_config.nvlink_forward_threshold_chunks == 5);
+    assert(peer_port_config.nvlink_forward_min_threshold_chunks == 2);
+    assert(!peer_port_config.nvlink_forward_ping_pong_enabled);
+    assert(peer_port_config.nvlink_forward_ping_pong_handoff_copy == 5);
+    assert(peer_port_config.nvlink_forward_max_threshold_chunks == 6);
+    assert(peer_port_config.nvlink_forward_out_of_order_chunks_enabled);
+    assert(peer_port_config.expert_gemm_m_tile == 64);
+    assert(peer_port_config.expert_gemm_device_capacity == 10);
+    assert(peer_port_config.expert_gemm_n_tile == 128);
+    assert(peer_port_config.expert_gemm_dimension == 4096);
+    assert(peer_port_config.expert_gemm_cluster_m == 2);
+    assert(peer_port_config.expert_gemm_max_swizzle_size == 4);
+    assert(!peer_port_config.nvlink_forward_notification_flush_per_entry_enabled);
+    assert(peer_port_config.nvlink_forward_notification_flag_update_mode ==
+           rdma_proxy::NvlinkForwardNotificationFlagUpdateMode::kMemcpy);
+    assert(peer_port_config.cpu_affinity == "0-95,192-287");
+
+    auto invalid_overlap_config = peer_port_config;
+    invalid_overlap_config.sequential_peer_transfers = false;
+    bool rejected_overlap_without_sequential_transfers = false;
+    try {
+        rdma_proxy::validate_config(invalid_overlap_config);
+    } catch (const std::runtime_error&) {
+        rejected_overlap_without_sequential_transfers = true;
+    }
+    assert(rejected_overlap_without_sequential_transfers);
+
+    const char* signal_interval_args[] = {
+        "test_config",
+        "--config",
+        argv[1],
+        "--data_signal_interval=0",
+        "--max_in_flight_chunks_per_qp=8",
+        "--rdma_chunk_per_token_sge_enabled=true",
+        "--rdma_discontinuous_token_payload_enabled=true",
+    };
+    const auto signal_interval_config = rdma_proxy::load_config(7, const_cast<char**>(signal_interval_args));
+    assert(signal_interval_config.data_signal_interval == 0);
+    assert(signal_interval_config.max_in_flight_chunks_per_qp == 8);
+    assert(signal_interval_config.rdma_chunk_per_token_sge_enabled);
+    assert(signal_interval_config.rdma_discontinuous_token_payload_enabled);
+
+    auto invalid_discontinuous_config = signal_interval_config;
+    invalid_discontinuous_config.rdma_chunk_per_token_sge_enabled = false;
+    bool rejected_discontinuous_without_sge = false;
+    try {
+        rdma_proxy::validate_config(invalid_discontinuous_config);
+    } catch (const std::runtime_error&) {
+        rejected_discontinuous_without_sge = true;
+    }
+    assert(rejected_discontinuous_without_sge);
+
+    auto router_config = signal_interval_config;
+    router_config.router_routing_enabled = true;
+    router_config.router_num_experts = 256;
+    router_config.router_top_k = 8;
+    router_config.rdma_chunk_per_token_sge_enabled = false;
+    router_config.rdma_discontinuous_token_payload_enabled = false;
+    rdma_proxy::validate_config(router_config);
+    assert(rdma_proxy::effective_rdma_chunk_per_token_sge_enabled(router_config));
+    assert(rdma_proxy::effective_rdma_discontinuous_token_payload_enabled(router_config));
+
+    auto router_nvlink_config = router_config;
+    router_nvlink_config.nvlink_forwarding_enabled = true;
+    router_nvlink_config.nvlink_forward_threshold_tokens = 700;
+    router_nvlink_config.nvlink_forward_chunk_tokens = 100;
+    rdma_proxy::validate_config(router_nvlink_config);
+
+    auto router_local_batch_sync_config = router_nvlink_config;
+    router_local_batch_sync_config.nvlink_forward_synchronize_batches = true;
+    router_local_batch_sync_config.nvlink_forward_local_batch_sync_enabled = true;
+    rdma_proxy::validate_config(router_local_batch_sync_config);
+
+    auto ping_pong_config = router_local_batch_sync_config;
+    ping_pong_config.nvlink_forward_completion_notifications_enabled = true;
+    ping_pong_config.nvlink_forward_ping_pong_enabled = true;
+    ping_pong_config.nvlink_forward_ping_pong_handoff_copy = 3;
+    rdma_proxy::validate_config(ping_pong_config);
+    const auto ping_pong_summary = rdma_proxy::config_summary(ping_pong_config);
+    assert(ping_pong_summary.find("nvlink_forward_ping_pong_enabled=true") != std::string::npos);
+    assert(ping_pong_summary.find("nvlink_forward_ping_pong_handoff_copy=3") != std::string::npos);
+    const char* ping_pong_args[] = {
+        "test_config", "--config", argv[1],
+        "--router_routing_enabled=true", "--nvlink_forwarding_enabled=true",
+        "--nvlink_forward_use_round_robin=false", "--nvlink_forward_use_batch_api=true",
+        "--nvlink_forward_synchronize_batches=true",
+        "--nvlink_forward_local_batch_sync_enabled=true",
+        "--nvlink_forward_completion_notifications_enabled=true",
+        "--nvlink_forward_ping_pong_enabled=true",
+        "--nvlink_forward_ping_pong_handoff_copy=3",
+    };
+    const auto parsed_ping_pong = rdma_proxy::load_config(
+        static_cast<int>(sizeof(ping_pong_args) / sizeof(ping_pong_args[0])),
+        const_cast<char**>(ping_pong_args));
+    assert(parsed_ping_pong.nvlink_forward_ping_pong_enabled);
+    assert(parsed_ping_pong.nvlink_forward_ping_pong_handoff_copy == 3);
+    for (int invalid = 0; invalid < 8; ++invalid) {
+        auto bad = ping_pong_config;
+        if (invalid == 0) bad.nvlink_forward_ping_pong_handoff_copy = 0;
+        if (invalid == 1) bad.router_routing_enabled = false;
+        if (invalid == 2) bad.nvlink_forward_use_round_robin = true;
+        if (invalid == 3) bad.nvlink_forward_out_of_order_chunks_enabled = true;
+        if (invalid == 4) bad.nvlink_forward_use_batch_api = false;
+        if (invalid == 5) bad.nvlink_forward_local_batch_sync_enabled = false;
+        if (invalid == 6) bad.nvlink_forward_completion_notifications_enabled = false;
+        if (invalid == 7) bad.nvlink_forward_synchronize_batches = false;
+        bool rejected = false;
+        try { rdma_proxy::validate_config(bad); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
+
+    assert(!config.nvlink_forward_local_staging_prepared_enabled);
+    assert(!config.nvlink_forward_preparation_enabled);
+    assert(config.nvlink_forward_prepared_batch_chunks == 0);
+    assert(config.nvlink_forward_prepared_queue_depth == 2);
+    auto prepared_config = ping_pong_config;
+    prepared_config.nvlink_forward_ping_pong_enabled = false;
+    prepared_config.nvlink_forward_preparation_enabled = true;
+    prepared_config.nvlink_forward_prepared_batch_chunks = 3;
+    // No legacy thresholds are needed, and n may exceed the total chunk count.
+    prepared_config.nvlink_forward_threshold_tokens = 0;
+    prepared_config.nvlink_forward_threshold_chunks = 0;
+    prepared_config.nvlink_forward_min_threshold_chunks = 0;
+    prepared_config.nvlink_forward_max_threshold_chunks = 0;
+    prepared_config.nvlink_forward_chunk_tokens = 0;
+    rdma_proxy::validate_config(prepared_config);
+    auto unsynchronized_prepared = prepared_config;
+    unsynchronized_prepared.nvlink_forward_local_batch_sync_enabled = false;
+    rdma_proxy::validate_config(unsynchronized_prepared);
+    // Report all conflicting flags even when the optional batch barrier is off.
+    auto conflicting_prepared = unsynchronized_prepared;
+    conflicting_prepared.nvlink_forward_synchronize_batches = false;
+    conflicting_prepared.nvlink_forward_use_batch_api = false;
+    bool conflicts_reported = false;
+    try { rdma_proxy::validate_config(conflicting_prepared); }
+    catch (const std::runtime_error& error) {
+        const std::string message = error.what();
+        assert(message.find("nvlink_forward_synchronize_batches=false (requires true)") != std::string::npos);
+        assert(message.find("nvlink_forward_use_batch_api=false (requires true)") != std::string::npos);
+        assert(message.find("nvlink_forward_local_batch_sync_enabled") == std::string::npos);
+        conflicts_reported = true;
+    }
+    assert(conflicts_reported);
+    assert(!prepared_config.nvlink_forward_ping_pong2_enabled);
+    auto ping_pong2 = prepared_config;
+    ping_pong2.nvlink_forward_ping_pong2_enabled = true;
+    rdma_proxy::validate_config(ping_pong2);
+    ping_pong2.nvlink_forward_preparation_enabled = false;
+    bool ping_pong2_rejected = false;
+    try { rdma_proxy::validate_config(ping_pong2); }
+    catch (const std::runtime_error&) { ping_pong2_rejected = true; }
+    assert(ping_pong2_rejected);
+    assert(!prepared_config.nvlink_forward_submit_epilogue_enabled);
+    auto submit_epilogue = prepared_config;
+    submit_epilogue.nvlink_forward_submit_epilogue_enabled = true;
+    rdma_proxy::validate_config(submit_epilogue);
+    auto return_notifications = submit_epilogue;
+    return_notifications.nvlink_forward_completion_notifications_enabled = true;
+    return_notifications.nvlink_return_completion_notifications_enabled = true;
+    rdma_proxy::validate_config(return_notifications);
+    auto synchronized_returns = return_notifications;
+    synchronized_returns.nvlink_return_local_batch_sync_enabled = true;
+    // The return start barrier is independent of the forwarding start barrier.
+    synchronized_returns.nvlink_forward_local_batch_sync_enabled = false;
+    rdma_proxy::validate_config(synchronized_returns);
+    synchronized_returns.nvlink_return_completion_notifications_enabled = false;
+    bool rejected_return_sync_without_notifications = false;
+    try { rdma_proxy::validate_config(synchronized_returns); }
+    catch (const std::runtime_error& error) {
+        const std::string message = error.what();
+        assert(message.find("nvlink_return_local_batch_sync_enabled requires") != std::string::npos);
+        assert(message.find("nvlink_return_completion_notifications_enabled=true") != std::string::npos);
+        rejected_return_sync_without_notifications = true;
+    }
+    assert(rejected_return_sync_without_notifications);
+    auto gpu_return_notifications = return_notifications;
+    gpu_return_notifications.nvlink_return_ready_gpu_publication_enabled = true;
+    rdma_proxy::validate_config(gpu_return_notifications);
+    gpu_return_notifications.nvlink_return_completion_notifications_enabled = false;
+    bool rejected_gpu_without_notifications = false;
+    try { rdma_proxy::validate_config(gpu_return_notifications); }
+    catch (const std::runtime_error&) { rejected_gpu_without_notifications = true; }
+    assert(rejected_gpu_without_notifications);
+    for (int conflict = 0; conflict < 4; ++conflict) {
+        auto bad = return_notifications;
+        if (conflict == 0) bad.nvlink_forward_submit_epilogue_enabled = false;
+        if (conflict == 1) bad.nvlink_forward_completion_notifications_enabled = false;
+        if (conflict == 2) bad.router_routing_enabled = false;
+        if (conflict == 3) bad.num_iterations = 0;
+        bool rejected = false;
+        try { rdma_proxy::validate_config(bad); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
+    for (int conflict = 0; conflict < 3; ++conflict) {
+        auto bad = submit_epilogue;
+        if (conflict == 0) bad.nvlink_forward_preparation_enabled = false;
+        if (conflict == 1) bad.nvlink_forward_ping_pong_enabled = true;
+        if (conflict == 2) bad.nvlink_forward_ping_pong2_enabled = true;
+        bool rejected = false;
+        try { rdma_proxy::validate_config(bad); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
+    assert(!submit_epilogue.nvlink_forward_prepared_atomic_ring_enabled);
+    auto atomic_ring = submit_epilogue;
+    atomic_ring.nvlink_forward_prepared_atomic_ring_enabled = true;
+    rdma_proxy::validate_config(atomic_ring);
+    atomic_ring.nvlink_forward_submit_epilogue_enabled = false;
+    bool atomic_ring_rejected = false;
+    try { rdma_proxy::validate_config(atomic_ring); }
+    catch (const std::runtime_error&) { atomic_ring_rejected = true; }
+    assert(atomic_ring_rejected);
+    assert(submit_epilogue.nvlink_forward_completion_mode == "stream_sync");
+    auto query_config = submit_epilogue;
+    query_config.nvlink_forward_completion_mode = "stream_query";
+    rdma_proxy::validate_config(query_config);
+    for (int invalid = 0; invalid < 2; ++invalid) {
+        auto bad = query_config;
+        if (invalid == 0) bad.nvlink_forward_completion_mode = "unknown";
+        else bad.nvlink_forward_submit_epilogue_enabled = false;
+        bool rejected = false;
+        try { rdma_proxy::validate_config(bad); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
+    auto large_prepared = prepared_config;
+    large_prepared.nvlink_forward_prepared_batch_chunks = large_prepared.num_tokens + 1;
+    rdma_proxy::validate_config(large_prepared);
+    for (int invalid = 0; invalid < 11; ++invalid) {
+        auto bad = prepared_config;
+        if (invalid == 0) bad.nvlink_forward_prepared_batch_chunks = 0;
+        if (invalid == 1) bad.nvlink_forward_prepared_queue_depth = 1;
+        if (invalid == 2) bad.nvlink_forward_ping_pong_enabled = true;
+        if (invalid == 3) bad.nvlink_forward_out_of_order_chunks_enabled = true;
+        if (invalid == 4) bad.nvlink_forward_use_round_robin = true;
+        if (invalid == 5) bad.nvlink_forward_use_batch_api = false;
+        if (invalid == 6) bad.nvlink_forward_synchronize_batches = false;
+        if (invalid == 7) {
+            bad.nvlink_forward_completion_notifications_enabled = false;
+            bad.local_iteration_sync_enabled = false;
+        }
+        if (invalid == 8) bad.router_routing_enabled = false;
+        if (invalid == 9) bad.nvlink_forwarding_enabled = false;
+        if (invalid == 10) bad.nvlink_forward_prepared_batch_chunks = std::numeric_limits<std::size_t>::max();
+        bool rejected = false;
+        try { rdma_proxy::validate_config(bad); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
+    const char* prepared_args[] = {
+        "test_config", "--config", argv[1],
+        "--router_routing_enabled=true", "--nvlink_forwarding_enabled=true",
+        "--nvlink_forward_use_round_robin=false", "--nvlink_forward_use_batch_api=true",
+        "--nvlink_forward_synchronize_batches=true",
+        "--nvlink_forward_local_batch_sync_enabled=false",
+        "--nvlink_forward_completion_notifications_enabled=false",
+        "--local_iteration_sync_enabled=true",
+        "--nvlink_forward_preparation_enabled=true",
+        "--nvlink_forward_ping_pong2_enabled=true",
+        "--nvlink_forward_prepared_batch_chunks=17",
+        "--nvlink_forward_prepared_queue_depth=3",
+    };
+    const auto parsed_prepared = rdma_proxy::load_config(
+        static_cast<int>(sizeof(prepared_args) / sizeof(prepared_args[0])),
+        const_cast<char**>(prepared_args));
+    assert(parsed_prepared.nvlink_forward_preparation_enabled);
+    assert(parsed_prepared.nvlink_forward_ping_pong2_enabled);
+    assert(rdma_proxy::config_summary(parsed_prepared).find(
+        "nvlink_forward_ping_pong2_enabled=true") != std::string::npos);
+    assert(!parsed_prepared.nvlink_forward_local_batch_sync_enabled);
+    assert(!parsed_prepared.nvlink_forward_completion_notifications_enabled);
+    rdma_proxy::validate_config(parsed_prepared);
+    assert(parsed_prepared.nvlink_forward_prepared_batch_chunks == 17);
+    assert(parsed_prepared.nvlink_forward_prepared_queue_depth == 3);
+    assert(rdma_proxy::config_summary(parsed_prepared).find(
+        "nvlink_forward_prepared_batch_chunks=17") != std::string::npos);
+    // Exercise the new CLI flag without replacing coverage of the old mode.
+    std::vector<const char*> split_args(std::begin(prepared_args), std::end(prepared_args));
+    split_args.push_back("--nvlink_forward_ping_pong2_enabled=false");
+    split_args.push_back("--nvlink_forward_submit_epilogue_enabled=true");
+    const auto parsed_split = rdma_proxy::load_config(
+        static_cast<int>(split_args.size()), const_cast<char**>(split_args.data()));
+    assert(parsed_split.nvlink_forward_submit_epilogue_enabled);
+    auto return_args = split_args;
+    return_args.push_back("--nvlink_forward_completion_notifications_enabled=true");
+    return_args.push_back("--nvlink_return_completion_notifications_enabled=true");
+    const auto parsed_returns = rdma_proxy::load_config(
+        static_cast<int>(return_args.size()), const_cast<char**>(return_args.data()));
+    assert(parsed_returns.nvlink_return_completion_notifications_enabled);
+    auto return_sync_args = return_args;
+    return_sync_args.push_back("--nvlink_return_local_batch_sync_enabled=true");
+    const auto parsed_return_sync = rdma_proxy::load_config(
+        static_cast<int>(return_sync_args.size()), const_cast<char**>(return_sync_args.data()));
+    assert(parsed_return_sync.nvlink_return_local_batch_sync_enabled);
+    assert(rdma_proxy::config_summary(parsed_return_sync).find(
+        "nvlink_return_local_batch_sync_enabled=true") != std::string::npos);
+    return_sync_args.push_back("--nvlink_return_local_batch_sync_enabled=false");
+    assert(!rdma_proxy::load_config(static_cast<int>(return_sync_args.size()),
+        const_cast<char**>(return_sync_args.data())).nvlink_return_local_batch_sync_enabled);
+    auto gpu_return_args = return_args;
+    gpu_return_args.push_back("--nvlink_return_ready_gpu_publication_enabled=true");
+    const auto parsed_gpu_returns = rdma_proxy::load_config(
+        static_cast<int>(gpu_return_args.size()), const_cast<char**>(gpu_return_args.data()));
+    assert(parsed_gpu_returns.nvlink_return_ready_gpu_publication_enabled);
+    assert(rdma_proxy::config_summary(parsed_gpu_returns).find(
+        "nvlink_return_ready_gpu_publication_enabled=true") != std::string::npos);
+    gpu_return_args.push_back("--nvlink_return_ready_gpu_publication_enabled=false");
+    assert(!rdma_proxy::load_config(static_cast<int>(gpu_return_args.size()),
+        const_cast<char**>(gpu_return_args.data())).nvlink_return_ready_gpu_publication_enabled);
+    assert(rdma_proxy::config_summary(parsed_returns).find(
+        "nvlink_return_completion_notifications_enabled=true") != std::string::npos);
+    return_args.push_back("--nvlink_return_completion_notifications_enabled=false");
+    assert(!rdma_proxy::load_config(static_cast<int>(return_args.size()),
+        const_cast<char**>(return_args.data())).nvlink_return_completion_notifications_enabled);
+    rdma_proxy::validate_config(parsed_split);
+    assert(rdma_proxy::config_summary(parsed_split).find(
+        "nvlink_forward_submit_epilogue_enabled=true") != std::string::npos);
+    split_args.push_back("--nvlink_forward_local_staging_prepared_enabled=true");
+    split_args.push_back("--router_local_input_staging_enabled=true");
+    split_args.push_back("--fill_test_data=false");
+    auto parsed_local = rdma_proxy::load_config(static_cast<int>(split_args.size()),
+        const_cast<char**>(split_args.data()));
+    assert(parsed_local.nvlink_forward_local_staging_prepared_enabled);
+    rdma_proxy::validate_config(parsed_local);
+    split_args.push_back("--nvlink_forward_local_staging_prepared_enabled=false");
+    assert(!rdma_proxy::load_config(static_cast<int>(split_args.size()),
+        const_cast<char**>(split_args.data())).nvlink_forward_local_staging_prepared_enabled);
+    split_args.push_back("--nvlink_forward_prepared_atomic_ring_enabled=true");
+    const auto parsed_atomic = rdma_proxy::load_config(
+        static_cast<int>(split_args.size()), const_cast<char**>(split_args.data()));
+    assert(parsed_atomic.nvlink_forward_prepared_atomic_ring_enabled);
+    rdma_proxy::validate_config(parsed_atomic);
+    assert(rdma_proxy::config_summary(parsed_atomic).find(
+        "nvlink_forward_prepared_atomic_ring_enabled=true") != std::string::npos);
+    split_args.push_back("--nvlink_forward_prepared_atomic_ring_enabled=false");
+    assert(!rdma_proxy::load_config(static_cast<int>(split_args.size()),
+        const_cast<char**>(split_args.data())).nvlink_forward_prepared_atomic_ring_enabled);
+    split_args.push_back("--nvlink_forward_completion_mode=stream_query");
+    const auto parsed_query = rdma_proxy::load_config(
+        static_cast<int>(split_args.size()), const_cast<char**>(split_args.data()));
+    assert(parsed_query.nvlink_forward_completion_mode == "stream_query");
+    assert(rdma_proxy::config_summary(parsed_query).find(
+        "nvlink_forward_completion_mode=stream_query") != std::string::npos);
+    {
+        std::ofstream json("prepared_forwarding_config.json");
+        json << R"json({"num_tokens":65, "token_dimension":8, "tokens_per_chunk":4,
+                       "num_gpus_per_node":2, "router_routing_enabled":true,
+                       "num_experts":2, "top_k":1, "nvlink_forwarding_enabled":true,
+                       "nvlink_forward_synchronize_batches":true,
+                       "nvlink_forward_completion_notifications_enabled":false,
+                       "local_iteration_sync_enabled":true,
+                       "nvlink_forward_local_batch_sync_enabled":false,
+                       "nvlink_forward_preparation_enabled":true,
+                       "nvlink_forward_ping_pong2_enabled":true,
+                       "nvlink_forward_prepared_batch_chunks":19,
+                       "nvlink_forward_prepared_queue_depth":4})json";
+    }
+    const auto json_prepared = rdma_proxy::load_config_file("prepared_forwarding_config.json");
+    assert(json_prepared.nvlink_forward_preparation_enabled);
+    assert(json_prepared.nvlink_forward_ping_pong2_enabled);
+    assert(!json_prepared.nvlink_forward_local_batch_sync_enabled);
+    assert(!json_prepared.nvlink_forward_completion_notifications_enabled);
+    rdma_proxy::validate_config(json_prepared);
+    assert(json_prepared.nvlink_forward_prepared_batch_chunks == 19);
+    assert(json_prepared.nvlink_forward_prepared_queue_depth == 4);
+
+    {
+        std::ofstream json("submit_epilogue_config.json");
+        json << R"json({"num_tokens":65, "token_dimension":8, "tokens_per_chunk":4,
+                       "num_gpus_per_node":2, "router_routing_enabled":true,
+                       "num_experts":2, "top_k":1, "nvlink_forwarding_enabled":true,
+                       "nvlink_forward_synchronize_batches":true,
+                       "nvlink_forward_completion_notifications_enabled":false,
+                       "local_iteration_sync_enabled":true,
+                       "nvlink_forward_preparation_enabled":true,
+                       "nvlink_forward_prepared_batch_chunks":19,
+                       "nvlink_forward_submit_epilogue_enabled":true,
+                       "nvlink_forward_prepared_atomic_ring_enabled":true,
+                       "nvlink_forward_local_staging_prepared_enabled":true,
+                       "router_local_input_staging_enabled":true,
+                       "fill_test_data":false,
+                       "nvlink_forward_completion_mode":"stream_query"})json";
+    }
+    const auto json_split = rdma_proxy::load_config_file("submit_epilogue_config.json");
+    assert(json_split.nvlink_forward_completion_mode == "stream_query");
+    assert(json_split.nvlink_forward_submit_epilogue_enabled);
+    assert(json_split.nvlink_forward_prepared_atomic_ring_enabled);
+    rdma_proxy::validate_config(json_split);
+
+    assert(json_split.nvlink_forward_local_staging_prepared_enabled);
+    {
+        std::ofstream json("return_notifications_config.json");
+        json << R"json({"num_tokens":65, "token_dimension":8, "tokens_per_chunk":4,
+                       "num_gpus_per_node":2, "router_routing_enabled":true,
+                       "num_experts":2, "top_k":1, "nvlink_forwarding_enabled":true,
+                       "nvlink_forward_synchronize_batches":true,
+                       "nvlink_forward_completion_notifications_enabled":true,
+                       "nvlink_forward_preparation_enabled":true,
+                       "nvlink_forward_prepared_batch_chunks":19,
+                       "nvlink_forward_submit_epilogue_enabled":true,
+                       "nvlink_return_completion_notifications_enabled":true,
+                       "nvlink_return_local_batch_sync_enabled":true,
+                       "nvlink_return_ready_gpu_publication_enabled":true})json";
+    }
+    assert(rdma_proxy::load_config_file("return_notifications_config.json")
+        .nvlink_return_completion_notifications_enabled);
+    assert(rdma_proxy::load_config_file("return_notifications_config.json")
+        .nvlink_return_local_batch_sync_enabled);
+    assert(rdma_proxy::load_config_file("return_notifications_config.json")
+        .nvlink_return_ready_gpu_publication_enabled);
+    for (int conflict = 0; conflict < 2; ++conflict) {
+        auto bad = json_split;
+        if (conflict == 0) bad.nvlink_forward_submit_epilogue_enabled = false;
+        else bad.router_local_input_staging_enabled = false;
+        bool rejected = false;
+        try { rdma_proxy::validate_config(bad); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
+
+    // A JSON base may require CLI overrides to become valid. Standalone file
+    // loading must still reject it, while merged loading validates only at the end.
+    {
+        std::ifstream input("submit_epilogue_config.json");
+        std::string base((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        for (const auto* key : {"nvlink_forward_submit_epilogue_enabled", "router_local_input_staging_enabled"}) {
+            const auto token = std::string("\"") + key + "\":true";
+            const auto pos = base.find(token);
+            assert(pos != std::string::npos);
+            base.replace(pos, token.size(), std::string("\"") + key + "\":false");
+        }
+        std::ofstream output("local_staging_override_config.json");
+        output << base;
+    }
+    bool invalid_base_rejected = false;
+    try { (void)rdma_proxy::load_config_file("local_staging_override_config.json"); }
+    catch (const std::runtime_error&) { invalid_base_rejected = true; }
+    assert(invalid_base_rejected);
+    const char* local_override_args[] = {
+        "test_config", "--config", "local_staging_override_config.json",
+        "--nvlink_forward_submit_epilogue_enabled=true",
+        "--router_local_input_staging_enabled=true",
+    };
+    const auto merged_local = rdma_proxy::load_config(5, const_cast<char**>(local_override_args));
+    assert(merged_local.nvlink_forward_local_staging_prepared_enabled);
+    assert(merged_local.nvlink_forward_submit_epilogue_enabled);
+    assert(merged_local.router_local_input_staging_enabled);
+    bool invalid_merged_rejected = false;
+    try { (void)rdma_proxy::load_config(4, const_cast<char**>(local_override_args)); }
+    catch (const std::runtime_error&) { invalid_merged_rejected = true; }
+    assert(invalid_merged_rejected);
+
+    auto valid_flush_only_config = router_nvlink_config;
+    valid_flush_only_config.nvlink_forward_synchronize_batches = true;
+    valid_flush_only_config.nvlink_forward_completion_notifications_enabled = true;
+    valid_flush_only_config.nvlink_forward_notification_flush_only_enabled = true;
+    rdma_proxy::validate_config(valid_flush_only_config);
+
+    auto valid_flush_per_entry_config = valid_flush_only_config;
+    valid_flush_per_entry_config.nvlink_forward_notification_flush_only_enabled = false;
+    valid_flush_per_entry_config.nvlink_forward_notification_flush_per_entry_enabled = true;
+    rdma_proxy::validate_config(valid_flush_per_entry_config);
+
+    auto valid_local_staging_config = valid_flush_only_config;
+    valid_local_staging_config.nvlink_forward_notification_flush_only_enabled = false;
+    valid_local_staging_config.fill_test_data = false;
+    valid_local_staging_config.router_local_input_staging_enabled = true;
+    rdma_proxy::validate_config(valid_local_staging_config);
+
+    auto early_local = valid_local_staging_config;
+    early_local.router_local_input_early_ready_enabled = true;
+    rdma_proxy::validate_config(early_local);
+    early_local.nvlink_forward_notification_flush_per_entry_enabled = true;
+    rdma_proxy::validate_config(early_local);
+    for (int conflict = 0; conflict < 3; ++conflict) {
+        auto bad = early_local;
+        bad.nvlink_forward_notification_flush_per_entry_enabled = false;
+        if (conflict == 0) bad.router_local_input_staging_enabled = false;
+        if (conflict == 1) bad.nvlink_forward_completion_notifications_enabled = false;
+        if (conflict == 2) bad.nvlink_forward_notification_flush_only_enabled = true;
+        bool rejected = false;
+        try { rdma_proxy::validate_config(bad); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
+    {
+        std::ofstream json("early_local_config.json");
+        json << R"({"num_tokens":65, "token_dimension":8, "tokens_per_chunk":4,
+                   "num_gpus_per_node":2, "router_routing_enabled":true,
+                   "num_experts":2, "top_k":1, "nvlink_forwarding_enabled":true,
+                   "nvlink_forward_synchronize_batches":true,
+                   "nvlink_forward_completion_notifications_enabled":true,
+                   "nvlink_forward_preparation_enabled":true,
+                   "nvlink_forward_prepared_batch_chunks":3,
+                   "router_local_input_staging_enabled":true,
+                   "router_local_input_early_ready_enabled":true,
+                   "fill_test_data":false})";
+    }
+    assert(rdma_proxy::load_config_file("early_local_config.json").router_local_input_early_ready_enabled);
+    const char* early_local_args[] = {"test_config", "--config", "early_local_config.json",
+        "--router_local_input_early_ready_enabled=false", "--router_local_input_early_ready_enabled=true"};
+    assert(!rdma_proxy::load_config(4, const_cast<char**>(early_local_args)).router_local_input_early_ready_enabled);
+    const auto early_local_cli = rdma_proxy::load_config(5, const_cast<char**>(early_local_args));
+    assert(early_local_cli.router_local_input_early_ready_enabled);
+    assert(rdma_proxy::config_summary(early_local_cli).find(
+        "router_local_input_early_ready_enabled=true") != std::string::npos);
+
+    // Scheduling policy and publication policy are independent, including the
+    // immediate own-source readiness path. Check both CLI and JSON entry points.
+    auto complete_round = early_local;
+    complete_round.nvlink_forward_notification_scheduling_mode = "complete_round";
+    complete_round.nvlink_forward_notification_scheduling_diagnostics = true;
+    for (const bool per_entry : {false, true}) {
+        complete_round.nvlink_forward_notification_flush_per_entry_enabled = per_entry;
+        rdma_proxy::validate_config(complete_round);
+    }
+    for (int conflict = 0; conflict < 4; ++conflict) {
+        auto bad = complete_round;
+        bad.nvlink_forward_notification_flush_per_entry_enabled = false;
+        bad.router_local_input_early_ready_enabled = false;
+        bad.router_local_input_staging_enabled = false;
+        if (conflict == 0) bad.nvlink_forward_notification_scheduling_mode = "drain_queue";
+        if (conflict == 1) bad.router_routing_enabled = false;
+        if (conflict == 2) bad.nvlink_forward_completion_notifications_enabled = false;
+        if (conflict == 3) bad.nvlink_forward_notification_flush_only_enabled = true;
+        bool rejected = false;
+        try { rdma_proxy::validate_config(bad); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
+    const char* scheduling_args[] = {"test_config", "--config", "early_local_config.json",
+        "--nvlink_forward_notification_scheduling_mode=complete_round",
+        "--nvlink_forward_notification_scheduling_diagnostics=true",
+        "--nvlink_forward_notification_scheduling_mode=per_notification",
+        "--nvlink_forward_notification_scheduling_diagnostics=false"};
+    const auto parsed_scheduling = rdma_proxy::load_config(5, const_cast<char**>(scheduling_args));
+    assert(parsed_scheduling.nvlink_forward_notification_scheduling_mode == "complete_round");
+    assert(parsed_scheduling.nvlink_forward_notification_scheduling_diagnostics);
+    const auto scheduling_summary = rdma_proxy::config_summary(parsed_scheduling);
+    assert(scheduling_summary.find("nvlink_forward_notification_scheduling_mode=complete_round") !=
+           std::string::npos);
+    assert(scheduling_summary.find("nvlink_forward_notification_scheduling_diagnostics=true") !=
+           std::string::npos);
+    const auto restored_scheduling = rdma_proxy::load_config(7, const_cast<char**>(scheduling_args));
+    assert(restored_scheduling.nvlink_forward_notification_scheduling_mode == "per_notification");
+    assert(!restored_scheduling.nvlink_forward_notification_scheduling_diagnostics);
+    {
+        std::ifstream input("early_local_config.json");
+        std::string base((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        base.insert(base.find('{') + 1,
+            "\"nvlink_forward_notification_scheduling_mode\":\"complete_round\","
+            "\"nvlink_forward_notification_scheduling_diagnostics\":true,");
+        std::ofstream output("round_scheduling_config.json");
+        output << base;
+    }
+    const auto json_scheduling = rdma_proxy::load_config_file("round_scheduling_config.json");
+    assert(json_scheduling.nvlink_forward_notification_scheduling_mode == "complete_round");
+    assert(json_scheduling.nvlink_forward_notification_scheduling_diagnostics);
+
+    auto invalid_local_staging_fill_config = valid_local_staging_config;
+    invalid_local_staging_fill_config.fill_test_data = true;
+    bool rejected_local_staging_fill = false;
+    try {
+        rdma_proxy::validate_config(invalid_local_staging_fill_config);
+    } catch (const std::runtime_error&) {
+        rejected_local_staging_fill = true;
+    }
+    assert(rejected_local_staging_fill);
+
+    auto invalid_flush_per_entry_without_notifications = router_nvlink_config;
+    invalid_flush_per_entry_without_notifications
+        .nvlink_forward_notification_flush_per_entry_enabled = true;
+    bool rejected_flush_per_entry_without_notifications = false;
+    try {
+        rdma_proxy::validate_config(invalid_flush_per_entry_without_notifications);
+    } catch (const std::runtime_error&) {
+        rejected_flush_per_entry_without_notifications = true;
+    }
+    assert(rejected_flush_per_entry_without_notifications);
+
+    auto invalid_combined_flush_modes = valid_flush_only_config;
+    invalid_combined_flush_modes.nvlink_forward_notification_flush_per_entry_enabled = true;
+    bool rejected_combined_flush_modes = false;
+    try {
+        rdma_proxy::validate_config(invalid_combined_flush_modes);
+    } catch (const std::runtime_error&) {
+        rejected_combined_flush_modes = true;
+    }
+    assert(rejected_combined_flush_modes);
+
+    auto invalid_flush_only_without_notifications = router_nvlink_config;
+    invalid_flush_only_without_notifications.nvlink_forward_notification_flush_only_enabled = true;
+    bool rejected_flush_only_without_notifications = false;
+    try {
+        rdma_proxy::validate_config(invalid_flush_only_without_notifications);
+    } catch (const std::runtime_error&) {
+        rejected_flush_only_without_notifications = true;
+    }
+    assert(rejected_flush_only_without_notifications);
+
+    auto invalid_router_round_robin_config = router_nvlink_config;
+    invalid_router_round_robin_config.nvlink_forward_use_round_robin = true;
+    bool rejected_router_round_robin = false;
+    try {
+        rdma_proxy::validate_config(invalid_router_round_robin_config);
+    } catch (const std::runtime_error&) {
+        rejected_router_round_robin = true;
+    }
+    assert(rejected_router_round_robin);
+
+    auto invalid_router_out_of_order_config = router_nvlink_config;
+    invalid_router_out_of_order_config.nvlink_forward_threshold_tokens = 0;
+    invalid_router_out_of_order_config.nvlink_forward_min_threshold_chunks = 1;
+    invalid_router_out_of_order_config.nvlink_forward_max_threshold_chunks = 4;
+    invalid_router_out_of_order_config.nvlink_forward_out_of_order_chunks_enabled = true;
+    bool rejected_router_out_of_order = false;
+    try {
+        rdma_proxy::validate_config(invalid_router_out_of_order_config);
+    } catch (const std::runtime_error&) {
+        rejected_router_out_of_order = true;
+    }
+    assert(rejected_router_out_of_order);
+
+    auto invalid_router_experts_config = router_config;
+    invalid_router_experts_config.router_num_experts = 255;
+    bool rejected_router_experts = false;
+    try {
+        rdma_proxy::validate_config(invalid_router_experts_config);
+    } catch (const std::runtime_error&) {
+        rejected_router_experts = true;
+    }
+    assert(rejected_router_experts);
+
+    const char* nvlink_config_path = "nvlink_forward_config.json";
+    {
+        std::ofstream out(nvlink_config_path);
+        out << R"json({
+  "node_rank": 0,
+  "num_nodes": 2,
+  "local_gpu_index": 0,
+  "num_gpus_per_node": 4,
+  "num_tokens": 300,
+  "token_dimension": 16,
+  "tokens_per_chunk": 25,
+  "num_qps_per_peer": 2,
+  "rdma_device_name": "mlx5_0",
+  "rdma_port": 1,
+  "gid_index": 3,
+  "cuda_device_id": 0,
+  "completion_poll_batch_size": 16,
+  "data_signal_interval": 0,
+  "max_in_flight_chunks_per_qp": 2,
+  "send_queue_depth": 256,
+  "recv_queue_depth": 256,
+  "cq_depth": 512,
+  "dtype": "fp16",
+  "mock_mode": true,
+  "nvlink_forwarding_enabled": true,
+  "nvlink_forward_threshold_chunks": 12,
+  "nvlink_forward_min_threshold_chunks": 0,
+  "nvlink_forward_max_threshold_chunks": 0,
+  "nvlink_forward_out_of_order_chunks_enabled": false,
+  "nvlink_forward_chunk_tokens": 100,
+  "nvlink_forward_use_batch_api": true,
+  "nvlink_forward_stream_nonblocking": true,
+  "nvlink_forward_synchronize_batches": false,
+  "nvlink_forward_completion_notifications_enabled": false,
+  "nvlink_forward_notification_flush_only_enabled": false,
+  "nvlink_forward_notification_flush_per_entry_enabled": false,
+  "nvlink_forward_notification_flag_update_mode": "memcpy",
+  "nvlink_forward_notification_queue_depth": 256,
+  "nvlink_forward_notification_log_enabled": false,
+  "nvlink_forward_notification_log_dir": "/tmp/rdma_cpu_proxy_test_notifications",
+  "nvlink_forward_local_batch_sync_enabled": false,
+  "nvlink_forward_ping_pong_enabled": false,
+  "nvlink_forward_ping_pong_handoff_copy": 7,
+  "nvlink_forward_synchronize_iteration": true,
+  "nvlink_forward_log_batches": true,
+  "log_qp_reports": true,
+  "log_marker_wait_reports": true,
+  "nvlink_forward_use_round_robin": true,
+  "nvlink_routing_probability": 0.25,
+  "nvlink_routing_seed": 1234,
+  "nvlink_forward_destinations": [
+    {"gpu_index": 1, "cuda_device_id": 1, "buffer_addr": "0x100000", "buffer_bytes": 9600},
+    {"gpu_index": 2, "cuda_device_id": 2, "buffer_addr": "0x200000", "buffer_bytes": 9600},
+    {"gpu_index": 3, "cuda_device_id": 3, "buffer_addr": "0x300000", "buffer_bytes": 9600}
+  ],
+  "peers": [
+    {
+      "node_rank": 1,
+      "host": "node-b.example.com",
+      "port": 18515
+    }
+  ]
+})json";
+    }
+    const auto nvlink_config = rdma_proxy::load_config_file(nvlink_config_path);
+    assert(nvlink_config.nvlink_forwarding_enabled);
+    assert(!nvlink_config.nvlink_forward_local_batch_sync_enabled);
+    assert(!nvlink_config.nvlink_forward_ping_pong_enabled);
+    assert(nvlink_config.nvlink_forward_ping_pong_handoff_copy == 7);
+    assert(nvlink_config.nvlink_forward_log_batches);
+    assert(nvlink_config.nvlink_forward_threshold_tokens == 0);
+    assert(nvlink_config.nvlink_forward_threshold_chunks == 12);
+    assert(nvlink_config.nvlink_forward_min_threshold_chunks == 0);
+    assert(nvlink_config.nvlink_forward_max_threshold_chunks == 0);
+    assert(!nvlink_config.nvlink_forward_out_of_order_chunks_enabled);
+    assert(!rdma_proxy::nvlink_forward_dynamic_threshold_enabled(nvlink_config));
+    assert(rdma_proxy::effective_nvlink_forward_threshold_tokens(nvlink_config) == 300);
+    assert(!nvlink_config.nvlink_forward_completion_notifications_enabled);
+    assert(!nvlink_config.nvlink_forward_notification_flush_only_enabled);
+    assert(!nvlink_config.nvlink_forward_notification_flush_per_entry_enabled);
+    assert(nvlink_config.nvlink_forward_notification_flag_update_mode ==
+           rdma_proxy::NvlinkForwardNotificationFlagUpdateMode::kMemcpy);
+    assert(nvlink_config.nvlink_forward_notification_queue_depth == 256);
+    assert(!nvlink_config.nvlink_forward_notification_log_enabled);
+    assert(nvlink_config.nvlink_forward_notification_log_dir == "/tmp/rdma_cpu_proxy_test_notifications");
+    assert(nvlink_config.log_qp_reports);
+    assert(nvlink_config.log_marker_wait_reports);
+    assert(nvlink_config.nvlink_forward_use_round_robin);
+    assert(nvlink_config.nvlink_routing_probability == 0.25);
+    assert(nvlink_config.nvlink_routing_seed == 1234);
+    assert(nvlink_config.nvlink_forward_destinations.size() == 3);
+    assert(nvlink_config.nvlink_forward_destinations[0].buffer_addr == 0x100000ULL);
+
+    auto invalid_threshold_config = nvlink_config;
+    invalid_threshold_config.nvlink_forward_threshold_tokens = 301;
+    bool rejected_mismatched_threshold = false;
+    try {
+        rdma_proxy::validate_config(invalid_threshold_config);
+    } catch (const std::runtime_error&) {
+        rejected_mismatched_threshold = true;
+    }
+    assert(rejected_mismatched_threshold);
+
+    auto invalid_batch_sync_config = nvlink_config;
+    invalid_batch_sync_config.nvlink_forward_local_batch_sync_enabled = true;
+    invalid_batch_sync_config.nvlink_forward_synchronize_batches = false;
+    bool rejected_batch_sync_without_stream_sync = false;
+    try {
+        rdma_proxy::validate_config(invalid_batch_sync_config);
+    } catch (const std::runtime_error&) {
+        rejected_batch_sync_without_stream_sync = true;
+    }
+    assert(rejected_batch_sync_without_stream_sync);
+
+    auto valid_batch_sync_config = nvlink_config;
+    valid_batch_sync_config.nvlink_forward_local_batch_sync_enabled = true;
+    valid_batch_sync_config.nvlink_forward_synchronize_batches = true;
+    rdma_proxy::validate_config(valid_batch_sync_config);
+
+    auto invalid_notification_config = nvlink_config;
+    invalid_notification_config.nvlink_forward_completion_notifications_enabled = true;
+    invalid_notification_config.nvlink_forward_synchronize_batches = false;
+    bool rejected_notifications_without_stream_sync = false;
+    try {
+        rdma_proxy::validate_config(invalid_notification_config);
+    } catch (const std::runtime_error&) {
+        rejected_notifications_without_stream_sync = true;
+    }
+    assert(rejected_notifications_without_stream_sync);
+
+    auto valid_notification_config = nvlink_config;
+    valid_notification_config.nvlink_forward_completion_notifications_enabled = true;
+    valid_notification_config.nvlink_forward_synchronize_batches = true;
+    valid_notification_config.nvlink_forward_notification_queue_depth = 8;
+    rdma_proxy::validate_config(valid_notification_config);
+
+    auto invalid_expert_gemm_config = valid_notification_config;
+    invalid_expert_gemm_config.router_routing_enabled = true;
+    invalid_expert_gemm_config.router_num_experts = 256;
+    invalid_expert_gemm_config.router_top_k = 8;
+    invalid_expert_gemm_config.expert_gemm_dimension = 8193;
+    bool rejected_nondivisible_n_swizzle_groups = false;
+    try {
+        rdma_proxy::validate_config(invalid_expert_gemm_config);
+    } catch (const std::runtime_error&) {
+        rejected_nondivisible_n_swizzle_groups = true;
+    }
+    assert(rejected_nondivisible_n_swizzle_groups);
+
+    auto valid_partial_n_tile_config = invalid_expert_gemm_config;
+    valid_partial_n_tile_config.expert_gemm_max_swizzle_size = 3;
+    valid_partial_n_tile_config.nvlink_forward_use_round_robin = false;
+    rdma_proxy::validate_config(valid_partial_n_tile_config);
+
+    auto invalid_flush_only_without_router = valid_notification_config;
+    invalid_flush_only_without_router.nvlink_forward_notification_flush_only_enabled = true;
+    bool rejected_flush_only_without_router = false;
+    try {
+        rdma_proxy::validate_config(invalid_flush_only_without_router);
+    } catch (const std::runtime_error&) {
+        rejected_flush_only_without_router = true;
+    }
+    assert(rejected_flush_only_without_router);
+
+    auto invalid_flush_per_entry_without_router = valid_notification_config;
+    invalid_flush_per_entry_without_router
+        .nvlink_forward_notification_flush_per_entry_enabled = true;
+    bool rejected_flush_per_entry_without_router = false;
+    try {
+        rdma_proxy::validate_config(invalid_flush_per_entry_without_router);
+    } catch (const std::runtime_error&) {
+        rejected_flush_per_entry_without_router = true;
+    }
+    assert(rejected_flush_per_entry_without_router);
+
+    auto invalid_notification_log_config = nvlink_config;
+    invalid_notification_log_config.nvlink_forward_notification_log_enabled = true;
+    invalid_notification_log_config.nvlink_forward_completion_notifications_enabled = false;
+    bool rejected_notification_log_without_notifications = false;
+    try {
+        rdma_proxy::validate_config(invalid_notification_log_config);
+    } catch (const std::runtime_error&) {
+        rejected_notification_log_without_notifications = true;
+    }
+    assert(rejected_notification_log_without_notifications);
+
+    auto valid_notification_log_config = valid_notification_config;
+    valid_notification_log_config.nvlink_forward_notification_log_enabled = true;
+    valid_notification_log_config.nvlink_forward_notification_log_dir =
+        "/tmp/rdma_cpu_proxy_test_notifications_valid";
+    rdma_proxy::validate_config(valid_notification_log_config);
+
+    auto dynamic_config = nvlink_config;
+    dynamic_config.nvlink_forward_use_round_robin = false;
+    dynamic_config.nvlink_forward_min_threshold_chunks = 2;
+    dynamic_config.nvlink_forward_max_threshold_chunks = 4;
+    assert(rdma_proxy::nvlink_forward_dynamic_threshold_enabled(dynamic_config));
+    rdma_proxy::validate_config(dynamic_config);
+
+    auto dynamic_out_of_order_config = dynamic_config;
+    dynamic_out_of_order_config.nvlink_forward_out_of_order_chunks_enabled = true;
+    rdma_proxy::validate_config(dynamic_out_of_order_config);
+
+    auto invalid_out_of_order_infinite_config = dynamic_out_of_order_config;
+    invalid_out_of_order_infinite_config.num_iterations = 0;
+    bool rejected_out_of_order_infinite = false;
+    try {
+        rdma_proxy::validate_config(invalid_out_of_order_infinite_config);
+    } catch (const std::runtime_error&) {
+        rejected_out_of_order_infinite = true;
+    }
+    assert(rejected_out_of_order_infinite);
+
+    auto invalid_dynamic_range_config = dynamic_config;
+    invalid_dynamic_range_config.nvlink_forward_min_threshold_chunks = 5;
+    invalid_dynamic_range_config.nvlink_forward_max_threshold_chunks = 4;
+    bool rejected_dynamic_range = false;
+    try {
+        rdma_proxy::validate_config(invalid_dynamic_range_config);
+    } catch (const std::runtime_error&) {
+        rejected_dynamic_range = true;
+    }
+    assert(rejected_dynamic_range);
+
+    auto invalid_dynamic_round_robin_config = dynamic_config;
+    invalid_dynamic_round_robin_config.nvlink_forward_use_round_robin = true;
+    bool rejected_dynamic_round_robin = false;
+    try {
+        rdma_proxy::validate_config(invalid_dynamic_round_robin_config);
+    } catch (const std::runtime_error&) {
+        rejected_dynamic_round_robin = true;
+    }
+    assert(rejected_dynamic_round_robin);
+
+    std::cout << rdma_proxy::config_summary(config) << '\n';
+    std::cout << "test_config passed\n";
+    return 0;
+}

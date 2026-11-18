@@ -39,7 +39,33 @@ MASTER_ADDR=127.0.0.1 bash scripts/run_single_node_torchrun.sh \
   --num_tokens=1024 --num_iterations=3 --check-projections
 ```
 
-**Two-node test.** Start the following commands concurrently, one in each host's prepared shell. This example assumes node 0 uses `10.51.1.3` for both torchrun rendezvous and proxy traffic. Both ranks use the same `MASTER_ADDR` and `MASTER_PORT`. Each rank sets `PEER_HOST` to the other host's reachable proxy address.
+### Weighted single-node test on Blackwell
+
+After the CUDA 13.0 setup and build above, run this on one eight-GPU Blackwell host. Each GPU supplies 20,480 tokens of width 7,168. The up and down GEMMs use 256 × 512 tiles, and the four `--down-bulk-*` options tune the additive `bulk_rows_reduce` store. The worker selects the Blackwell down kernel with ping-pong disabled.
+
+```bash
+RDMA_PROXY_GEMM_ARCH=blackwell MASTER_ADDR=127.0.0.1 \
+  bash scripts/run_single_node_torchrun.sh \
+    --num_iterations=3 --num_tokens=20480 --token_dimension=7168 \
+    --nvlink_forward_prepared_batch_chunks=64 \
+    --grouped-gemm-m-tile=256 --grouped-gemm-n-tile=512 \
+    --grouped-gemm-output-dimension=1536 --grouped-gemm-max-swizzle-size=1 \
+    --down-tile-m=256 --down-tile-n=512 --down-cluster-m=2 --down-max-swizzle-size=2 \
+    --down-bulk-smem-padding=16 --down-bulk-smem-cols=128 \
+    --down-bulk-smem-buffers=1 --down-bulk-store-warps=4 \
+    --down-sm-count=140 --intra-node-combine-ctas=6 --intra-node-combine-relax-sm-guard \
+    --weighted-contributions --cpu-scatter-preparation --cpu-scatter-publication=threaded \
+    --router_local_input_early_ready_enabled=true \
+    --nvlink_forward_notification_scheduling_mode=complete_round \
+    --down-output-reset=end-of-iteration --nvlink_return_local_batch_sync_enabled=true \
+    --completion_timeout_ms=600000 --return-token-timeout=600 --check-projections
+```
+
+The relaxed guard requires at least **146 visible SMs per GPU** for the down budget of 140 and six combine CTAs. The launcher checks returns and combine results. The added `--check-projections` compares the up and down results with numerical references on all three iterations. [Parameter descriptions](features.md#reading-a-single-node-command)
+
+### Two-node test on Blackwell
+
+Start the following commands concurrently, one in each host's prepared shell. This example assumes node 0 uses `10.51.1.3` for both torchrun rendezvous and proxy traffic. Both ranks use the same `MASTER_ADDR` and `MASTER_PORT`. Each rank sets `PEER_HOST` to the other host's reachable proxy address.
 
 On **node 0**, replace `<node-1-proxy-IP>` with node 1's address.
 

@@ -92,6 +92,13 @@ if(RDMA_PROXY_HAVE_CUDA)
   # rdma_cpu_proxy_lib is static, so CUDA symbols referenced by its objects
   # must also be present on every consuming executable's final link line.
   target_link_libraries(rdma_cpu_proxy_lib PUBLIC CUDA::cudart CUDA::cuda_driver)
+  # The header-only NVTX3 calls in proxy.cpp and cuda_buffers.cpp use the dynamic loader.
+  target_link_libraries(rdma_cpu_proxy_lib PRIVATE ${CMAKE_DL_LIBS})
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Older glibc provides the proxy's shm_open and shm_unlink in librt.
+  target_link_libraries(rdma_cpu_proxy_lib PRIVATE rt)
 endif()
 
 find_package(Threads REQUIRED)

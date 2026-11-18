@@ -92,7 +92,32 @@ MASTER_ADDR=127.0.0.1 bash scripts/run_single_node_torchrun.sh \
   --num_tokens=1024 --num_iterations=3 --check-projections
 ```
 
-**Two nodes.** Start these commands concurrently. The addresses below are the checked-in Hopper profile. If your hosts have different addresses, use node 0's rendezvous address for `MASTER_ADDR` in both shells and the opposite host's proxy address for each `PEER_HOST`.
+### Weighted single-node test on Hopper
+
+After the SM90 build and environment setup above, run this from the meon root on one eight-GPU Hopper host. It uses 20,480 tokens per GPU, 7,168 features per token and a SwiGLU output width of 1,536. The command makes the Hopper geometry and ping-pong choice explicit and checks projection results on each of three iterations.
+
+```bash
+RDMA_PROXY_GEMM_ARCH=hopper MASTER_ADDR=127.0.0.1 \
+  bash scripts/run_single_node_torchrun.sh \
+    --num_iterations=3 --num_tokens=20480 --token_dimension=7168 \
+    --nvlink_forward_prepared_batch_chunks=64 \
+    --grouped-gemm-m-tile=128 --grouped-gemm-n-tile=128 \
+    --grouped-gemm-output-dimension=1536 --grouped-gemm-max-swizzle-size=1 \
+    --down-tile-m=128 --down-tile-n=128 --down-cluster-m=1 \
+    --down-max-swizzle-size=2 --down-sm-count=74 --down-pingpong \
+    --intra-node-combine-ctas=6 --weighted-contributions \
+    --cpu-scatter-preparation --cpu-scatter-publication=threaded \
+    --router_local_input_early_ready_enabled=true \
+    --nvlink_forward_notification_scheduling_mode=complete_round \
+    --down-output-reset=end-of-iteration --nvlink_return_local_batch_sync_enabled=true \
+    --completion_timeout_ms=600000 --return-token-timeout=600 --check-projections
+```
+
+The launcher enables expert waves, the wave barrier, readiness publication and the additive `bulk_rows_reduce` epilogue. Expert waves alone determine the order of work. Enabling the wave barrier on Hopper requires ping-pong, and the worker selects it automatically if you omit `--down-pingpong`. QuACK rejects the four Blackwell shared-memory and store-warp tuning flags on Hopper. With 74 down SMs, down cluster M=1 and six combine CTAs, the standard guard requires at least 80 visible SMs. [Parameter descriptions](features.md#reading-a-single-node-command)
+
+### Two-node test on Hopper
+
+Start these commands concurrently. The addresses below are the checked-in Hopper profile. If your hosts have different addresses, use node 0's rendezvous address for `MASTER_ADDR` in both shells and the opposite host's proxy address for each `PEER_HOST`.
 
 Run on **node 0**.
 

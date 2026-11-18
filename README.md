@@ -23,6 +23,8 @@ TORCHRUN_BIN=echo bash scripts/run_single_node_torchrun.sh --communication-only
 
 ## Running on NVIDIA hardware
 
+For eight-GPU nodes, choose the quick start for your hardware. Each includes the environment exports, native build, single-node test and commands for both hosts in a two-node test. [Hopper H100 / CUDA 12.9](docs/development.md#hopper-h100-quick-start) · [Blackwell / CUDA 13.0](docs/development.md#blackwell-cuda-130-quick-start)
+
 - **Transport** uses NVIDIA GPUs, NVLink/peer-accessible CUDA IPC allocations and an NVIDIA/Mellanox NIC with libibverbs. Inter-node payloads require working GPU-memory registration and GPUDirect RDMA. The local-only launcher also initializes its configured NIC. The integrated profiles target eight GPUs per node. GPU/NIC maps, peer addresses, ports and GIDs are site-specific.
 - **Build** the Linux shared library with a full CUDA 12.9+ toolkit, a compatible host compiler, rdma-core development headers/libraries and POSIX threads. Use CUDA architecture 90 for Hopper H100 or 100 for Blackwell B200/B300. Both paths support BF16/FP16 compute. Native transport, CuTe metadata and QuACK GEMM each have their own compilation path.
 - **Compute** requires CUDA-enabled PyTorch and the separate communication-overlap QuACK checkout, including its `run/` helpers. Set `QUACK_ROOT` to that checkout or pass `--quack-root` to the worker. The inspected revision is `ccc12c585a453a4d96c333677aa58714d117c496`. Its documented B300 baseline uses Python 3.12, PyTorch 2.13.0+cu129, CUDA Python/bindings 12.9.4 and CUTLASS DSL 4.7.0. Match the shared CUDA runtime major used by PyTorch and the native library. [QuACK revision](https://github.com/ZH1243/quack_for_communication_overlap/tree/ccc12c585a453a4d96c333677aa58714d117c496)

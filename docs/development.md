@@ -2,6 +2,114 @@
 
 Run these blocks in Bash from the root of the meon checkout unless a block specifies another directory. CPU tests exercise routing, protocols and lifecycle logic. Establish GPU numerical correctness on each target architecture before comparing latency.
 
+## Blackwell CUDA 13.0 quick start
+
+This example uses an existing CUDA 13.0 Conda environment, eight visible GPUs per node, and two NICs per GPU. Activate that environment on each participating host, then run the shared setup below in each shell. Adjust the checkout paths and NIC names if they differ between hosts. For a new environment, follow the [CUDA 13 installation recipe](runtime.md#cuda-13-alternative).
+
+```bash
+export PROXY_ROOT=/sjtu-aisys-workspace/meon
+export QUACK_ROOT=/sjtu-aisys-workspace/quack_for_communication_overlap
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CONDA_PREFIX/bin:$CUDA_HOME/bin:$PATH"
+export RDMA_PROXY_BUILD_DIR="$PROXY_ROOT/build-blackwell-cu130"
+export QUACK_CACHE_DIR="$CONDA_PREFIX/var/cache/quack"  # optional
+
+export RDMA_PROXY_GEMM_ARCH=blackwell
+export CUDA_DEVICE_MAP="0,1,2,3,4,5,6,7"
+export RDMA_DEVICE_MAP="mlx5_000+mlx5_001,mlx5_002+mlx5_003,mlx5_004+mlx5_005,mlx5_006+mlx5_007,mlx5_008+mlx5_009,mlx5_010+mlx5_011,mlx5_012+mlx5_013,mlx5_014+mlx5_015"
+export RDMA_GID_INDEX=3
+export RDMA_PORT=1
+cd "$PROXY_ROOT"
+```
+
+Build once per build directory. CMake uses the CUDA toolkit and architecture 100 to compile the native library. The launchers use `RDMA_PROXY_BUILD_DIR` to find that library. The GPU map, NIC map, GID and peer addresses take effect at launch.
+
+```bash
+cmake -S "$PROXY_ROOT" -B "$RDMA_PROXY_BUILD_DIR" \
+  -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" -DCUDAToolkit_ROOT="$CUDA_HOME" \
+  -DCMAKE_CUDA_ARCHITECTURES=100 -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+  -DRDMA_PROXY_REQUIRE_CUDA=ON -DRDMA_PROXY_REQUIRE_VERBS=ON
+cmake --build "$RDMA_PROXY_BUILD_DIR" -j4
+```
+
+**Single-node test.** Run on either host. Rendezvous uses loopback and the launcher initializes the local NICs. This checks projections and the enabled return/combine stages over three iterations.
+
+```bash
+MASTER_ADDR=127.0.0.1 bash scripts/run_single_node_torchrun.sh \
+  --num_tokens=1024 --num_iterations=3 --check-projections
+```
+
+**Two-node test.** Start the following commands concurrently, one in each host's prepared shell. This example assumes node 0 uses `10.51.1.3` for both torchrun rendezvous and proxy traffic. Both ranks use the same `MASTER_ADDR` and `MASTER_PORT`. Each rank sets `PEER_HOST` to the other host's reachable proxy address.
+
+On **node 0**, replace `<node-1-proxy-IP>` with node 1's address.
+
+```bash
+export MASTER_ADDR=10.51.1.3 MASTER_PORT=29500 PEER_HOST="<node-1-proxy-IP>"
+bash scripts/run_node0_torchrun.sh --num_tokens=1024 --num_iterations=3 --check-projections
+```
+
+On **node 1**, the peer is node 0.
+
+```bash
+export MASTER_ADDR=10.51.1.3 MASTER_PORT=29500 PEER_HOST=10.51.1.3
+bash scripts/run_node1_torchrun.sh --num_tokens=1024 --num_iterations=3 --check-projections
+```
+
+Check that each launcher exits successfully and every worker reports `Projection numerical checks passed: iteration=2`. The two-node profile also prints `RDMA return transport check: PASSED`.
+
+## Hopper H100 quick start
+
+Activate the Hopper Conda environment on each participating host and start in the meon checkout. This example uses CUDA 12.9 with matching CUDA-enabled PyTorch and the external QuACK checkout alongside meon. The map assigns one bonded NIC to each of eight GPUs in the order used by the shipped Hopper launchers. Check the local names with `nvidia-smi topo -m` and `ibv_devinfo`, and adjust the map, port and GID for that host if needed.
+
+```bash
+export PROXY_ROOT="$PWD"
+export QUACK_ROOT="$(dirname "$PROXY_ROOT")/quack_for_communication_overlap"
+export CUDA_HOME=/usr/local/cuda-12.9
+export PATH="$CONDA_PREFIX/bin:$CUDA_HOME/bin:$PATH"
+export QUACK_CACHE_DIR="$CONDA_PREFIX/var/cache/quack"  # optional
+export RDMA_PROXY_BUILD_DIR="$PROXY_ROOT/build-hopper"
+export RDMA_PROXY_GEMM_ARCH=hopper
+export CUDA_DEVICE_MAP="0,1,2,3,4,5,6,7"
+export RDMA_DEVICE_MAP="mlx5_bond_1,mlx5_bond_4,mlx5_bond_3,mlx5_bond_2,mlx5_bond_7,mlx5_bond_6,mlx5_bond_8,mlx5_bond_5"
+export RDMA_GID_INDEX=3
+export RDMA_PORT=1
+```
+
+**Build for SM90.** Build once per build directory and keep `RDMA_PROXY_BUILD_DIR` exported for the launchers. If your Hopper environment already uses CUDA 13.0 and cu130 PyTorch, set `CUDA_HOME=/usr/local/cuda-13.0` before exporting `PATH` above and choose a fresh directory such as `$PROXY_ROOT/build-hopper-cu130`. The H100 build target stays `90` with either toolkit.
+
+```bash
+cmake -S "$PROXY_ROOT" -B "$RDMA_PROXY_BUILD_DIR" \
+  -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" -DCUDAToolkit_ROOT="$CUDA_HOME" \
+  -DCMAKE_CUDA_ARCHITECTURES=90 -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+  -DRDMA_PROXY_REQUIRE_CUDA=ON -DRDMA_PROXY_REQUIRE_VERBS=ON
+cmake --build "$RDMA_PROXY_BUILD_DIR" -j4
+```
+
+**Single node.** Run on either host. The launcher uses the local NIC map and loopback rendezvous. It ignores `PEER_HOST`.
+
+```bash
+MASTER_ADDR=127.0.0.1 bash scripts/run_single_node_torchrun.sh \
+  --num_tokens=1024 --num_iterations=3 --check-projections
+```
+
+**Two nodes.** Start these commands concurrently. The addresses below are the checked-in Hopper profile. If your hosts have different addresses, use node 0's rendezvous address for `MASTER_ADDR` in both shells and the opposite host's proxy address for each `PEER_HOST`.
+
+Run on **node 0**.
+
+```bash
+export MASTER_ADDR=28.59.80.49 MASTER_PORT=29500 PEER_HOST=29.162.224.226
+bash scripts/run_node0_torchrun.sh --num_tokens=1024 --num_iterations=3 --check-projections
+```
+
+Run on **node 1**.
+
+```bash
+export MASTER_ADDR=28.59.80.49 MASTER_PORT=29500 PEER_HOST=28.59.80.49
+bash scripts/run_node1_torchrun.sh --num_tokens=1024 --num_iterations=3 --check-projections
+```
+
+Each launcher should exit successfully, and every worker should print `Projection numerical checks passed: iteration=2`. The two-node run also checks the reverse RDMA path and prints `RDMA return transport check: PASSED`.
+
 ## Mac or CPU-only development
 
 CMake 3.20+, a C++17 compiler and Python 3.9+ suffice for the commands below. The project also builds with CMake 3.18/3.19. With those versions run `(cd build/mock && ctest --output-on-failure)` and use the same pattern in each benchmark build directory. A Python environment containing CPU PyTorch additionally exercises tensor arithmetic and corruption detection. Keep assertions enabled. Socket tests need permission to bind loopback ports.

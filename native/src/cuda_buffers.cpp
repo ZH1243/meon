@@ -126,7 +126,7 @@ CudaBuffers::CudaBuffers(ProxyConfig config) : config_(std::move(config)) {}
 
 void CudaBuffers::set_external_device_buffer_allocator(
     ExternalDeviceBufferAllocator allocator) {
-    if (!buffers_.empty() || router_send_buffer_.ptr ||
+    if (!buffers_.empty() || input_pool_.ptr || router_send_buffer_.ptr ||
         !nvlink_recv_buffers_.empty() ||
         router_notification_publication_buffers_.device_ready_rows.ptr) {
         throw std::runtime_error(
@@ -205,9 +205,21 @@ CudaBuffers::~CudaBuffers() {
         free_buffer(entry.expert_token_indices_device);
         free_buffer(entry.expert_route_weights_device);
     }
+    // Unconfirmed peer imports can outlive a failed or partially initialized
+    // proxy. Retain a native allocation until process exit in that case.
+    if (input_pool_exported_) {
+        RDMA_PROXY_LOG_WARN("retaining input pool bytes=", input_pool_.bytes,
+                            " because peer CUDA IPC retirement was not confirmed");
+    } else {
+        free_buffer(input_pool_);
+    }
     free_buffer(router_notification_publication_buffers_.device_table);
+    free_buffer(router_notification_publication_buffers_.device_pooled_table);
+    free_buffer(router_notification_publication_buffers_.device_pooled_a_idx);
     free_buffer(router_notification_publication_buffers_.device_ready_rows);
     free_pinned_buffer(router_notification_publication_buffers_.host_table);
+    free_pinned_buffer(router_notification_publication_buffers_.host_pooled_table);
+    free_pinned_buffer(router_notification_publication_buffers_.host_pooled_a_idx);
     free_pinned_buffer(router_notification_publication_buffers_.host_ready_rows);
     free_pinned_buffer(router_notification_ready_values_);
     free_pinned_buffer(cpu_scatter_staging_);
@@ -230,6 +242,18 @@ void CudaBuffers::initialize() {
 
     buffers_.clear();
     buffers_.reserve(config_.peers.size());
+    if (config_.router_pooled_up_gemm_enabled) {
+        const auto sources = static_cast<std::size_t>(config_.num_nodes) * config_.num_gpus_per_node;
+        const auto max_rows = static_cast<std::size_t>(std::numeric_limits<int32_t>::max()) + 1;
+        if (sources == 0 || config_.num_tokens > max_rows / sources)
+            throw std::runtime_error("pooled input row indices exceed int32 range");
+        const auto rows = sources * config_.num_tokens;
+        if (rows == 0 || config_.token_dimension >
+                std::numeric_limits<std::size_t>::max() / rows / dtype_size(config_.dtype))
+            throw std::runtime_error("pooled input byte size is out of range");
+        allocate_buffer(input_pool_,
+            token_buffer_request(DeviceBufferKind::kInputPool, config_, sources * bytes));
+    }
     if (config_.router_routing_enabled) {
         allocate_buffer(
             router_send_buffer_,
@@ -247,10 +271,11 @@ void CudaBuffers::initialize() {
                 token_buffer_request(
                     DeviceBufferKind::kRdmaSend, config_, bytes, peer.node_rank));
         }
-        allocate_buffer(
+        allocate_receive_buffer(
             entry.recv,
             token_buffer_request(
-                DeviceBufferKind::kRdmaReceive, config_, bytes, peer.node_rank));
+                DeviceBufferKind::kRdmaReceive, config_, bytes, peer.node_rank),
+            peer.node_rank, config_.local_gpu_index);
         buffers_.push_back(entry);
         RDMA_PROXY_LOG_INFO("allocated GPU buffers for peer ", peer.node_rank, " bytes=", bytes);
     }
@@ -287,7 +312,7 @@ void CudaBuffers::initialize() {
                             " source_gpu=", source_gpu,
                             " bytes=", forwarding_bytes);
                     } else {
-                        allocate_buffer(entry.recv, request);
+                        allocate_receive_buffer(entry.recv, request, source_node, source_gpu);
                     }
                     nvlink_recv_buffers_.push_back(entry);
                     RDMA_PROXY_LOG_INFO(
@@ -777,6 +802,10 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
     if (a_idx_capacity > std::numeric_limits<std::size_t>::max() / sizeof(int32_t)) {
         throw std::runtime_error("QuACK A_idx allocation size overflows size_t");
     }
+    const auto receive_buffer_count = router_computation_buffer_indices_.size();
+    if (config_.router_pooled_up_gemm_enabled &&
+        a_idx_capacity > std::numeric_limits<int32_t>::max() / receive_buffer_count)
+        throw std::runtime_error("pooled A_idx capacity exceeds int32 range");
     for (const auto buffer_index : router_computation_buffer_indices_) {
         auto& buffer = nvlink_recv_buffers_[buffer_index];
         buffer.expert_token_index_count =
@@ -849,7 +878,6 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
         total_batches += batches;
     }
 
-    const auto receive_buffer_count = router_computation_buffer_indices_.size();
     auto& publication = router_notification_publication_buffers_;
     if (receive_buffer_count >
         (std::numeric_limits<std::size_t>::max() - 2) / 2) {
@@ -900,6 +928,25 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
                 -1,
                 table_bytes,
                 {publication.table_rows, publication.table_width}});
+    }
+    if (config_.router_pooled_up_gemm_enabled) {
+        // QuACK's fused entry point derives output capacity from A_idx.numel().
+        // Keep the same padded capacity as the multi-buffer launch while only
+        // staging and transferring the meaningful ranges.
+        const auto capacity = a_idx_capacity * receive_buffer_count;
+        allocate_buffer(publication.device_pooled_a_idx, DeviceBufferAllocationRequest{
+            DeviceBufferKind::kPooledAIdx, DeviceBufferElementType::kInt32, -1, -1, -1,
+            capacity * sizeof(int32_t), {capacity}});
+        std::size_t routes = 0;
+        for (const auto count : state.expert_total_tokens) routes += count;
+        if (routes != 0) {
+            allocate_pinned_buffer(publication.host_pooled_a_idx, routes * sizeof(int32_t));
+            const auto bytes = publication.table_rows * 4 * sizeof(int32_t);
+            allocate_pinned_buffer(publication.host_pooled_table, bytes);
+            allocate_buffer(publication.device_pooled_table, DeviceBufferAllocationRequest{
+                DeviceBufferKind::kPooledGatherTable, DeviceBufferElementType::kInt32, -1, -1, -1,
+                bytes, {publication.table_rows, 4}});
+        }
     }
     if (config_.nvlink_forward_notification_flag_update_mode ==
         NvlinkForwardNotificationFlagUpdateMode::kMemcpy) {
@@ -1420,8 +1467,8 @@ void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) 
     }
     const bool reset_existing_iteration = scheduler.iteration_initialized;
     if (reset_existing_iteration) {
-        // Rows are immutable within an iteration, but a new iteration reuses
-        // them. Wait for prior H2D reads before clearing pinned host memory.
+        // A new arrival order can reuse every descriptor and packed index
+        // slot differently. Retire all H2D reads before reusing pinned storage.
         synchronize_cuda_stream(
             router_notification_publication_stream_, config_.mock_mode);
     }
@@ -1731,6 +1778,39 @@ void CudaBuffers::ingest_router_notification_completion_locked(
         *it, iteration, start_token, num_tokens, flush_ready_entries_per_entry);
 }
 
+// The scheduler has selected the batch using only visible receive rows. Its
+// packed interval is unique within the iteration (including across experts),
+// so DMA can read this pinned span while later selections fill other spans.
+void CudaBuffers::publish_pooled_batch(std::size_t expert, const std::vector<int32_t>& ranges,
+                                       std::size_t batch_tokens, std::size_t first_row) {
+    auto& publication = router_notification_publication_buffers_;
+    std::size_t packed_begin = 0;
+    for (std::size_t j = 0; j < router_computation_buffer_indices_.size(); ++j)
+        packed_begin += ranges[2 * j]; // Empty ranges can have nonzero starts.
+    auto* flat = static_cast<int32_t*>(publication.host_pooled_a_idx.ptr) + packed_begin;
+    for (std::size_t j = 0; j < router_computation_buffer_indices_.size(); ++j) {
+        const auto& buffer = nvlink_recv_buffers_[router_computation_buffer_indices_[j]];
+        const auto base = input_pool_row_base(buffer.source_node_rank, buffer.source_gpu_index);
+        const auto& indices = buffer.expert_metadata.expert_token_indices;
+        for (auto pos = ranges[2 * j]; pos < ranges[2 * j + 1]; ++pos)
+            *flat++ = static_cast<int32_t>(base + indices[pos]);
+    }
+    const auto groups = publication.n_groups_per_m_cluster;
+    auto* row = static_cast<int32_t*>(publication.host_pooled_table.ptr) + 4 * first_row;
+    for (std::size_t g = 0; g < groups; ++g, row += 4) {
+        row[0] = static_cast<int32_t>(expert);
+        row[1] = static_cast<int32_t>(packed_begin);
+        row[2] = static_cast<int32_t>(packed_begin + batch_tokens);
+        row[3] = static_cast<int32_t>(g) * publication.group_size;
+    }
+    // Both copies precede even the first per-entry ready write on this stream.
+    if (first_row == 0) record_router_computation_start();
+    upload_publication_range(publication.host_pooled_a_idx, publication.device_pooled_a_idx,
+                             packed_begin * sizeof(int32_t), batch_tokens * sizeof(int32_t));
+    upload_publication_range(publication.host_pooled_table, publication.device_pooled_table,
+                             first_row * 4 * sizeof(int32_t), groups * 4 * sizeof(int32_t));
+}
+
 std::size_t
 CudaBuffers::schedule_ready_computation_batches_for_expert_locked(
     std::size_t expert,
@@ -1808,6 +1888,8 @@ CudaBuffers::schedule_ready_computation_batches_for_expert_locked(
         // committed host-table prefixes on its worker outside this hot path.
         if (cpu_scatter_device_ && !cpu_scatter_deferred_staging_.ptr)
             prepare_cpu_scatter_batch(ranges.data());
+        if (config_.router_pooled_up_gemm_enabled)
+            publish_pooled_batch(expert, ranges, batch_tokens, scheduler.published_rows);
 
         for (std::size_t n_group = 0;
              n_group < publication.n_groups_per_m_cluster; ++n_group) {
@@ -1929,6 +2011,38 @@ void CudaBuffers::flush_router_notification_publication() {
         0, router_notification_publication_buffers_.host_table.bytes);
 }
 
+void CudaBuffers::record_router_computation_start() {
+    std::lock_guard<std::mutex> lock(router_computation_timing_mutex_);
+    if (router_computation_start_recorded_) return;
+    if (!router_computation_timing_initialized_) {
+        if (config_.mock_mode) return;  // Host tests also flush before iteration zero.
+        throw std::runtime_error("router computation timing iteration is not initialized");
+    }
+#if RDMA_PROXY_HAVE_CUDA
+    if (!config_.mock_mode) {
+        check_cuda(cudaEventRecord(reinterpret_cast<cudaEvent_t>(router_computation_start_event_),
+                                   reinterpret_cast<cudaStream_t>(router_notification_publication_stream_)),
+                   "cudaEventRecord QuACK computation start");
+    }
+#endif
+    router_computation_start_recorded_ = true;
+}
+
+void CudaBuffers::upload_publication_range(const CpuPinnedBuffer& host, GpuBuffer& device,
+                                           std::size_t offset, std::size_t bytes) {
+    auto* dst = static_cast<uint8_t*>(device.ptr) + offset;
+    const auto* src = static_cast<const uint8_t*>(host.ptr) + offset;
+    if (config_.mock_mode) {
+        std::memcpy(dst, src, bytes);
+        return;
+    }
+#if RDMA_PROXY_HAVE_CUDA
+    check_cuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice,
+                               reinterpret_cast<cudaStream_t>(router_notification_publication_stream_)),
+               "cudaMemcpyAsync H2D QuACK publication range");
+#endif
+}
+
 void CudaBuffers::flush_router_notification_publication_range(
     std::size_t table_offset,
     std::size_t table_bytes) {
@@ -1945,6 +2059,9 @@ void CudaBuffers::flush_router_notification_publication_range(
         (table_bytes != 0 &&
          (!publication.host_table.ptr || !publication.device_table.ptr))) {
         throw std::runtime_error("QuACK gather-table flush range is invalid");
+    }
+    if (!config_.mock_mode && !router_notification_publication_stream_) {
+        throw std::runtime_error("router notification publication stream is not initialized");
     }
 
     const auto ready_rows = *static_cast<const int32_t*>(
@@ -1970,21 +2087,12 @@ void CudaBuffers::flush_router_notification_publication_range(
                 router_notification_ready_values_.ptr) + ready_rows;
     }
 
+    if (table_bytes != 0) {
+        if (!config_.router_pooled_up_gemm_enabled) record_router_computation_start();
+        upload_publication_range(publication.host_table, publication.device_table,
+                                 table_offset, table_bytes);
+    }
     if (config_.mock_mode) {
-        if (table_bytes != 0) {
-            std::lock_guard<std::mutex> timing_lock(
-                router_computation_timing_mutex_);
-            if (router_computation_timing_initialized_ &&
-                !router_computation_start_recorded_) {
-                router_computation_start_recorded_ = true;
-            }
-        }
-        if (table_bytes != 0) {
-            std::memcpy(
-                static_cast<uint8_t*>(publication.device_table.ptr) + table_offset,
-                static_cast<const uint8_t*>(publication.host_table.ptr) + table_offset,
-                table_bytes);
-        }
         std::memcpy(
             publication.device_ready_rows.ptr,
             ready_rows_memcpy_source,
@@ -1995,38 +2103,8 @@ void CudaBuffers::flush_router_notification_publication_range(
         return;
     }
 #if RDMA_PROXY_HAVE_CUDA
-    if (!router_notification_publication_stream_) {
-        throw std::runtime_error(
-            "router notification publication stream is not initialized");
-    }
     auto stream = reinterpret_cast<cudaStream_t>(
         router_notification_publication_stream_);
-    if (table_bytes != 0) {
-        {
-            std::lock_guard<std::mutex> timing_lock(
-                router_computation_timing_mutex_);
-            if (!router_computation_timing_initialized_) {
-                throw std::runtime_error(
-                    "router computation timing iteration is not initialized");
-            }
-            if (!router_computation_start_recorded_) {
-                check_cuda(
-                    cudaEventRecord(
-                        reinterpret_cast<cudaEvent_t>(
-                            router_computation_start_event_),
-                        stream),
-                    "cudaEventRecord QuACK computation start");
-                router_computation_start_recorded_ = true;
-            }
-        }
-        check_cuda(cudaMemcpyAsync(
-            static_cast<uint8_t*>(publication.device_table.ptr) + table_offset,
-            static_cast<const uint8_t*>(publication.host_table.ptr) + table_offset,
-            table_bytes,
-            cudaMemcpyHostToDevice,
-            stream), "cudaMemcpyAsync H2D QuACK gather-table range");
-    }
-
     if (config_.nvlink_forward_notification_flag_update_mode ==
         NvlinkForwardNotificationFlagUpdateMode::kMemcpy) {
         check_cuda(cudaMemcpyAsync(
@@ -2105,6 +2183,33 @@ void CudaBuffers::allocate_buffer(
 #endif
 }
 
+std::size_t CudaBuffers::input_pool_row_base(int source_node, int source_gpu) const {
+    return (static_cast<std::size_t>(source_node) * config_.num_gpus_per_node + source_gpu) *
+        config_.num_tokens;
+}
+
+void CudaBuffers::allocate_receive_buffer(
+    GpuBuffer& buffer,
+    const DeviceBufferAllocationRequest& request,
+    int source_node,
+    int source_gpu) {
+    if (!input_pool_.ptr) {
+        allocate_buffer(buffer, request);
+        return;
+    }
+    if (source_node < 0 || source_node >= config_.num_nodes ||
+        source_gpu < 0 || source_gpu >= config_.num_gpus_per_node) {
+        throw std::runtime_error("pooled receive source is outside the configured topology");
+    }
+    auto slice = input_pool_;
+    const auto offset = input_pool_row_base(source_node, source_gpu) *
+        config_.token_dimension * dtype_size(config_.dtype);
+    slice.ptr = static_cast<uint8_t*>(input_pool_.ptr) + offset;
+    slice.bytes = request.bytes;
+    // The embedding allocator also exposes this view under its logical key.
+    alias_buffer(buffer, slice, request);
+}
+
 void CudaBuffers::alias_buffer(
     GpuBuffer& buffer,
     const GpuBuffer& source,
@@ -2121,8 +2226,7 @@ void CudaBuffers::alias_buffer(
         }
         if (exposed_ptr != source.ptr) {
             throw std::runtime_error(
-                "external device-buffer allocator did not return the RDMA receive "
-                "pointer for a direct-input alias");
+                "external device-buffer allocator returned the wrong pointer for a receive alias");
         }
     }
     buffer = source;
@@ -2700,16 +2804,18 @@ void* open_cuda_ipc_memory_handle(const std::string& handle_hex, uint64_t mock_a
 #endif
 }
 
-void close_cuda_ipc_memory_handle(void* ptr, bool mock_mode) {
-    if (mock_mode || !ptr) return;
+bool close_cuda_ipc_memory_handle(void* ptr, bool mock_mode) {
+    if (mock_mode || !ptr) return true;
 #if RDMA_PROXY_HAVE_CUDA
     const auto status = cudaIpcCloseMemHandle(ptr);
     if (status != cudaSuccess) {
         RDMA_PROXY_LOG_WARN("cudaIpcCloseMemHandle failed during cleanup: ", cudaGetErrorString(status));
+        return false;
     }
 #else
     (void)ptr;
 #endif
+    return true;
 }
 
 }  // namespace rdma_proxy

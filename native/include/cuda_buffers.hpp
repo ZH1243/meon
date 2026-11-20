@@ -45,6 +45,9 @@ enum class DeviceBufferKind : int32_t {
     kGatherTable = 5,
     kGatherReadyRows = 6,
     kRouterRouteWeights = 7,
+    kInputPool = 8,
+    kPooledAIdx = 9,
+    kPooledGatherTable = 10,
 };
 
 enum class DeviceBufferElementType : int32_t {
@@ -81,6 +84,12 @@ struct RouterNotificationPublicationBuffers {
     CpuPinnedBuffer host_ready_rows;
     GpuBuffer device_table;
     GpuBuffer device_ready_rows;
+    // Optional single-buffer QuACK operands. The logical table above remains
+    // the authoritative source/list-position mapping for scatter and checks.
+    CpuPinnedBuffer host_pooled_a_idx;
+    CpuPinnedBuffer host_pooled_table;
+    GpuBuffer device_pooled_a_idx;
+    GpuBuffer device_pooled_table;
     std::size_t table_row_bytes{0};
     std::size_t table_rows{0};
     std::size_t table_width{0};
@@ -218,6 +227,9 @@ public:
     const std::vector<PeerGpuBuffers>& peer_buffers() const { return buffers_; }
     std::vector<PeerGpuBuffers>& peer_buffers() { return buffers_; }
     const std::vector<NvlinkReceiveBuffer>& nvlink_receive_buffers() const { return nvlink_recv_buffers_; }
+    const GpuBuffer& input_pool() const { return input_pool_; }
+    bool input_pool_exported() const { return input_pool_exported_; }
+    void set_input_pool_exported(bool exported) { input_pool_exported_ = exported; }
     PeerGpuBuffers& buffers_for_peer(int peer_rank);
     const PeerGpuBuffers& buffers_for_peer(int peer_rank) const;
     const NvlinkReceiveBuffer& nvlink_receive_buffer_for_source(
@@ -281,6 +293,12 @@ private:
     void allocate_buffer(
         GpuBuffer& buffer,
         const DeviceBufferAllocationRequest& request);
+    std::size_t input_pool_row_base(int source_node, int source_gpu) const;
+    void allocate_receive_buffer(
+        GpuBuffer& buffer,
+        const DeviceBufferAllocationRequest& request,
+        int source_node,
+        int source_gpu);
     void alias_buffer(
         GpuBuffer& buffer,
         const GpuBuffer& source,
@@ -306,6 +324,11 @@ private:
         bool flush_per_entry);
     std::size_t schedule_ready_computation_batches_locked(bool flush_per_entry);
     void schedule_router_notification_completions_locked();
+    void publish_pooled_batch(std::size_t expert, const std::vector<int32_t>& ranges,
+                              std::size_t batch_tokens, std::size_t first_row);
+    void record_router_computation_start();
+    void upload_publication_range(const CpuPinnedBuffer& host, GpuBuffer& device,
+                                  std::size_t offset, std::size_t bytes);
     void flush_router_notification_publication_range(
         std::size_t table_offset,
         std::size_t table_bytes);
@@ -356,6 +379,8 @@ private:
     // Per-source A_idx entry -> final address (and optional N-tile stride).
     std::vector<std::vector<int64_t>> cpu_scatter_lookup_;
     ExternalDeviceBufferAllocator external_device_buffer_allocator_;
+    GpuBuffer input_pool_;
+    bool input_pool_exported_{false};
     GpuBuffer router_send_buffer_;
     std::vector<PeerGpuBuffers> buffers_;
     std::vector<NvlinkReceiveBuffer> nvlink_recv_buffers_;
@@ -435,6 +460,6 @@ void launch_cuda_forward_copy_batch_async(
     bool mock_mode);
 CudaIpcMemoryHandle export_cuda_ipc_memory_handle(void* ptr, bool mock_mode);
 void* open_cuda_ipc_memory_handle(const std::string& handle_hex, uint64_t mock_addr, bool mock_mode);
-void close_cuda_ipc_memory_handle(void* ptr, bool mock_mode);
+bool close_cuda_ipc_memory_handle(void* ptr, bool mock_mode);
 
 }  // namespace rdma_proxy

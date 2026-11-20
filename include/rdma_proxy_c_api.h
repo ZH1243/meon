@@ -93,6 +93,9 @@ typedef enum RdmaProxyDeviceBufferKind {
     RDMA_PROXY_DEVICE_BUFFER_GATHER_TABLE = 5,
     RDMA_PROXY_DEVICE_BUFFER_GATHER_READY_ROWS = 6,
     RDMA_PROXY_DEVICE_BUFFER_ROUTER_ROUTE_WEIGHTS = 7,
+    RDMA_PROXY_DEVICE_BUFFER_INPUT_POOL = 8,
+    RDMA_PROXY_DEVICE_BUFFER_POOLED_A_IDX = 9,
+    RDMA_PROXY_DEVICE_BUFFER_POOLED_GATHER_TABLE = 10,
 } RdmaProxyDeviceBufferKind;
 
 typedef enum RdmaProxyDeviceBufferElementType {
@@ -109,6 +112,15 @@ typedef enum RdmaProxyDeviceBufferElementType {
  * NVLINK_RECEIVE request whose remote source GPU equals this proxy's local GPU
  * is a logical alias request: the allocator must return the pointer previously
  * supplied for that source node's RDMA_RECEIVE request.
+ * In pooled up-GEMM mode the first INPUT_POOL request is [global GPUs *
+ * num_tokens, token_dimension]. All NVLINK_RECEIVE requests are views into
+ * this pool, starting at row (source_node_rank * num_gpus_per_node +
+ * source_gpu_index) * num_tokens. RDMA_RECEIVE requests use peer_rank and
+ * the local GPU index for these source coordinates. Keep the pool alive
+ * through transport teardown. If shutdown cannot confirm peer IPC closure,
+ * retain the exported pool for the process lifetime. POOLED_A_IDX and
+ * POOLED_GATHER_TABLE supply the packed indices and four-column up-GEMM
+ * descriptors, respectively.
  */
 typedef struct RdmaProxyDeviceBufferRequest {
     uint32_t struct_size;

@@ -117,7 +117,7 @@ struct StopWorkerBeforeStorageRelease {
 
 // publication_mode: legacy per-batch=0, deferred=1, dedicated CPU thread=2.
 static void run(bool per_entry, uint64_t tile, bool cuda, int weight_mode,
-                int publication_mode, bool memcpy_flag, int lifecycle = 0) {
+                int publication_mode, bool memcpy_flag, int lifecycle = 0, bool pooled = false) {
     const bool deferred = publication_mode == 1;
     const bool threaded = publication_mode == 2;
     const bool single_upload = deferred || threaded;
@@ -125,6 +125,7 @@ static void run(bool per_entry, uint64_t tile, bool cuda, int weight_mode,
     config.mock_mode = !cuda;
     config.router_routing_enabled = true;
     config.router_weighted_contributions_enabled = weight_mode != 0;
+    config.router_pooled_up_gemm_enabled = pooled;
     config.nvlink_forwarding_enabled = true;
     config.nvlink_forward_completion_notifications_enabled = true;
     config.nvlink_forward_notification_flush_per_entry_enabled = per_entry;
@@ -299,7 +300,10 @@ static void run(bool per_entry, uint64_t tile, bool cuda, int weight_mode,
         const auto check_published = [&]() {
             int32_t ready = 0;
             auto* table = static_cast<const int32_t*>(publication.device_table.ptr);
-            std::vector<int32_t> table_copy;
+            auto* flat = static_cast<const int32_t*>(publication.device_pooled_a_idx.ptr);
+#if RDMA_PROXY_HAVE_CUDA
+            std::vector<int32_t> table_copy, flat_copy;
+#endif
             if (!cuda) {
                 ready = *static_cast<const int32_t*>(publication.device_ready_rows.ptr);
                 std::memcpy(scatter.data(), device_scatter, scatter_bytes);
@@ -319,6 +323,12 @@ static void run(bool per_entry, uint64_t tile, bool cuda, int weight_mode,
                     require(cudaMemcpy(packed_weights.data(), device_weights, packed_weights.size()*sizeof(float),
                                        cudaMemcpyDeviceToHost) == cudaSuccess);
                 table = table_copy.data();
+                if (pooled) {
+                    flat_copy.resize(routes);
+                    require(cudaMemcpy(flat_copy.data(), flat, routes * sizeof(int32_t),
+                                       cudaMemcpyDeviceToHost) == cudaSuccess);
+                    flat = flat_copy.data();
+                }
             }
 #endif
             require(ready == static_cast<int32_t>(
@@ -360,6 +370,7 @@ static void run(bool per_entry, uint64_t tile, bool cuda, int weight_mode,
                         ++expected_packed;
                         if (weight_mode) require(packed_weights[packed] == weights[s][i]);
                         const auto input = indices[s][i];
+                        if (pooled) require(flat[packed] == s * 10 + input);
                         const auto begin = inverse.begin() + s*10;
                         const auto compact = std::find(begin, begin + counts[s], input) - begin;
                         require(compact < counts[s]);
@@ -575,6 +586,10 @@ int main(int argc, char** argv) {
         for (int weights : {0, 1, 2}) for (int publication_mode : {0, 1, 2})
             for (bool memcpy_flag : {false, true})
                 run(per_entry, tile, cuda, weights, publication_mode, memcpy_flag);
+    // Check single-buffer gathers against the compact down addresses and
+    // position-specific weights in the SAME packed slots in both iterations.
+    run(true, 128, cuda, 1, 0, true, 0, true);
+    run(false, 128, cuda, 1, 2, false, 0, true);
     if (!cuda) {
         run(false, 128, false, 1, 2, false, 1); // busy reset and worker failure
         run(false, 128, false, 1, 2, false, 2); // destructor joins a busy worker

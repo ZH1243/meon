@@ -161,6 +161,126 @@ bash scripts/run_node1_torchrun.sh --num_tokens=1024 --num_iterations=3 --check-
 
 Each launcher should exit successfully, and every worker should print `Projection numerical checks passed: iteration=2`. The two-node run also checks the reverse RDMA path and prints `RDMA return transport check: PASSED`.
 
+## Pooled up GEMM on H200
+
+Use eight H200s per host. Start in the Meon checkout with the GPU/NIC maps and CUDA 12.9 environment from the [Hopper quick start](#hopper-h100-quick-start). The paired runs use one build and QuACK checkout. The pooled reference was inspected at QuACK revision `05e4efc4bb70fed084b3e2f8488f3ed316b1838b`. Run this setup on each host.
+
+```bash
+set -eo pipefail
+export RDMA_PROXY_GEMM_ARCH=hopper NPROC_PER_NODE=8
+export RDMA_PROXY_BUILD_DIR="$PWD/build/h200-release"
+native_flags=(-DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" -DCUDAToolkit_ROOT="$CUDA_HOME"
+  -DCMAKE_CUDA_ARCHITECTURES=90 -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared
+  -DRDMA_PROXY_REQUIRE_CUDA=ON -DRDMA_PROXY_REQUIRE_VERBS=ON)
+cmake -S . -B build/h200-debug -DCMAKE_BUILD_TYPE=Debug "${native_flags[@]}"
+cmake --build build/h200-debug --target test_cpu_scatter -j4
+CUDA_VISIBLE_DEVICES=0 build/h200-debug/test_cpu_scatter --cuda
+cmake -S . -B "$RDMA_PROXY_BUILD_DIR" -DCMAKE_BUILD_TYPE=Release "${native_flags[@]}"
+cmake --build "$RDMA_PROXY_BUILD_DIR" --target rdma_cpu_proxy_shared -j4
+git -C "$QUACK_ROOT" rev-parse HEAD
+CUDA_VISIBLE_DEVICES=0 RDMA_PROXY_TEST_CUDA=1 python -m unittest discover -s tests/python -v
+```
+
+Define this function in Bash on each participating host. It checks weighted SwiGLU with the launcher's GPU scatter, repeats with threaded CPU scatter, then measures the default multi-buffer and pooled modes in alternating order. The first pooled timing job also replays its last completed batch sequence after all consumers join. Each replay uses the exact same pool allocation, payload, weights, packed output, ready counter and descriptor order observed on that GPU. Both layouts must reproduce the valid live rows. Eighteen CUDA event samples per layout measure the two kernels in a graph with the order multi, pooled, pooled, multi.
+
+```bash
+h200_pooled_runs() {
+  local launcher="$1" tag="$2" output_dir="$3"
+  local common=(--num_experts=128 --top_k=8 --router_seed=1234 --token_dimension=4096
+    --grouped-gemm-activation=swiglu --grouped-gemm-output-dimension=2048
+    --grouped-gemm-m-tile=128 --grouped-gemm-n-tile=128 --grouped-gemm-cluster-m=2
+    --grouped-gemm-max-swizzle-size=4 --up-sm-count=96
+    --down-tile-m=128 --down-tile-n=128 --down-cluster-m=1 --down-max-swizzle-size=1
+    --down-pingpong --down-sm-count=74 --intra-node-combine-ctas=6
+    --weighted-contributions --nvlink_forward_notification_scheduling_mode=per_notification
+    --router_local_input_early_ready_enabled=true --nvlink_forward_prepared_batch_chunks=8
+    --completion_timeout_ms=600000 --return-token-timeout=600)
+  local checks_off=(--no-check-projections --no-check-return-token-results
+    --no-check-rdma-return-token-results --no-check-intra-node-combine --no-check-inter-node-combine)
+  local replay=() layout sample=0
+  mkdir -p "$output_dir"
+  timeout 3600 bash "$launcher" "${common[@]}" --pooled-up-gemm --num_tokens=1024 \
+    --num_iterations=3 --check-projections --local_iteration_sync_run_id="${tag}_gpu" \
+    2>&1 | tee "$output_dir/check-gpu.log" || return
+  timeout 3600 bash "$launcher" "${common[@]}" --pooled-up-gemm --num_tokens=1024 \
+    --num_iterations=3 --check-projections --cpu-scatter-preparation \
+    --cpu-scatter-publication=threaded --local_iteration_sync_run_id="${tag}_cpu" \
+    2>&1 | tee "$output_dir/check-cpu.log" || return
+  for layout in --no-pooled-up-gemm --pooled-up-gemm --pooled-up-gemm --no-pooled-up-gemm; do
+    sample=$((sample + 1))
+    replay=()
+    if [[ $sample == 2 ]]; then replay+=(--benchmark-ready-up-gemm); fi
+    timeout 7200 bash "$launcher" "${common[@]}" "${checks_off[@]}" "$layout" "${replay[@]}" \
+      --num_tokens=20480 --num_iterations=30 --local_iteration_sync_run_id="${tag}_perf_$sample" \
+      2>&1 | tee "$output_dir/perf-$sample.log" || return
+  done
+}
+```
+
+**One node, eight logical sources.** Run in the prepared shell.
+
+```bash
+MASTER_ADDR=127.0.0.1 MASTER_PORT=29500 h200_pooled_runs scripts/run_single_node_torchrun.sh \
+  h200_single_01 results/h200-single/node0
+```
+
+**Two nodes, sixteen logical sources.** Start both commands concurrently in the prepared shells. The examples use the shipped Hopper IPs. Set the rendezvous to node 0's reachable address and each proxy peer to the opposite host. Use a fresh shared tag when retrying a failed job.
+
+```bash
+# Node 0
+MASTER_ADDR=28.59.80.49 MASTER_PORT=29500 PEER_HOST=29.162.224.226 \
+  h200_pooled_runs scripts/run_node0_torchrun.sh h200_pair_01 results/h200-pair/node0
+```
+
+```bash
+# Node 1
+MASTER_ADDR=28.59.80.49 MASTER_PORT=29500 PEER_HOST=28.59.80.49 \
+  h200_pooled_runs scripts/run_node1_torchrun.sh h200_pair_01 results/h200-pair/node1
+```
+
+Check every rank for three projection and combine passes. The two-node profile also checks reverse RDMA. In `perf-2.log`, each `Ready up-GEMM` line reports the per-GPU median time with all descriptors ready. For live runs, the up line (`iteration I: elapsed_ms=… effective_throughput=…`) measures the first publication through up completion, including stalls on later arrivals. The `pipeline iteration I` line measures the complete host interval through returns, combine and reuse barriers. For each job and metric take the largest rank time at each iteration across **both** node logs for a two-node job. Compare medians over iterations 3–29 and retain the spread across the two runs per layout. Live jobs have matching routing and resource budgets. Arrival order can change between jobs.
+
+Collect the per-node log directories under the paths below and summarize each topology.
+
+```bash
+python - <<'PY'
+from collections import defaultdict
+from pathlib import Path
+import re, statistics
+for path, nodes in (("results/h200-single", 1), ("results/h200-pair", 2)):
+    medians = defaultdict(list)
+    for run in range(1, 5):
+        logs = [Path(path, f"node{n}", f"perf-{run}.log").read_text() for n in range(nodes)]
+        layout = "multi" if run in (1, 4) else "pooled"
+        for stage, pattern in (
+            ("up", r"\biteration (\d+): elapsed_ms=([\d.]+) effective_throughput="),
+            ("pipeline", r"\bpipeline iteration (\d+): elapsed_ms=([\d.]+)"),
+        ):
+            ranks = defaultdict(list)
+            for log in logs:
+                for i, ms in re.findall(pattern, log):
+                    ranks[int(i)].append(float(ms))
+            assert all(len(ranks[i]) == 8 * nodes for i in range(30)), (path, run, stage)
+            medians[stage, layout].append(statistics.median(max(ranks[i]) for i in range(3, 30)))
+    for stage in ("up", "pipeline"):
+        multi, pooled = medians[stage, "multi"], medians[stage, "pooled"]
+        print(path, stage, "multi ms", multi, "pooled ms", pooled,
+              "speedup", statistics.median(multi) / statistics.median(pooled))
+PY
+```
+
+The reported standalone H200 result exceeded 700 TFLOP/s with eight logical sources and reached about 670–680 TFLOP/s with sixteen or thirty-two. Meon's streaming speedup still needs measurement on H200.
+
+Local validation used an Apple M1 Max MacBook Pro running macOS 15.6.1, with Python 3.9.19 and CPU PyTorch 2.0.0. Debug CTest passed 40 tests and skipped three CUDA tests. The Python suite reported 70 tests, five CUDA skips and zero failures. These runs covered mock transport, scheduler publication, allocator aliases, weighted scatter and CPU numerical references. The H200 commands above cover the outstanding CUDA IPC, GPUDirect registration, live QuACK and timing checks.
+
+```bash
+cmake -S . -B build/mock -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/mock -j4
+ctest --test-dir build/mock --output-on-failure
+./build/mock/rdma_cpu_proxy --config config/example_config.json --cpu_affinity=none
+/Users/zhuhao/opt/anaconda3/envs/d2l/bin/python -m unittest discover -s tests/python -v
+```
+
 ## Mac or CPU-only development
 
 CMake 3.20+, a C++17 compiler and Python 3.9+ suffice for the commands below. The project also builds with CMake 3.18/3.19. With those versions run `(cd build/mock && ctest --output-on-failure)` and use the same pattern in each benchmark build directory. A Python environment containing CPU PyTorch additionally exercises tensor arithmetic and corruption detection. Keep assertions enabled. Socket tests need permission to bind loopback ports.

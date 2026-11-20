@@ -12,6 +12,10 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 namespace rdma_proxy {
 // Declared before proxy owners so callback storage outlives receiver shutdown.
@@ -544,8 +548,83 @@ struct PreparedForwardingTestAccess {
         }
     }
 
+    static void verify_pooled_transport(const Proxy& source, const Proxy& receiver) {
+        const auto& config = source.config_;
+        const auto& pool = receiver.cuda_buffers_.input_pool();
+        const auto slice_bytes = receiver.cuda_buffers_.token_buffer_bytes();
+        if (!pool.ptr || pool.bytes != config.num_nodes * config.num_gpus_per_node * slice_bytes)
+            throw std::runtime_error("unexpected input pool extent");
+        for (const auto& receive : receiver.cuda_buffers_.nvlink_receive_buffers()) {
+            const auto slot = receive.source_node_rank * config.num_gpus_per_node +
+                receive.source_gpu_index;
+            const auto* expected = static_cast<const char*>(pool.ptr) + slot * slice_bytes;
+            if (!receive.recv.is_alias || receive.recv.ptr != expected || receive.recv.bytes != slice_bytes)
+                throw std::runtime_error("logical receive view has the wrong pool slice");
+        }
+        for (const auto& peer : receiver.peers_) {
+            const auto& direct = receiver.cuda_buffers_.nvlink_receive_buffer_for_source(
+                peer.peer_rank, receiver.config_.local_gpu_index);
+            for (const auto& mr : {peer.local_recv_mr, peer.local_recv_mr2}) {
+                if (mr.addr != reinterpret_cast<uintptr_t>(direct.recv.ptr) || mr.length != slice_bytes)
+                    throw std::runtime_error("wrong slice registered for RDMA");
+            }
+        }
+        for (const auto& destination : source.forwarding_destinations_) {
+            int imports = 0;
+            for (const auto& mapped : destination.source_buffers) {
+                const auto& logical = receiver.cuda_buffers_.nvlink_receive_buffer_for_source(
+                    mapped.source_node_rank, config.local_gpu_index);
+                if (mapped.imported_cuda_ipc_base != pool.ptr || mapped.ptr != logical.recv.ptr)
+                    throw std::runtime_error("IPC mapping lost the input slice offset");
+                imports += mapped.imported_cuda_ipc;
+            }
+            if (imports != 1)
+                throw std::runtime_error("the pool must have exactly one owning IPC import");
+        }
+    }
+
+    static void verify_unconfirmed_pool(ProxyConfig config, bool cancelled) {
+        config.local_iteration_sync_run_id += cancelled ? "_cancel" : "_partial";
+        config.nvlink_forward_exchange_dir += cancelled ? "_cancel" : "_partial";
+        Proxy owner(config);
+        owner.cuda_buffers_.initialize();
+        owner.initialize_nvlink_forward_notifications();
+        owner.publish_local_nvlink_receive_buffers();
+        if (cancelled) {
+            owner.initialized_ = true;
+            owner.set_forwarding_error("injected pooled forwarding cancellation");
+        }
+        bool failed = false;
+        try { owner.shutdown(); }
+        catch (const std::runtime_error&) { failed = true; }
+        if (!failed || !owner.cuda_buffers_.input_pool_exported())
+            throw std::runtime_error("unconfirmed pooled export was released");
+        // The fixture published this mock pool without starting any importers.
+        owner.cuda_buffers_.set_input_pool_exported(false);
+    }
+
+    static std::string notification_name_and_finish_dispatch(Proxy& fast, Proxy& slow) {
+        // The slow rank has finished all iterations. Retire its sender now,
+        // leaving its forwarding IPC import open until the test allows shutdown.
+        slow.mark_forward_notification_senders_done();
+        return fast.nvlink_forward_notification_name_;
+    }
+
+    static void wait_for_unlink(const std::string& name) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto fd = shm_open(name.c_str(), O_RDONLY, 0600);
+            if (fd < 0 && errno == ENOENT) return;
+            if (fd >= 0) close(fd);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        throw std::runtime_error("fast rank did not retire its own IPC imports");
+    }
+
     static void verify(Proxy& source, Proxy& receiver, uint64_t iteration) {
         const auto& config = source.config_;
+        if (config.router_pooled_up_gemm_enabled)
+            verify_pooled_transport(source, receiver);
         if (!config.nvlink_forward_completion_notifications_enabled &&
             (source.nvlink_forward_notification_dispatch_ ||
              source.nvlink_forward_notification_header_ ||
@@ -635,7 +714,8 @@ int main(int argc, char** argv) {
         return 0;
     }
     const bool complete_round_forwarding = mode_arg == "--complete-round-forwarding";
-    const bool dual = mode_arg == "--dual-device";
+    const bool pooled = mode_arg == "--pooled-input";
+    const bool dual = pooled || mode_arg == "--dual-device";
     const bool unified = dual || mode_arg == "--unified-local" || mode_arg == "--unified-local-atomic" ||
         mode_arg == "--unified-local-query";
     const bool ping_pong2_only = argc == 2 && std::string(argv[1]) == "--ping-pong2-only";
@@ -662,7 +742,7 @@ int main(int argc, char** argv) {
     // Policies: prepared coordinator, ping-pong2, submit/epilogue, atomic ring,
     // stream-query mutex, and stream-query atomic. Other arguments retain their
     // original per-notification and notification-disabled baseline matrices.
-    const int scenario_end = complete_round_forwarding ? 6 * 18 : ping_pong2_only ? 72 : 36;
+    const int scenario_end = pooled ? 1 : complete_round_forwarding ? 6 * 18 : ping_pong2_only ? 72 : 36;
     for (int scenario = ping_pong2_only ? 36 : 0; scenario < scenario_end; ++scenario) {
         const int mode = scenario % 9;
         const int policy = complete_round_forwarding ? scenario / 18 : -1;
@@ -700,6 +780,7 @@ int main(int argc, char** argv) {
         config.fill_test_data = false;
         config.validate_data = false;
         config.router_routing_enabled = true;
+        config.router_pooled_up_gemm_enabled = pooled;
         config.router_num_experts = config.num_nodes * 2;
         config.router_top_k = 1;
         config.nvlink_forwarding_enabled = true;
@@ -732,6 +813,10 @@ int main(int argc, char** argv) {
         config.nvlink_forward_exchange_dir = "/tmp/test_prepared_" + nonce;
         for (int node = 1; node < config.num_nodes; ++node) {
             config.peers.push_back(PeerAddress{node, "mock-peer", 18515});
+        }
+        if (pooled) {
+            PreparedForwardingTestAccess::verify_unconfirmed_pool(config, false);
+            PreparedForwardingTestAccess::verify_unconfirmed_pool(config, true);
         }
         std::array<std::unique_ptr<Proxy>, 2> proxies;
         for (int gpu = 0; gpu < 2; ++gpu) {
@@ -804,8 +889,21 @@ int main(int argc, char** argv) {
             catch (...) { if (!errors[gpu]) errors[gpu] = std::current_exception(); }
         };
         const auto stop_start = std::chrono::steady_clock::now();
-        std::thread stop0(shutdown, 0), stop1(shutdown, 1);
+        const auto retirement_name = pooled && !failed ?
+            PreparedForwardingTestAccess::notification_name_and_finish_dispatch(*proxies[0], *proxies[1]) : "";
+        std::atomic<bool> fast_stopped{false};
+        std::thread stop0([&] { shutdown(0); fast_stopped = true; });
+        std::exception_ptr skew_error;
+        if (!retirement_name.empty()) {
+            try {
+                PreparedForwardingTestAccess::wait_for_unlink(retirement_name);
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                if (fast_stopped) throw std::runtime_error("pool owner returned with an open peer IPC import");
+            } catch (...) { skew_error = std::current_exception(); }
+        }
+        std::thread stop1(shutdown, 1);
         stop0.join(); stop1.join();
+        if (skew_error) std::rethrow_exception(skew_error);
         if (mode >= 6 && std::chrono::steady_clock::now() - stop_start > std::chrono::seconds(5)) {
             throw std::runtime_error("prepared shutdown waited for the completion timeout");
         }

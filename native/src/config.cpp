@@ -439,6 +439,10 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
         config.router_local_input_early_ready_enabled =
             (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "router_pooled_up_gemm_enabled") {
+        config.router_pooled_up_gemm_enabled =
+            (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "nvlink_forward_notification_flag_update_mode") {
         config.nvlink_forward_notification_flag_update_mode =
             nvlink_forward_notification_flag_update_mode_from_string(value);
@@ -785,6 +789,8 @@ static ProxyConfig parse_config_file(const std::string& path) {
         object,
         "router_local_input_early_ready_enabled",
         config.router_local_input_early_ready_enabled);
+    config.router_pooled_up_gemm_enabled = get_bool(
+        object, "router_pooled_up_gemm_enabled", config.router_pooled_up_gemm_enabled);
     config.expert_gemm_m_tile = number_as<std::size_t>(
         object, "expert_gemm_m_tile", config.expert_gemm_m_tile);
     config.expert_gemm_device_capacity = number_as<int>(
@@ -1217,6 +1223,15 @@ void validate_config(const ProxyConfig& config) {
                 "with nvlink_forward_notification_flush_only_enabled");
         }
     }
+    if (config.router_pooled_up_gemm_enabled &&
+        (!config.router_routing_enabled || !config.nvlink_forwarding_enabled ||
+         !config.nvlink_forward_completion_notifications_enabled ||
+         config.nvlink_forward_notification_flush_only_enabled ||
+         config.expert_gemm_device_capacity != 9)) {
+        throw std::runtime_error(
+            "router_pooled_up_gemm_enabled requires Hopper routed forwarding with "
+            "completion notifications and flush-only mode disabled");
+    }
     if (config.router_local_input_staging_enabled) {
         if (!config.router_routing_enabled || !config.nvlink_forwarding_enabled) {
             throw std::runtime_error(
@@ -1452,6 +1467,8 @@ std::string config_summary(const ProxyConfig& config) {
         << (config.router_computation_forwarded_inputs_only ? "true" : "false")
         << " router_local_input_staging_enabled="
         << (config.router_local_input_staging_enabled ? "true" : "false")
+        << " router_pooled_up_gemm_enabled="
+        << (config.router_pooled_up_gemm_enabled ? "true" : "false")
         << " router_local_input_early_ready_enabled="
         << (config.router_local_input_early_ready_enabled ? "true" : "false")
         << " nvlink_forward_notification_flag_update_mode="

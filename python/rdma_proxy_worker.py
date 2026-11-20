@@ -67,6 +67,9 @@ DEVICE_BUFFER_ROUTER_A_IDX = 4
 DEVICE_BUFFER_GATHER_TABLE = 5
 DEVICE_BUFFER_GATHER_READY_ROWS = 6
 DEVICE_BUFFER_ROUTER_ROUTE_WEIGHTS = 7
+DEVICE_BUFFER_INPUT_POOL = 8
+DEVICE_BUFFER_POOLED_A_IDX = 9
+DEVICE_BUFFER_POOLED_GATHER_TABLE = 10
 
 DEVICE_BUFFER_BF16 = 1
 DEVICE_BUFFER_FP16 = 2
@@ -107,6 +110,9 @@ class TorchDeviceBuffers:
         DEVICE_BUFFER_GATHER_TABLE: "gather_table",
         DEVICE_BUFFER_GATHER_READY_ROWS: "gather_ready_rows",
         DEVICE_BUFFER_ROUTER_ROUTE_WEIGHTS: "router_route_weights",
+        DEVICE_BUFFER_INPUT_POOL: "input_pool",
+        DEVICE_BUFFER_POOLED_A_IDX: "pooled_a_idx",
+        DEVICE_BUFFER_POOLED_GATHER_TABLE: "pooled_gather_table",
     }
 
     def __init__(
@@ -116,11 +122,13 @@ class TorchDeviceBuffers:
         *,
         node_rank: int,
         local_gpu_index: int,
+        num_gpus_per_node: int | None = None,
     ) -> None:
         self.torch = torch_module
         self.cuda_device_id = cuda_device_id
         self.node_rank = node_rank
         self.local_gpu_index = local_gpu_index
+        self.num_gpus_per_node = num_gpus_per_node
         self.tensors: dict[tuple[int, int, int, int], object] = {}
         self.allocation_error: BaseException | None = None
         # ctypes callbacks must themselves remain strongly referenced for as
@@ -175,6 +183,7 @@ class TorchDeviceBuffers:
                 int(request.source_node_rank),
                 int(request.source_gpu_index),
             )
+            pool = self.tensors.get((DEVICE_BUFFER_INPUT_POOL, -1, -1, -1))
             if (
                 request.kind == DEVICE_BUFFER_NVLINK_RECEIVE
                 and request.source_node_rank != self.node_rank
@@ -193,27 +202,27 @@ class TorchDeviceBuffers:
                         "direct-RDMA input alias was requested before its peer "
                         f"receive tensor: source_node={request.source_node_rank}"
                     ) from error
-                tensor_bytes = tensor.numel() * tensor.element_size()
-                if tuple(tensor.shape) != shape or tensor.dtype != dtype or tensor_bytes != request.bytes:
-                    raise RuntimeError(
-                        "direct-RDMA input alias descriptor does not match its RDMA "
-                        f"receive tensor: shape={shape}, bytes={request.bytes}"
-                    )
-                if key in self.tensors:
-                    raise RuntimeError(f"duplicate C++ device-buffer request for key {key}")
-                self.tensors[key] = tensor
-                return int(tensor.data_ptr())
-
-            tensor = self.torch.empty(
-                shape,
-                dtype=dtype,
-                device=f"cuda:{self.cuda_device_id}",
-            )
+            elif pool is not None and request.kind in (DEVICE_BUFFER_RDMA_RECEIVE,
+                                                        DEVICE_BUFFER_NVLINK_RECEIVE):
+                if self.num_gpus_per_node is None:
+                    raise RuntimeError("pooled receive allocation requires num_gpus_per_node")
+                if request.kind == DEVICE_BUFFER_RDMA_RECEIVE:
+                    node, gpu = request.peer_rank, self.local_gpu_index
+                else:
+                    node, gpu = request.source_node_rank, request.source_gpu_index
+                row_base = (node * self.num_gpus_per_node + gpu) * shape[0]
+                tensor = pool.narrow(0, row_base, shape[0])
+            else:
+                tensor = self.torch.empty(
+                    shape,
+                    dtype=dtype,
+                    device=f"cuda:{self.cuda_device_id}",
+                )
             tensor_bytes = tensor.numel() * tensor.element_size()
-            if tensor_bytes != request.bytes:
+            if tuple(tensor.shape) != shape or tensor.dtype != dtype or tensor_bytes != request.bytes:
                 raise RuntimeError(
-                    f"{kind_name} tensor shape {shape} occupies {tensor_bytes} bytes, "
-                    f"but C++ requested {request.bytes}"
+                    f"{kind_name} tensor {tuple(tensor.shape)} {tensor.dtype} ({tensor_bytes} bytes) "
+                    f"disagrees with C++ request {shape} {dtype} ({request.bytes} bytes)"
                 )
 
             # The launch scripts disable C++ test-pattern filling. Give the
@@ -238,8 +247,11 @@ class TorchDeviceBuffers:
         # In particular, finish the random send-buffer initialization before
         # the first C++ iteration is allowed to post RDMA work.
         self.torch.cuda.synchronize(self.cuda_device_id)
+        # Slice views have distinct data_ptrs but share the pool's storage.
+        pooled = (DEVICE_BUFFER_INPUT_POOL, -1, -1, -1) in self.tensors
         unique_tensors = {
-            int(tensor.data_ptr()): tensor for tensor in self.tensors.values()
+            int(tensor.data_ptr()): tensor for (kind, _, _, _), tensor in self.tensors.items()
+            if not pooled or kind not in (DEVICE_BUFFER_RDMA_RECEIVE, DEVICE_BUFFER_NVLINK_RECEIVE)
         }
         total_bytes = sum(
             tensor.numel() * tensor.element_size()
@@ -275,7 +287,7 @@ class TorchDeviceBuffers:
 
 
 class GroupedGemmRunner:
-    """Launch QuACK's readiness-gated multi-buffer GroupedGEMM."""
+    """Launch QuACK's readiness-gated up GEMM on the proxy's receive storage."""
 
     def __init__(
         self,
@@ -426,6 +438,18 @@ class GroupedGemmRunner:
         self.x_buffers = tuple(x_buffers)
         self.source_pairs = tuple(source_pairs)
         self.a_idx = tuple(a_idx)
+        # Keep the logical table and per-source list positions for down scatter,
+        # weights and validation. Only the operands passed to the up kernel vary.
+        self.x_pool = None
+        if device_buffers.tensors_of_kind(DEVICE_BUFFER_INPUT_POOL):
+            self.x_pool = device_buffers.only_tensor_of_kind(DEVICE_BUFFER_INPUT_POOL)
+            self.pooled_a_idx = device_buffers.only_tensor_of_kind(DEVICE_BUFFER_POOLED_A_IDX)
+            self.pooled_work_table = device_buffers.only_tensor_of_kind(DEVICE_BUFFER_POOLED_GATHER_TABLE)
+            if self.device_capacity != 9:
+                raise ValueError("pooled up GEMM requires Hopper SM90")
+            if (self.pooled_a_idx.shape != (self.output.shape[0],)
+                    or self.pooled_work_table.shape != (work_table.shape[0], 4)):
+                raise RuntimeError("pooled A_idx or four-column table has incompatible capacity")
         weight_entries = device_buffers.tensors_of_kind(DEVICE_BUFFER_ROUTER_ROUTE_WEIGHTS)
         self.route_weights = None
         if weight_entries:
@@ -449,29 +473,40 @@ class GroupedGemmRunner:
         self.max_swizzle_size = max_swizzle_size
         from quack.gemm_config import cta_tile_shape_m
         self.cta_tile_m = cta_tile_shape_m(tile_m, cluster_m, self.device_capacity)
+        pooled = self.x_pool is not None
+        input_shape = self.x_pool.shape if pooled else first_x.shape
+        index_shape = self.pooled_a_idx.shape if pooled else first_a_idx.shape
+        table_shape = self.pooled_work_table.shape if pooled else work_table.shape
         print(
             "GroupedGEMM configured: "
             f"device_capacity={self.device_capacity} mma_tile_m={tile_m} "
             f"cta_tile_m={self.cta_tile_m} cluster_rows={self.cta_tile_m * cluster_m} "
             f"sm_count={self.sm_count if self.sm_count is not None else 'hardware-default'} "
             f"activation={activation or 'none'} projection_N={self.gemm_dimension} "
-            f"active_sources={source_pairs} X={tuple(first_x.shape)} "
-            f"A_idx={tuple(first_a_idx.shape)} W={tuple(self.weights.shape)} "
-            f"output={tuple(self.output.shape)} table={tuple(work_table.shape)}",
+            f"active_sources={source_pairs} X={tuple(input_shape)} "
+            f"A_idx={tuple(index_shape)} W={tuple(self.weights.shape)} "
+            f"output={tuple(self.output.shape)} table={tuple(table_shape)} pooled_up_gemm={pooled}",
             flush=True,
         )
 
-    def launch(self) -> None:
+    def launch(self, *, pooled: bool | None = None) -> None:
+        if pooled is None:
+            pooled = self.x_pool is not None
+        if pooled and self.x_pool is None:
+            raise ValueError("pooled launch requires a pooled receive allocation")
+        x = self.x_pool if pooled else self.x_buffers
+        indices = self.pooled_a_idx if pooled else self.a_idx
+        table = self.pooled_work_table if pooled else self.work_table
         if self.activation is not None:
             self.quack_gemm_act(
-                self.x_buffers,
+                x,
                 self.weights,
                 activation=self.activation,
                 postact_out=self.output,
-                A_idx=self.a_idx,
-                gather_work_table=self.work_table,
+                A_idx=indices,
+                gather_work_table=table,
                 gather_work_table_ready=self.ready_rows,
-                multi_buffer_gather=True,
+                multi_buffer_gather=not pooled,
                 store_preact=False,
                 dynamic_scheduler=False,
                 tuned=False,
@@ -483,7 +518,7 @@ class GroupedGemmRunner:
             )
             return
         self.quack_gemm(
-            self.x_buffers,
+            x,
             self.transposed_weights,
             self.output,
             C=None,
@@ -499,10 +534,10 @@ class GroupedGemmRunner:
             is_dynamic_persistent=False,
             max_swizzle_size=self.max_swizzle_size,
             cu_seqlens_m=None,
-            A_idx=self.a_idx,
-            gather_work_table=self.work_table,
+            A_idx=indices,
+            gather_work_table=table,
             gather_work_table_ready=self.ready_rows,
-            multi_buffer_gather=True,
+            multi_buffer_gather=not pooled,
             use_tma_gather=False,
             sm_count=self.sm_count,
         )
@@ -1279,6 +1314,8 @@ def build_proxy_argv(
     ]
     if args.num_experts is not None:
         generated_args.append(f"--num_experts={args.num_experts}")
+    if getattr(args, "pooled_up_gemm", None) is not None:
+        generated_args.append(f"--router_pooled_up_gemm_enabled={str(args.pooled_up_gemm).lower()}")
     if args.concurrent_kernel:
         generated_args.extend(
             [
@@ -1474,6 +1511,8 @@ def install_python_device_buffers(
         cuda_device_id,
         node_rank=node_rank,
         local_gpu_index=local_gpu_index,
+        num_gpus_per_node=(environment_integer("LOCAL_WORLD_SIZE") if "LOCAL_WORLD_SIZE" in os.environ
+                           else None),
     )
     require_proxy_success(
         library,
@@ -1483,6 +1522,28 @@ def install_python_device_buffers(
         "installing Python device-buffer allocator",
     )
     return buffers
+
+
+# A peer may still own an IPC mapping if native teardown could not confirm
+# its close. Keep that allocation unavailable to the torch caching allocator.
+_unclosed_input_pools = []
+
+
+def shutdown_embedded_proxy(library, handle, buffers, initialized, success, return_exchange=None):
+    pools = buffers.tensors_of_kind(DEVICE_BUFFER_INPUT_POOL) if buffers is not None else []
+    error = None
+    try:
+        # A partially initialized proxy can already have exported its pool.
+        if (initialized or pools) and library.rdma_proxy_shutdown(handle) != 0:
+            error = proxy_last_error(library)
+            _unclosed_input_pools.extend(pools)
+            print(f"proxy shutdown failed: {error}", file=sys.stderr, flush=True)
+    finally:
+        library.rdma_proxy_destroy(handle)
+    if return_exchange is not None:
+        return_exchange.close(success and error is None)
+    if pools and success and error is not None:
+        raise RuntimeError(f"pooled receive teardown failed: {error}")
 
 
 def run_proxy(
@@ -1500,6 +1561,7 @@ def run_proxy(
         raise RuntimeError(f"proxy creation failed: {proxy_last_error(library)}")
 
     initialized = False
+    success = False
     device_buffers: TorchDeviceBuffers | None = None
     try:
         device_buffers = install_python_device_buffers(
@@ -1520,17 +1582,10 @@ def run_proxy(
         initialized = True
         device_buffers.finish_initialization()
         require_proxy_success(library, library.rdma_proxy_run(handle), "proxy run")
+        success = True
         return 0
     finally:
-        if initialized:
-            shutdown_status = library.rdma_proxy_shutdown(handle)
-            if shutdown_status != 0:
-                print(
-                    f"proxy shutdown failed: {proxy_last_error(library)}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-        library.rdma_proxy_destroy(handle)
+        shutdown_embedded_proxy(library, handle, device_buffers, initialized, success)
 
 
 class DownReadyTrace:
@@ -1599,6 +1654,8 @@ def run_proxy_with_concurrent_kernel(
     capacity = resolve_gemm_architecture(
         getattr(down_options, "gemm_arch", "auto"),
         torch.cuda.get_device_capability(cuda_device_id))
+    if down_options.pooled_up_gemm and capacity != 9:
+        raise ValueError("--pooled-up-gemm requires Hopper SM90")
     if down_options.down_projection2:
         resolve_down_pingpong(down_options.down_pingpong, capacity,
                               down_options.down_gather_table_wave_barrier)
@@ -1638,6 +1695,10 @@ def run_proxy_with_concurrent_kernel(
         initialized = True
         device_buffers.finish_initialization()
 
+        # Older ABI-v1 libraries ignore unrecognized native CLI keys. A pooled
+        # timing run must fail explicitly if it would exercise the default path.
+        if down_options.pooled_up_gemm and not device_buffers.tensors_of_kind(DEVICE_BUFFER_INPUT_POOL):
+            raise RuntimeError("--pooled-up-gemm requires a native library with pooled receive support")
         num_iterations = ctypes.c_uint64()
         require_proxy_success(
             library,
@@ -1752,7 +1813,7 @@ def run_proxy_with_concurrent_kernel(
 
         print(
             "concurrent-kernel mode enabled: Python will launch one readiness-gated "
-            "QuACK multi-buffer GroupedGEMM with each proxy iteration",
+            "QuACK GroupedGEMM with each proxy iteration",
             flush=True,
         )
 
@@ -1879,6 +1940,11 @@ def run_proxy_with_concurrent_kernel(
         coordinator.join()
         coordinator = None
         require_proxy_success(library, library.rdma_proxy_finish(handle), "proxy finish")
+        if down_options.benchmark_ready_up_gemm:
+            from benchmark_ready_up_gemm import benchmark_ready_up_gemm
+            kernel_stream.wait_stream(torch.cuda.current_stream(cuda_device_id))
+            with torch.cuda.stream(kernel_stream):
+                benchmark_ready_up_gemm(grouped_gemm, int(computation_tokens.value))
         print(
             "GroupedGEMM effective throughput by iteration "
             f"(useful_routes={computation_tokens.value}, K={hidden_dimension}, "
@@ -1933,17 +1999,7 @@ def run_proxy_with_concurrent_kernel(
         if coordinator is not None:
             commands.put(None)
             coordinator.join()
-        if initialized:
-            shutdown_status = library.rdma_proxy_shutdown(handle)
-            if shutdown_status != 0:
-                print(
-                    f"proxy shutdown failed: {proxy_last_error(library)}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-        library.rdma_proxy_destroy(handle)
-        if return_exchange is not None:
-            return_exchange.close(success and shutdown_status == 0)
+        shutdown_embedded_proxy(library, handle, device_buffers, initialized, success, return_exchange)
 
 
 def main() -> int:
@@ -1960,8 +2016,14 @@ def main() -> int:
     parser.add_argument(
         "--concurrent-kernel",
         action="store_true",
-        help="launch QuACK multi-buffer GroupedGEMM with every proxy iteration",
+        help="launch readiness-gated QuACK GroupedGEMM with every proxy iteration",
     )
+    parser.add_argument("--pooled-up-gemm", action=argparse.BooleanOptionalAction, default=None,
+                        help="receive into one activation pool and stream a flat gather index "
+                             "to the Hopper up GEMM (default: multi-buffer gather)")
+    parser.add_argument("--benchmark-ready-up-gemm", action="store_true",
+                        help="replay the final pooled iteration's ready work through both "
+                             "up kernels and compare their outputs and timings")
     parser.add_argument(
         "--communication-only",
         action="store_true",
@@ -2028,6 +2090,8 @@ def main() -> int:
         add_down_arguments(down_parser)
         vars(args).update(vars(down_parser.parse_args([])))
         args.concurrent_kernel = False
+        args.pooled_up_gemm = False
+        args.benchmark_ready_up_gemm = False
         args.check_projections = False
         args.weighted_contributions = False
         args.grouped_gemm_activation = "none"
@@ -2036,6 +2100,12 @@ def main() -> int:
             if name.startswith("expert_gemm_"):
                 setattr(args, name, parser.get_default(name))
     try:
+        if args.pooled_up_gemm and not args.concurrent_kernel:
+            raise ValueError("--pooled-up-gemm requires --concurrent-kernel")
+        if args.pooled_up_gemm and args.gemm_arch == "blackwell":
+            raise ValueError("--pooled-up-gemm requires Hopper SM90")
+        if args.benchmark_ready_up_gemm and not args.pooled_up_gemm:
+            raise ValueError("--benchmark-ready-up-gemm requires --pooled-up-gemm")
         if args.up_sm_count is not None and not args.concurrent_kernel:
             raise ValueError("--up-sm-count requires --concurrent-kernel")
         validate_up_sm_count(args.up_sm_count, args.expert_gemm_cluster_m)

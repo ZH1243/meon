@@ -125,6 +125,8 @@ struct ProxyConfig {
     // Populate the otherwise-unused local-node source descriptors from the
     // shared router send buffer and include them in the QuACK input set.
     bool router_local_input_staging_enabled{false};
+    // Receive into contiguous source slices and stream single-buffer Hopper descriptors.
+    bool router_pooled_up_gemm_enabled{false};
     // Request receiver publication of the already-staged own-GPU input at
     // iteration activation, concurrently with forwarding. Other sources still
     // need copy-completion notifications.

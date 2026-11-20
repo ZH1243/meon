@@ -178,6 +178,13 @@ class CompositionCudaTests(unittest.TestCase):
         # Up budgets change and repeat while down retains its independent cap.
         self._composition(128, 2, policy="distinct", up_sm_counts=(2, 4, 2))
 
+    def test_pooled_hopper_weighted_streamed_composition(self):
+        if self.arch != 9:
+            self.skipTest("pooled up GEMM requires Hopper")
+        for preparation in ("gpu", "threaded"):
+            with self.subTest(preparation=preparation):
+                self._composition(128, 4, policy="distinct", preparation=preparation, pooled=True)
+
     def test_end_of_iteration_reset_preserves_weighted_composition(self):
         for preparation in ("gpu", "per-batch", "deferred", "threaded"):
             with self.subTest(preparation=preparation):
@@ -188,7 +195,8 @@ class CompositionCudaTests(unittest.TestCase):
         self._composition(128, 4, output_reset="end-of-iteration")
 
     def _composition(self, tile_m, sm_count, policy=None, preparation="gpu",
-                     publication_default=False, up_sm_counts=None, output_reset="before-down"):
+                     publication_default=False, up_sm_counts=None, output_reset="before-down",
+                     pooled=False):
         torch = self.torch
         single_upload = preparation in ("deferred", "threaded")
         root = Path(os.environ.get("QUACK_ROOT", PYTHON_DIR.parents[1] / "quack_for_communication_overlap"))
@@ -208,8 +216,15 @@ class CompositionCudaTests(unittest.TestCase):
         original = {}
         buffers = worker.TorchDeviceBuffers(torch, torch.cuda.current_device(), node_rank=0,
                                             local_gpu_index=0)
+        if pooled:
+            pool = torch.empty(sources * input_rows, hidden, dtype=torch.bfloat16, device="cuda")
+            buffers.tensors[(worker.DEVICE_BUFFER_INPUT_POOL, -1, -1, -1)] = pool
         for source in range(sources):
-            x = torch.randn(input_rows, hidden, dtype=torch.bfloat16, device="cuda") * 0.2
+            if pooled:
+                x = pool.narrow(0, source * input_rows, input_rows)
+                x.normal_(std=0.2)
+            else:
+                x = torch.randn(input_rows, hidden, dtype=torch.bfloat16, device="cuda") * 0.2
             index = torch.full((capacity,), -12345, dtype=torch.int32, device="cuda")
             # Original source-token/expert assignments are created before any
             # gather table or packed-row order. Experts share source tokens;
@@ -235,6 +250,11 @@ class CompositionCudaTests(unittest.TestCase):
         ready = torch.full((1,), len(rows), dtype=torch.int32, device="cuda")
         buffers.tensors[(worker.DEVICE_BUFFER_GATHER_TABLE, -1, -1, -1)] = table
         buffers.tensors[(worker.DEVICE_BUFFER_GATHER_READY_ROWS, -1, -1, -1)] = ready
+        if pooled:
+            flat_indices = torch.empty(sources * capacity, dtype=torch.int32, device="cuda")
+            pooled_table = torch.empty(len(rows), 4, dtype=torch.int32, device="cuda")
+            buffers.tensors[(worker.DEVICE_BUFFER_POOLED_A_IDX, -1, -1, -1)] = flat_indices
+            buffers.tensors[(worker.DEVICE_BUFFER_POOLED_GATHER_TABLE, -1, -1, -1)] = pooled_table
         up = worker.GroupedGemmRunner(
             torch, buffers, cuda_device_id=torch.cuda.current_device(), world_size=1,
             num_experts=2, output_dimension=intermediate, activation="swiglu",
@@ -266,6 +286,18 @@ class CompositionCudaTests(unittest.TestCase):
 
         expert_counts = [sum(values[expert] for values in counts) for expert in range(2)]
         routes = sum(expert_counts)
+        def pooled_reference(descriptors):
+            logical = validation.route_metadata(up, routes)
+            indices = torch.tensor([source * input_rows + token for _, source, token in logical],
+                                   dtype=torch.int32, pin_memory=True)
+            table4 = torch.tensor([[r[0], sum(r[2::2]), sum(r[3::2]), r[1]] for r in descriptors],
+                                  dtype=torch.int32, pin_memory=True)
+            return indices, table4
+
+        if pooled:
+            pinned_indices, pinned_pooled = pooled_reference(rows)
+            flat_indices[:routes].copy_(pinned_indices)
+            pooled_table.copy_(pinned_pooled)
         down = worker.DownProjectionRunner(torch, up, expert_counts, options,
                                            trace_configure=configure_trace)
         if preparation != "gpu":
@@ -319,6 +351,11 @@ class CompositionCudaTests(unittest.TestCase):
                 for destination, source in zip(up.x_buffers, pinned_x):
                     destination.copy_(source, non_blocking=True)
                 for index, count in enumerate(pinned_counts):
+                    if pooled:
+                        _, begin, end, group = pinned_pooled[index].tolist()
+                        if group == 0:
+                            flat_indices[begin:end].copy_(pinned_indices[begin:end], non_blocking=True)
+                        pooled_table[index:index + 1].copy_(pinned_pooled[index:index + 1], non_blocking=True)
                     if (preparation == "per-batch" and pinned_addresses is not None
                             and pinned_table[index, 1].item() == 0):
                         # Mirrors native CPU scatter preparation: route weights
@@ -352,6 +389,10 @@ class CompositionCudaTests(unittest.TestCase):
                                       list(range(sources))[::-1] if iteration % 2 else None)
             pinned_table.copy_(torch.tensor(changed, dtype=torch.int32))
             table.copy_(pinned_table)
+            if pooled:
+                pinned_indices, pinned_pooled = pooled_reference(changed)
+                flat_indices.fill_(-1)
+                pooled_table.fill_(-1)
             if preparation != "gpu":
                 # Use the tested GPU address builder only to obtain invariant
                 # compact destination addresses; source weights are packed by a

@@ -38,6 +38,8 @@ bash scripts/run_single_node_torchrun.sh --num_tokens=1024 --num_iterations=3 --
 
 For a larger single-node run, the [annotated parameter example](docs/features.md#reading-a-single-node-command) explains the workload, GEMM tiles, SM budget, forwarding and return policies, and timeouts, with Hopper and Blackwell constraints.
 
+On Hopper, add `--pooled-up-gemm` to stream up GEMM from a contiguous receive pool. The default gathers from multiple buffers. The [H200 validation and timing commands](docs/development.md#pooled-up-gemm-on-h200) cover one and two nodes, including a same-pool kernel comparison.
+
 ## Directory map
 
 | Path | Responsibility |

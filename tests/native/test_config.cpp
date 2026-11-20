@@ -77,6 +77,7 @@ int main(int argc, char** argv) {
     assert(!config.nvlink_forward_notification_flush_per_entry_enabled);
     assert(config.nvlink_forward_notification_scheduling_mode == "per_notification");
     assert(!config.nvlink_forward_notification_scheduling_diagnostics);
+    assert(!config.router_pooled_up_gemm_enabled);
     assert(!config.router_local_input_staging_enabled);
     assert(!config.router_local_input_early_ready_enabled);
     assert(config.nvlink_forward_notification_flag_update_mode ==
@@ -740,6 +741,16 @@ int main(int argc, char** argv) {
     assert(!rdma_proxy::load_config(4, const_cast<char**>(early_local_args)).router_local_input_early_ready_enabled);
     const auto early_local_cli = rdma_proxy::load_config(5, const_cast<char**>(early_local_args));
     assert(early_local_cli.router_local_input_early_ready_enabled);
+    const char* pooled_args[] = {"test_config", "--config", "early_local_config.json",
+        "--router_pooled_up_gemm_enabled=true"};
+    const auto pooled = rdma_proxy::load_config(4, const_cast<char**>(pooled_args));
+    assert(pooled.router_pooled_up_gemm_enabled);
+    auto pooled_blackwell = pooled;
+    pooled_blackwell.expert_gemm_device_capacity = 10;
+    bool rejected_pooled_blackwell = false;
+    try { rdma_proxy::validate_config(pooled_blackwell); }
+    catch (const std::runtime_error&) { rejected_pooled_blackwell = true; }
+    assert(rejected_pooled_blackwell);
     assert(rdma_proxy::config_summary(early_local_cli).find(
         "router_local_input_early_ready_enabled=true") != std::string::npos);
 
@@ -786,6 +797,7 @@ int main(int argc, char** argv) {
         std::ifstream input("early_local_config.json");
         std::string base((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
         base.insert(base.find('{') + 1,
+            "\"router_pooled_up_gemm_enabled\":true,"
             "\"nvlink_forward_notification_scheduling_mode\":\"complete_round\","
             "\"nvlink_forward_notification_scheduling_diagnostics\":true,");
         std::ofstream output("round_scheduling_config.json");
@@ -794,6 +806,7 @@ int main(int argc, char** argv) {
     const auto json_scheduling = rdma_proxy::load_config_file("round_scheduling_config.json");
     assert(json_scheduling.nvlink_forward_notification_scheduling_mode == "complete_round");
     assert(json_scheduling.nvlink_forward_notification_scheduling_diagnostics);
+    assert(json_scheduling.router_pooled_up_gemm_enabled);
 
     auto invalid_local_staging_fill_config = valid_local_staging_config;
     invalid_local_staging_fill_config.fill_test_data = true;

@@ -225,6 +225,7 @@ private:
     LocalIterationSyncSlot* local_iteration_sync_slot(int gpu_index) const;
     void initialize_nvlink_forward_notifications();
     void release_nvlink_forward_notifications();
+    void retire_input_pool_exports();
     std::string nvlink_forward_notification_shm_name(int gpu_index) const;
     NvlinkForwardNotificationQueue* nvlink_forward_notification_queue_for_source(
         NvlinkForwardNotificationHeader* header,
@@ -300,8 +301,8 @@ private:
     void stop_forwarding_thread();
     void prepare_forwarding_routing_tables();
     void prepare_forwarding_destinations();
-    void publish_local_nvlink_receive_buffers() const;
-    ForwardDestinationState load_forward_destination(int dst_gpu) const;
+    void publish_local_nvlink_receive_buffers();
+    ForwardDestinationState load_forward_destination(int dst_gpu);
     const ForwardDestinationBufferState& forward_destination_buffer(
         const ForwardDestinationState& destination,
         int source_node_rank) const;
@@ -410,6 +411,7 @@ private:
     std::size_t forwarding_ready_peer_count_{0};
     std::vector<ForwardingOutOfOrderPeerState> forwarding_out_of_order_peer_states_;
     std::vector<ForwardDestinationState> forwarding_destinations_;
+    bool forward_ipc_close_failed_{false};
     std::vector<ForwardNotificationDestinationState> forwarding_notification_destinations_;
     std::vector<ForwardingIterationStats> forwarding_iteration_stats_;
     std::vector<ChunkDescriptor> local_router_forwarding_chunks_;

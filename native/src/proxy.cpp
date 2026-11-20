@@ -906,6 +906,8 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
     peer.peer_rank = buffers.peer_rank;
     peer.local_send_mr = rdma_context_.register_memory(
         buffers.send.ptr, buffers.send.bytes, "send_buffer_peer_" + std::to_string(buffers.peer_rank));
+    // In pooled mode this is the peer's same-index source slice. Advertise
+    // that slice's start and extent on each PD, just as for a separate receive.
     peer.local_recv_mr = rdma_context_.register_memory(
         buffers.recv.ptr, buffers.recv.bytes, "recv_buffer_peer_" + std::to_string(buffers.peer_rank));
 
@@ -1814,10 +1816,58 @@ void Proxy::initialize_nvlink_forward_notifications() {
 #endif
 }
 
+void Proxy::retire_input_pool_exports() {
+    if (!cuda_buffers_.input_pool_exported()) return;
+#if defined(__unix__) || defined(__APPLE__)
+    if (!initialized_ || forwarding_notification_failed_.load() ||
+        forwarding_notification_destinations_.size() != static_cast<std::size_t>(config_.num_gpus_per_node))
+        throw std::runtime_error("retaining exported input pool after incomplete forwarding setup or shutdown");
+    // Each importer unlinks its own notification object after its last CUDA
+    // IPC close. Our still-open mappings identify this generation even if a
+    // new job subsequently creates objects with the same names.
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.completion_timeout_ms);
+    for (const auto& dst : forwarding_notification_destinations_) {
+        if (dst.gpu_index == config_.local_gpu_index) continue;
+        const auto name = nvlink_forward_notification_shm_name(dst.gpu_index);
+        while (true) {
+            const int fd = shm_open(name.c_str(), O_RDONLY, 0600);
+            if (fd < 0) {
+                if (errno == ENOENT) break;
+                throw std::runtime_error("cannot confirm peer IPC retirement for " + name);
+            }
+            struct stat original{}, current{};
+            const bool stat_ok = fstat(dst.fd, &original) == 0 && fstat(fd, &current) == 0;
+            close(fd);
+            if (stat_ok && (original.st_dev != current.st_dev || original.st_ino != current.st_ino))
+                break;
+            if (!process_is_alive(atomic_load_i32(&dst.header->pid)) ||
+                std::chrono::steady_clock::now() >= deadline)
+                throw std::runtime_error("unconfirmed peer IPC close; retaining input pool for " + name);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    cuda_buffers_.set_input_pool_exported(false);
+#endif
+}
+
 void Proxy::release_nvlink_forward_notifications() {
     cancel_local_nvlink_return_batch_sync();
 #if defined(__unix__) || defined(__APPLE__)
     const bool owned = nvlink_forward_notification_fd_ >= 0;
+    if (owned) {
+        if (forward_ipc_close_failed_) {
+            // Leave the name present so peers cannot interpret a failed CUDA
+            // close as permission to free their exported allocations.
+            if (cuda_buffers_.input_pool_exported())
+                set_forwarding_error("failed to close a forwarding CUDA IPC mapping");
+        } else if (shm_unlink(nvlink_forward_notification_name_.c_str()) != 0 && errno != ENOENT) {
+            if (cuda_buffers_.input_pool_exported())
+                set_forwarding_error("failed to unlink NVLink notification shared memory during shutdown");
+        }
+        try { retire_input_pool_exports(); }
+        catch (const std::exception& error) { set_forwarding_error(error.what()); }
+    }
     for (auto& dst : forwarding_notification_destinations_) {
         if (dst.header) {
             munmap(dst.header, dst.bytes);
@@ -1837,9 +1887,6 @@ void Proxy::release_nvlink_forward_notifications() {
     if (nvlink_forward_notification_fd_ >= 0) {
         close(nvlink_forward_notification_fd_);
         nvlink_forward_notification_fd_ = -1;
-    }
-    if (owned && !nvlink_forward_notification_name_.empty()) {
-        shm_unlink(nvlink_forward_notification_name_.c_str());
     }
     nvlink_forward_notification_size_ = 0;
     nvlink_forward_notification_name_.clear();
@@ -3893,7 +3940,7 @@ void Proxy::stop_forwarding_thread() {
     nvlink_forward_notification_dispatch_.reset();
     // Even on a partial submission failure, finish stream work before closing
     // IPC mappings or releasing prepared argument storage.
-    if (prepared_forwarding_ && forwarding_stream_) {
+    if ((prepared_forwarding_ || config_.router_pooled_up_gemm_enabled) && forwarding_stream_) {
         synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
     }
     prepared_forwarding_.reset();
@@ -3902,10 +3949,9 @@ void Proxy::stop_forwarding_thread() {
     flush_nvlink_forward_notification_log_queue();
     for (auto& dst : forwarding_destinations_) {
         for (auto& source_buffer : dst.source_buffers) {
-            if (source_buffer.imported_cuda_ipc) {
-                close_cuda_ipc_memory_handle(
-                    source_buffer.imported_cuda_ipc_base, config_.mock_mode);
-            }
+            if (source_buffer.imported_cuda_ipc && !close_cuda_ipc_memory_handle(
+                    source_buffer.imported_cuda_ipc_base, config_.mock_mode))
+                forward_ipc_close_failed_ = true;
             source_buffer.ptr = nullptr;
             source_buffer.imported_cuda_ipc = false;
             source_buffer.imported_cuda_ipc_base = nullptr;
@@ -3993,7 +4039,7 @@ std::string Proxy::nvlink_exchange_file(int gpu_index) const {
     return path.string();
 }
 
-void Proxy::publish_local_nvlink_receive_buffers() const {
+void Proxy::publish_local_nvlink_receive_buffers() {
     if (!config_.nvlink_forward_destinations.empty()) return;
 
     std::filesystem::create_directories(config_.nvlink_forward_exchange_dir);
@@ -4006,21 +4052,31 @@ void Proxy::publish_local_nvlink_receive_buffers() const {
         << "exporter_pid " << current_process_id() << '\n'
         << "cuda_device_id " << config_.cuda_device_id << '\n'
         << "buffer_bytes " << cuda_buffers_.nvlink_receive_buffer_bytes() << '\n';
+    const auto& pool = cuda_buffers_.input_pool();
+    const auto pool_ipc = pool.ptr
+        ? export_cuda_ipc_memory_handle(pool.ptr, config_.mock_mode)
+        : CudaIpcMemoryHandle{};
     for (const auto& entry : cuda_buffers_.nvlink_receive_buffers()) {
-        const auto ipc = export_cuda_ipc_memory_handle(
-            entry.recv.ptr, config_.mock_mode);
+        // pool.ptr can itself start inside a torch CUDA allocation. Add the
+        // slice displacement to that allocation offset before publishing.
+        const auto ipc = pool.ptr ? pool_ipc :
+            export_cuda_ipc_memory_handle(entry.recv.ptr, config_.mock_mode);
+        const auto export_ptr = pool.ptr ? pool.ptr : entry.recv.ptr;
+        const auto slice_offset = reinterpret_cast<uintptr_t>(entry.recv.ptr) -
+            reinterpret_cast<uintptr_t>(export_ptr);
         if (entry.source_node_rank >= 0) {
             out << "source_node " << entry.source_node_rank << ' ';
         }
         out << "source_gpu " << entry.source_gpu_index
-            << " mock_addr " << reinterpret_cast<uintptr_t>(entry.recv.ptr)
+            << " mock_addr " << reinterpret_cast<uintptr_t>(export_ptr)
             << " ipc_handle " << ipc.handle_hex
-            << " ipc_offset " << ipc.offset
+            << " ipc_offset " << ipc.offset + slice_offset
             << '\n';
     }
     out.close();
     if (!out) throw std::runtime_error("failed to flush NVLink exchange file: " + tmp_path);
     std::filesystem::rename(tmp_path, path);
+    cuda_buffers_.set_input_pool_exported(pool.ptr != nullptr);
     RDMA_PROXY_LOG_INFO("published NVLink receive buffers local_rank=", config_.node_rank,
                         " local_gpu=", config_.local_gpu_index,
                         " path=", path,
@@ -4028,7 +4084,7 @@ void Proxy::publish_local_nvlink_receive_buffers() const {
                         " bytes_per_buffer=", cuda_buffers_.nvlink_receive_buffer_bytes());
 }
 
-Proxy::ForwardDestinationState Proxy::load_forward_destination(int dst_gpu) const {
+Proxy::ForwardDestinationState Proxy::load_forward_destination(int dst_gpu) {
     if (!config_.nvlink_forward_destinations.empty()) {
         const auto it = std::find_if(
             config_.nvlink_forward_destinations.begin(),
@@ -4191,21 +4247,15 @@ Proxy::ForwardDestinationState Proxy::load_forward_destination(int dst_gpu) cons
         std::unordered_map<std::string, void*> opened_ipc_allocations;
         try {
             for (const auto* published : selected_buffers) {
-                void* ipc_base = nullptr;
-                bool owns_ipc_import = false;
-                const auto existing = opened_ipc_allocations.find(
-                    published->ipc_handle);
-                if (existing != opened_ipc_allocations.end()) {
-                    ipc_base = existing->second;
-                } else {
-                    ipc_base = open_cuda_ipc_memory_handle(
+                auto [allocation, owns_ipc_import] =
+                    opened_ipc_allocations.try_emplace(published->ipc_handle, nullptr);
+                if (owns_ipc_import) {
+                    allocation->second = open_cuda_ipc_memory_handle(
                         published->ipc_handle,
                         published->mock_addr,
                         config_.mock_mode);
-                    opened_ipc_allocations.emplace(
-                        published->ipc_handle, ipc_base);
-                    owns_ipc_import = true;
                 }
+                void* ipc_base = allocation->second;
                 void* ptr = reinterpret_cast<void*>(
                     reinterpret_cast<uintptr_t>(ipc_base) + published->ipc_offset);
                 destination.source_buffers.push_back(ForwardDestinationBufferState{
@@ -4227,10 +4277,9 @@ Proxy::ForwardDestinationState Proxy::load_forward_destination(int dst_gpu) cons
             }
         } catch (...) {
             for (auto& source_buffer : destination.source_buffers) {
-                if (source_buffer.imported_cuda_ipc) {
-                    close_cuda_ipc_memory_handle(
-                        source_buffer.imported_cuda_ipc_base, config_.mock_mode);
-                }
+                if (source_buffer.imported_cuda_ipc && !close_cuda_ipc_memory_handle(
+                        source_buffer.imported_cuda_ipc_base, config_.mock_mode))
+                    forward_ipc_close_failed_ = true;
             }
             throw;
         }

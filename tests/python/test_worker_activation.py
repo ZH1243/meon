@@ -456,6 +456,24 @@ class ActivationCliTests(unittest.TestCase):
         self.assertNotIn("Up GEMM SM budget", result.stdout)
         self.assertNotIn("sm-count", result.stdout.splitlines()[-1])
 
+    def test_pooled_up_gemm_cli(self):
+        option = "--router_pooled_up_gemm_enabled"
+        self.assertNotIn(option, self.run_cli("--concurrent-kernel").stdout)
+        for flag, value in (("--pooled-up-gemm", "true"), ("--no-pooled-up-gemm", "false")):
+            result = self.run_cli("--concurrent-kernel", flag)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"{option}={value}", result.stdout)
+        result = self.run_cli("--concurrent-kernel", "--pooled-up-gemm", "--benchmark-ready-up-gemm")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--benchmark-ready-up-gemm", result.stdout)
+        for flags, reason in ((("--pooled-up-gemm",), "requires --concurrent-kernel"),
+                              (("--concurrent-kernel", "--pooled-up-gemm", "--gemm-arch=blackwell"),
+                               "requires Hopper"),
+                              (("--benchmark-ready-up-gemm",), "requires --pooled-up-gemm")):
+            result = self.run_cli(*flags)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(reason, result.stderr)
+
     def test_up_sm_count_reaches_plain_and_fused_launches(self):
         # CPU-only boundary test: do not import CUDA/QuACK or construct buffers.
         for activation in (None, "relu", "swiglu"):
@@ -465,6 +483,7 @@ class ActivationCliTests(unittest.TestCase):
                     runner.activation, runner.gated = activation, activation == "swiglu"
                     runner.sm_count = count
                     runner.x_buffers = (object(), object())
+                    runner.x_pool = None
                     runner.weights = runner.transposed_weights = object()
                     runner.output = runner.a_idx = runner.work_table = runner.ready_rows = object()
                     runner.activation_config = object()
@@ -487,6 +506,18 @@ class ActivationCliTests(unittest.TestCase):
                     if activation is not None:
                         self.assertFalse(kwargs["store_preact"])
                         self.assertEqual(kwargs["concat_layout"], ("B",) if runner.gated else None)
+                    self.assertIs(calls[0][0][0], runner.x_buffers)
+                    self.assertIs(kwargs["A_idx"], runner.a_idx)
+                    runner.x_pool, runner.pooled_a_idx, runner.pooled_work_table = object(), object(), object()
+                    runner.launch()
+                    pooled_args, pooled_kwargs = calls[-1]
+                    self.assertIs(pooled_args[0], runner.x_pool)
+                    self.assertEqual(pooled_args[1:], calls[0][0][1:])
+                    self.assertEqual(pooled_kwargs, dict(kwargs, A_idx=runner.pooled_a_idx,
+                                                         gather_work_table=runner.pooled_work_table,
+                                                         multi_buffer_gather=False))
+                    runner.launch(pooled=False)
+                    self.assertEqual(calls[0], calls[-1])
 
     def test_architecture_and_pingpong_selection(self):
         for capability in ((9, 0), (10, 0), (10, 3)):
@@ -876,9 +907,14 @@ class HopperActivationTests(unittest.TestCase):
                     torch, torch.cuda.current_device(), node_rank=0, local_gpu_index=0
                 )
                 xs, indices = [], []
+                # Also exercise the real single-buffer plain GEMM on Hopper.
+                # The control below reads these same two physical slices.
+                plain_pool = (torch.randn(16, 256, device="cuda", dtype=torch.bfloat16)
+                              if activation is None and torch.cuda.get_device_capability()[0] == 9 else None)
                 for source in range(2):
                     # Down width spans two N=128 tiles to test packed strides.
-                    x = torch.randn(8, 256, device="cuda", dtype=torch.bfloat16)
+                    x = (plain_pool[source * 8:(source + 1) * 8] if plain_pool is not None
+                         else torch.randn(8, 256, device="cuda", dtype=torch.bfloat16))
                     idx = torch.tensor([4, 1, 6, 4, 3, 0, 0], device="cuda", dtype=torch.int32)
                     buffers.tensors[(worker.DEVICE_BUFFER_NVLINK_RECEIVE, -1, 0, source)] = x
                     buffers.tensors[(worker.DEVICE_BUFFER_ROUTER_A_IDX, -1, 0, source)] = idx
@@ -893,6 +929,13 @@ class HopperActivationTests(unittest.TestCase):
                 buffers.tensors[(worker.DEVICE_BUFFER_GATHER_READY_ROWS, -1, -1, -1)] = (
                     torch.tensor([2], device="cuda", dtype=torch.int32)
                 )
+                if plain_pool is not None:
+                    buffers.tensors[(worker.DEVICE_BUFFER_INPUT_POOL, -1, -1, -1)] = plain_pool
+                    buffers.tensors[(worker.DEVICE_BUFFER_POOLED_A_IDX, -1, -1, -1)] = torch.tensor(
+                        [4, 1, 6, 12, 9, 14, 4, 3, 12, 11, -1, -1, -1, -1],
+                        dtype=torch.int32, device="cuda")
+                    buffers.tensors[(worker.DEVICE_BUFFER_POOLED_GATHER_TABLE, -1, -1, -1)] = (
+                        torch.tensor([[0, 0, 6, 0], [1, 6, 10, 0]], dtype=torch.int32, device="cuda"))
                 runner = worker.GroupedGemmRunner(
                     torch, buffers, cuda_device_id=torch.cuda.current_device(),
                     world_size=1, num_experts=2, output_dimension=128,
@@ -914,6 +957,10 @@ class HopperActivationTests(unittest.TestCase):
                         parts.append(value)
                 expected = torch.cat(parts).to(torch.bfloat16)
                 torch.testing.assert_close(runner.output[:10], expected, atol=6e-2, rtol=2e-3)
+                if plain_pool is not None:
+                    runner.output.fill_(float("nan"))
+                    runner.launch(pooled=False)
+                    torch.testing.assert_close(runner.output[:10], expected, atol=6e-2, rtol=2e-3)
 
                 if activation == "swiglu":
                     # Reuse the actual fused up output, including its unused padding.

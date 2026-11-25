@@ -13,12 +13,14 @@ using namespace rdma_proxy;
 namespace {
 constexpr int gpus = 8, nodes = 2, experts_per_gpu = 8, tokens = 2;
 constexpr int row_bytes = 16;
+constexpr int combine_row_stride = nodes * tokens + 2;
 
 struct Rank {
     std::vector<std::unique_ptr<uint8_t[]>> allocations;
     uint8_t* send{};
     uint8_t* rdma_receive{};
     std::array<uint8_t*, nodes*gpus> inputs{};
+    std::array<int32_t, nodes * gpus * combine_row_stride> combine_rows{};
     std::unique_ptr<Proxy> proxy;
 };
 
@@ -132,6 +134,41 @@ void install(Rank& rank, int gpu, int epoch) {
             rank.proxy->intra_node_source_masks(n) !=
                 std::vector<uint8_t>(rows[n].size(), 1u << destination_gpu(epoch, gpu, n)))
             throw std::runtime_error("incorrect outgoing rows or incoming source masks");
+    }
+    // Reverse the source-node order. The caller's domain order determines both
+    // table axes even when one domain is empty or shrinks after being full.
+    const std::array<int32_t, nodes> source_nodes{1, 0};
+    std::array<uint64_t, nodes> domain_counts{};
+    if (!epoch) {
+        rank.combine_rows.fill(37);
+        domain_counts.fill(99);
+        const std::array<int32_t, nodes> duplicate{1, 1};
+        expect_error([&] {
+            rank.proxy->build_intra_node_combine_rows(duplicate.data(), nodes, tokens,
+                rank.combine_rows.data(), rank.combine_rows.size(), domain_counts.data());
+        });
+        if (!std::all_of(rank.combine_rows.begin(), rank.combine_rows.end(), [](int32_t x) { return x == 37; }) ||
+            domain_counts != std::array<uint64_t, nodes>{99, 99})
+            throw std::runtime_error("partial combine table after invalid source nodes");
+    }
+    rank.proxy->build_intra_node_combine_rows(source_nodes.data(), nodes, tokens,
+        rank.combine_rows.data(), rank.combine_rows.size(), domain_counts.data());
+    for (int domain = 0; domain < nodes; ++domain) {
+        const int node = source_nodes[domain];
+        const int valid = static_cast<int>(rows[node].size());
+        if (domain_counts[domain] != static_cast<uint64_t>(valid))
+            throw std::runtime_error("incorrect combine domain length");
+        for (int peer = 0; peer < gpus; ++peer) {
+            const bool selected = peer == destination_gpu(epoch, gpu, node);
+            const auto* row = rank.combine_rows.data() + (domain * gpus + peer) * combine_row_stride;
+            for (int column = 0; column < nodes * tokens; ++column) {
+                const int local = column - domain * tokens;
+                const int expected = selected && local >= 0 && local < valid ? local : -1;
+                if (row[column] != expected) throw std::runtime_error("incorrect combine lookup row");
+            }
+            if (row[combine_row_stride - 2] != (selected ? valid : 0) || row[combine_row_stride - 1] != valid)
+                throw std::runtime_error("incorrect combine input stride or domain count");
+        }
     }
 }
 }

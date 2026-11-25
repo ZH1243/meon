@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 import rdma_proxy_worker as worker
@@ -106,6 +107,102 @@ class DynamicRoutingTests(unittest.TestCase):
             self.assertEqual(combine.rows[2, 5:10].tolist(), list(range(b)) + [-1] * (5 - b))
             self.assertEqual(combine.outputs[1].shape, (2, b, 4))
             self.assertEqual(combine.storage_for_node(1).data_ptr(), combine.output[40:].data_ptr())
+
+    def test_direct_combine_rows_follow_dynamic_masks_with_one_upload(self):
+        torch = self.torch
+        if torch is None:
+            self.skipTest("requires PyTorch")
+        capacity, world = 4, 2
+        device = torch.device("cuda" if os.environ.get("RDMA_PROXY_TEST_CUDA") == "1" else "cpu")
+        generations = (([], []), ([2, 3, 1, 3], [3]), ([1], []), ([], [1, 2, 1, 3]))
+        mask_queries = []
+        builds = []
+
+        def read_masks(handle, node, destination, size, count):
+            mask_queries.append(node)
+            ctypes.cast(count, ctypes.POINTER(ctypes.c_uint64))[0] = len(masks[node])
+            if destination is not None:
+                self.assertGreaterEqual(size, len(masks[node]))
+                for i, mask in enumerate(masks[node]):
+                    destination[i] = mask
+            return 0
+
+        def build(handle, nodes, num_nodes, limit, rows, elements, counts):
+            self.assertEqual(list(nodes[:num_nodes]), [0, 1])
+            self.assertEqual(limit, capacity)
+            self.assertEqual(elements, expected_rows.numel())
+            builds.append(ctypes.cast(rows, ctypes.c_void_p).value)
+            ctypes.memmove(rows, expected_rows.data_ptr(), elements * expected_rows.element_size())
+            for domain, source_masks in enumerate(masks):
+                counts[domain] = len(source_masks)
+            return 0
+
+        def make_combine(has_builder, dynamic):
+            combine = IntraNodeCombine.__new__(IntraNodeCombine)
+            lib = SimpleNamespace(rdma_proxy_get_intra_node_source_masks=read_masks)
+            if has_builder:
+                lib.rdma_proxy_build_intra_node_combine_rows = build
+            source_pairs = [(node, peer) for node in range(2) for peer in range(world)]
+            outputs = [torch.zeros(capacity * 2, device=device) for _ in source_pairs]
+            combine.exchange = SimpleNamespace(
+                library=lib, require=lambda status: self.assertEqual(status, 0), handle=None,
+                down=SimpleNamespace(up=SimpleNamespace(source_pairs=source_pairs)),
+                outputs=outputs, received={(0, node): torch.zeros_like(outputs[0]) for node in range(2)},
+                rank=1, world=world)
+            combine.nodes = [0, 1]
+            combine.dynamic_capacity = capacity if dynamic else None
+            combine.torch, combine.device = torch, device
+            combine.width = combine.tile = combine.output_tile_n = 2
+            combine.rdma_return = combine.inter_node_combine = None
+            return combine
+
+        direct, legacy = make_combine(True, True), make_combine(False, True)
+        uploads = []
+        copy = torch.Tensor.copy_
+
+        def track_copy(dst, src, *args, **kwargs):
+            uploads.append((dst.data_ptr(), src.data_ptr(), src.numel()))
+            return copy(dst, src, *args, **kwargs)
+
+        for generation, masks in enumerate(generations):
+            mask_queries.clear()
+            if generation == 0:
+                legacy._init_routes()
+            else:
+                legacy.refresh_routes()
+            self.assertEqual(mask_queries, [0, 0, 1, 1])
+            expected_rows = legacy.rows.cpu()
+            mask_queries.clear()
+            with patch.object(torch.Tensor, "copy_", track_copy):
+                if generation == 0:
+                    direct._init_routes()
+                else:
+                    direct.refresh_routes()
+            self.assertEqual(mask_queries, [])
+            self.assertEqual(len(uploads), generation + 1)
+            self.assertEqual(uploads[-1], (direct.rows.data_ptr(), builds[-1], direct.rows.numel()))
+            self.assertEqual(uploads[-1], uploads[0])
+            self.assertEqual(direct.rows_host.is_pinned(), device.type == "cuda")
+            self.assertEqual(direct.domains, legacy.domains)
+            for node in direct.nodes:
+                self.assertEqual(direct.outputs[node].shape, legacy.outputs[node].shape)
+            torch.testing.assert_close(direct.rows, legacy.rows)
+
+        # A corrupt domain length must be detected independently of the built table.
+        node, offset, length = direct.domains[-1]
+        direct.domains[-1] = (node, offset, length - 1)
+        mask_queries.clear()
+        with self.assertRaisesRegex(RuntimeError, "domain lengths disagree"):
+            direct.check()
+        self.assertEqual(mask_queries, [0, 0, 1, 1])
+
+        # A library exporting both APIs must still use the fixed-routing layout.
+        static = make_combine(True, False)
+        mask_queries.clear()
+        active = static._init_routes()
+        self.assertEqual(mask_queries, [0, 0, 1, 1])
+        self.assertEqual(len(builds), len(generations))
+        self.assertEqual(static.rows.shape, (len(active), sum(map(len, masks))))
 
     @unittest.skipUnless(os.environ.get("RDMA_PROXY_TEST_CUDA") == "1", "requires CUDA opt-in")
     def test_empty_down_releases_all_groups_after_prior_stream_work(self):

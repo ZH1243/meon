@@ -66,6 +66,8 @@ public:
                                 std::size_t element_bytes, bool per_group, uintptr_t down_done);
     void arm_return_copies(uint64_t iteration);
     std::vector<uint8_t> intra_node_source_masks(int source_node) const;
+    void build_intra_node_combine_rows(const int32_t* source_nodes, uint64_t num_nodes,
+        uint64_t capacity, int32_t* rows, uint64_t row_elements, uint64_t* domain_counts) const;
     const std::vector<std::size_t>& outgoing_token_indices(int destination_node) const;
     std::size_t rdma_return_receive_rows(int peer) const;
     uintptr_t configure_rdma_returns(const RdmaProxyNetworkReturnBuffer* buffers, std::size_t count,
@@ -312,6 +314,7 @@ private:
     void prepare_forwarding_routing_tables();
     void prepare_local_forwarding_routing_table();
     const RouterRouting& active_routing() const;
+    const std::vector<uint8_t>& intra_node_raw_masks(int source_node) const;
     bool routing_install_required(uint64_t iteration) const;
     void install_iteration_routing(uint64_t iteration, IterationRouteData route);
     std::shared_lock<std::shared_mutex> lock_forwarding_routes() const;

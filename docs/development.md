@@ -172,7 +172,17 @@ python -m unittest discover -s tests/python -p test_cpu_scatter_publication.py -
 
 On Hopper, run `ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R '^test_cpu_scatter_cuda$' --output-on-failure` after building the CUDA tests. Rebuild the shared library on both hosts and repeat the dynamic numerical check above with `--cpu-scatter-preparation --cpu-scatter-publication=threaded`. In a CUDA API trace of the two-node timing run, look for the pinned scatter allocation during setup and the single scatter metadata H2D per nonempty iteration. Its byte count follows the current route count. The [scatter staging description](runtime.md#optional-cpu-scatter-preparation) gives the expected capacity and upload sizes.
 
-**Validation.** On macOS 15.6.1 arm64 with Apple Clang 14, CPU-only PyTorch 1.13.1 and a Debug build, the runtime native suite passed 44 tests with four CUDA tests skipped. The Python suite passed 83 tests with eight skipped. The shared metadata checks passed all four tests. The CPU exchange benchmark passed its native codec test and all 38 Python tests on rerun after one loopback TCP timeout. The GPU exchange benchmark passed its ten host tests. The exact host commands are in [Mac or CPU-only development](#mac-or-cpu-only-development). CUDA compilation, the numerical checks with QuACK, and two-node GPU/RDMA transport and timing still require the Hopper hosts. The production record-layout test runs with `ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R test_iteration_metadata_cuda --output-on-failure` on a CUDA host. Run the dynamic combine tests there with `RDMA_PROXY_TEST_CUDA=1 python -m unittest discover -s tests/python -p test_dynamic_routing.py -v`.
+For the dynamic intra-node combine table, `test_c_api` compares the native output
+with the mask query, and `test_benchmark_routing` covers incoming remote masks
+and shrinking and empty domains. The Python regression in `test_dynamic_routing.py`
+checks table and buffer reuse across generations. On the two Hopper hosts, use the
+matching updated worker and Release shared library. Run the dynamic numerical check
+above with `--check-intra-node-combine --benchmark-metadata-exchange` on both nodes.
+For the timing run, use `--no-check-intra-node-combine`. With 20,480 tokens and
+eight GPUs per node, look for one 2,621,568-byte host-to-device copy per rank and
+iteration for this table. [Table layout](runtime.md#intra-node-combine-concurrent-with-down-gemm)
+
+**Validation.** On macOS 15.6.1 arm64 with Apple Clang 14, CPU-only PyTorch 1.13.1 and a Debug build, the runtime native suite passed 44 tests with four CUDA tests skipped. The Python suite passed 84 tests with eight skipped. The shared metadata checks passed all four tests. The CPU exchange benchmark passed its native codec test and all 38 Python tests on rerun after one loopback TCP timeout. The GPU exchange benchmark passed its ten host tests. The exact host commands are in [Mac or CPU-only development](#mac-or-cpu-only-development). CUDA compilation, the numerical checks with QuACK, and two-node GPU/RDMA transport and timing still require the Hopper hosts. The production record-layout test runs with `ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R test_iteration_metadata_cuda --output-on-failure` on a CUDA host. Run the dynamic combine tests there with `RDMA_PROXY_TEST_CUDA=1 python -m unittest discover -s tests/python -p test_dynamic_routing.py -v`.
 
 ### Benchmark metadata backend
 

@@ -2100,13 +2100,22 @@ seven peer copy batches remain unchanged. Iteration completion waits for combine
 and a same-node barrier before any rank can reuse incoming buffers. A separate
 cancellation flag releases polling during exceptional teardown.
 
-The C ABI query `rdma_proxy_get_intra_node_source_masks` exports immutable routing
-masks in full staging/RDMA input-row order, with bit g identifying computing GPU g.
-It uses actual received remote routing metadata, not an assumption of equal seeds.
-For each computing GPU, ascending selected rows map to its compact contribution
-rows, including the compact retained self output. Mapping and compilation happen
-once during setup; this benchmark's routing and source order are fixed across
-iterations. There is no runtime exchange of row maps or per-group transpose.
+Each computing GPU stores its compact contributions in ascending staging/RDMA
+input-row order, including the contributions retained on the local GPU. Fixed
+routing builds this mapping once during setup. With dynamic routing, the rank's
+main thread calls `rdma_proxy_build_intra_node_combine_rows` once per generation.
+C++ reads the installed local and incoming remote x4 masks and fills a reusable
+pinned int32 table. A selected row gets its ordinal in that GPU's compact return
+buffer. Absent and out-of-domain slots get `-1`. Each peer row ends with its
+compact count and the number of live rows for its source node.
+
+The worker uploads the whole table to the combine kernel's existing allocation
+in one copy before compute starts. At two nodes, eight GPUs per node and 20,480
+tokens per source, the table is `16 × (2 × 20,480 + 2)` int32 elements, or
+2,621,568 bytes per rank. The optional numerical check independently reconstructs
+the selected rows after returns complete using `rdma_proxy_get_intra_node_source_masks`.
+Workers paired with an older ABI-v1 library also use that mask query to build
+the mapping.
 
 `down.intra_node_combine.outputs[source_node]` exposes a row-major tensor of shape
 `[populated_staging_or_RDMA_rows, token_dimension]` by default. Append

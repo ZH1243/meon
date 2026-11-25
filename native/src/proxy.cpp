@@ -883,29 +883,81 @@ std::vector<std::pair<int32_t, double>> Proxy::read_down_ready_trace(uint64_t it
     }
 }
 
-std::vector<uint8_t> Proxy::intra_node_source_masks(int source_node) const {
+const std::vector<uint8_t>& Proxy::intra_node_raw_masks(int source_node) const {
     if (!initialized_ || !config_.router_routing_enabled ||
         !config_.router_local_input_staging_enabled ||
         source_node < 0 || source_node >= config_.num_nodes)
         throw std::runtime_error("invalid intra-node source-mask query");
-    const std::vector<uint8_t>* masks = nullptr;
-    if (source_node == config_.node_rank) {
-        masks = &active_routing().token_masks_for_node(source_node);
-    } else {
-        for (const auto& peer : peers_)
-            if (peer.peer_rank == source_node) masks = &peer.router_x4;
-    }
-    if (!masks) throw std::runtime_error("intra-node source peer not found");
+    if (source_node == config_.node_rank)
+        return active_routing().token_masks_for_node(source_node);
+    for (const auto& peer : peers_)
+        if (peer.peer_rank == source_node) return peer.router_x4;
+    throw std::runtime_error("intra-node source peer not found");
+}
+
+std::vector<uint8_t> Proxy::intra_node_source_masks(int source_node) const {
+    const auto& masks = intra_node_raw_masks(source_node);
     // x4 bit b denotes GPU (source_gpu - b) modulo local world size.
     // Export natural GPU bit positions, in the full staging/RDMA row order.
-    std::vector<uint8_t> result(masks->size(), 0);
-    for (std::size_t row = 0; row < masks->size(); ++row)
+    std::vector<uint8_t> result(masks.size(), 0);
+    for (std::size_t row = 0; row < masks.size(); ++row)
         for (int gpu = 0; gpu < config_.num_gpus_per_node; ++gpu) {
             const int bit = (config_.local_gpu_index - gpu + config_.num_gpus_per_node) %
                 config_.num_gpus_per_node;
-            if ((*masks)[row] & (1U << bit)) result[row] |= 1U << gpu;
+            if (masks[row] & (1U << bit)) result[row] |= 1U << gpu;
         }
     return result;
+}
+
+void Proxy::build_intra_node_combine_rows(
+    const int32_t* source_nodes, uint64_t num_nodes, uint64_t capacity, int32_t* rows,
+    uint64_t row_elements, uint64_t* domain_counts) const {
+    auto routes_lock = lock_forwarding_routes();
+    if (!initialized_ || !config_.router_dynamic_routing_enabled || iteration_prepared_ ||
+        routing_failed_ || routing_iteration_ != completed_routing_iterations_)
+        throw std::runtime_error("combine rows require a freshly installed, idle dynamic route");
+    if (!source_nodes || !rows || !domain_counts || !num_nodes ||
+        num_nodes > static_cast<uint64_t>(config_.num_nodes) || capacity != config_.num_tokens ||
+        capacity > std::numeric_limits<int32_t>::max() / num_nodes)
+        throw std::runtime_error("invalid combine row table dimensions or host arrays");
+    const int peers = config_.num_gpus_per_node;
+    const auto stride = num_nodes * capacity + 2;
+    const auto peer_rows = num_nodes * peers;
+    if (peer_rows > std::numeric_limits<std::size_t>::max() / sizeof(int32_t) / stride ||
+        row_elements != peer_rows * stride)
+        throw std::runtime_error("combine row table has incorrect element count");
+
+    // Resolve every domain before modifying caller storage. Keep the installed
+    // x4 vectors in place; only their addresses are needed while holding the lock.
+    std::vector<const std::vector<uint8_t>*> domains;
+    domains.reserve(num_nodes);
+    for (uint64_t d = 0; d < num_nodes; ++d) {
+        if (std::find(source_nodes, source_nodes + d, source_nodes[d]) != source_nodes + d)
+            throw std::runtime_error("duplicate combine source node");
+        const auto& masks = intra_node_raw_masks(source_nodes[d]);
+        if (masks.size() > capacity)
+            throw std::runtime_error("combine source domain exceeds row capacity");
+        domains.push_back(&masks);
+    }
+    for (uint64_t d = 0; d < num_nodes; ++d) {
+        const auto& masks = *domains[d];
+        domain_counts[d] = masks.size();
+        for (int peer = 0; peer < peers; ++peer) {
+            auto* row = rows + (d * peers + peer) * stride;
+            auto* live = row + d * capacity;
+            const unsigned bit = 1U << ((config_.local_gpu_index - peer + peers) % peers);
+            std::fill(row, live, -1);
+            int32_t selected = 0;
+            for (std::size_t i = 0; i < masks.size(); ++i) {
+                const bool hit = (masks[i] & bit) != 0;
+                live[i] = hit ? selected : -1;
+                selected += hit;
+            }
+            std::fill(live + masks.size(), row + stride - 2, -1);
+            row[stride - 2] = selected;
+            row[stride - 1] = static_cast<int32_t>(masks.size());
+        }
+    }
 }
 
 int Proxy::return_ready_prefix(uint64_t iteration) const {

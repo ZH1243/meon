@@ -261,13 +261,26 @@ RDMA_PROXY_C_API int rdma_proxy_get_computation_num_tokens(
 RDMA_PROXY_C_API int rdma_proxy_get_computation_expert_counts(
     RdmaProxyHandle* handle, uint64_t* counts, uint64_t capacity,
     uint64_t* num_experts);
-/* Static routing masks in this GPU's full staging (local source_node) or RDMA
+/* Installed routing masks in this GPU's full staging (local source_node) or RDMA
  * receive (remote source_node) row order. Bit g means computing GPU g uses row.
  * Query length with masks=NULL, capacity=0; populated rows exclude capacity tails.
- * Valid after initialization; benchmark routing remains fixed across iterations. */
+ * For dynamic routing, query after installing the desired generation. */
 RDMA_PROXY_C_API int rdma_proxy_get_intra_node_source_masks(
     RdmaProxyHandle* handle, int32_t source_node, uint8_t* masks,
     uint64_t capacity, uint64_t* count);
+/* Build the combine kernel's row table on the calling CPU thread after dynamic
+ * routing installation and before preparing that payload iteration. source_nodes
+ * lists distinct source-node IDs in kernel domain order; capacity is num_tokens.
+ * rows is contiguous host int32[num_nodes * gpus_per_node][num_nodes * capacity + 2].
+ * row_elements must equal the number of int32 elements in that shape.
+ * Row (domain, gpu) maps input slots to compact row ordinals, with -1 for absent
+ * contributions, unused capacity and other domains. Its final two elements give
+ * this GPU's compact row count and this domain's live row count, respectively.
+ * domain_counts receives num_nodes live row counts in source_nodes order.
+ * Arrays must not overlap. All pointers are borrowed only for this synchronous call. */
+RDMA_PROXY_C_API int rdma_proxy_build_intra_node_combine_rows(
+    RdmaProxyHandle* handle, const int32_t* source_nodes, uint64_t num_nodes,
+    uint64_t capacity, int32_t* rows, uint64_t row_elements, uint64_t* domain_counts);
 RDMA_PROXY_C_API int rdma_proxy_finish(RdmaProxyHandle* handle);
 
 /* This source GPU's original token IDs in outgoing x3 order for a destination

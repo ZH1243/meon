@@ -10,6 +10,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #if defined(__linux__) || defined(__APPLE__)
 #include <pthread.h>
 #endif
@@ -545,7 +546,7 @@ const NvlinkReceiveBuffer& CudaBuffers::nvlink_receive_buffer_for_source(
 
 void CudaBuffers::stage_local_router_input(
     const std::vector<std::size_t>& source_token_indices,
-    const int32_t* device_source_token_indices) {
+    const int32_t* device_source_token_indices, void* staging_stream) {
     if (!config_.router_local_input_staging_enabled ||
         !config_.router_routing_enabled || !config_.nvlink_forwarding_enabled) {
         throw std::runtime_error("local router input staging is not enabled");
@@ -591,15 +592,18 @@ void CudaBuffers::stage_local_router_input(
         device_source_token_indices,
         static_cast<int>(source_token_indices.size()),
         row_bytes,
-        nullptr);
-    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize local router staging");
+        staging_stream);
+    // A supplied stream belongs to the iteration worker, which joins it before
+    // releasing the new route. The synchronous setup caller uses stream zero.
+    if (!staging_stream) check_cuda(cudaStreamSynchronize(nullptr), "wait for local router staging");
 #else
     (void)device_source_token_indices;
+    (void)staging_stream;
     throw std::runtime_error("local router input staging requested without CUDA support");
 #endif
 }
 
-void CudaBuffers::install_expert_metadata(RouterExpertMetadata metadata) {
+void CudaBuffers::validate_expert_metadata(const RouterExpertMetadata& metadata) const {
     if (!config_.router_routing_enabled || !config_.nvlink_forwarding_enabled) {
         throw std::runtime_error(
             "expert metadata requires combined router/NVLink mode");
@@ -664,6 +668,19 @@ void CudaBuffers::install_expert_metadata(RouterExpertMetadata metadata) {
         metadata.source_gpu_index >= config_.num_gpus_per_node) {
         throw std::runtime_error("expert metadata source is out of range");
     }
+}
+
+void CudaBuffers::assign_expert_metadata(NvlinkReceiveBuffer& buffer, RouterExpertMetadata metadata) {
+    const auto experts = static_cast<std::size_t>(metadata.experts_per_gpu);
+    buffer.expert_metadata = std::move(metadata);
+    buffer.expert_metadata_ready = true;
+    buffer.expert_token_head_state = RouterExpertTokenHeadState{};
+    buffer.expert_token_head_state.expert_token_heads.assign(experts, 0);
+    buffer.expert_token_head_state.expert_token_tails.assign(experts, 0);
+}
+
+void CudaBuffers::install_expert_metadata(RouterExpertMetadata metadata) {
+    validate_expert_metadata(metadata);
     std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
     auto it = std::find_if(
         nvlink_recv_buffers_.begin(), nvlink_recv_buffers_.end(),
@@ -677,13 +694,7 @@ void CudaBuffers::install_expert_metadata(RouterExpertMetadata metadata) {
     if (it->expert_metadata_ready) {
         throw std::runtime_error("duplicate expert metadata for source GPU");
     }
-    it->expert_metadata = std::move(metadata);
-    it->expert_metadata_ready = true;
-    it->expert_token_head_state = RouterExpertTokenHeadState{};
-    it->expert_token_head_state.expert_token_heads.assign(
-        static_cast<std::size_t>(expected_experts_per_gpu), 0);
-    it->expert_token_head_state.expert_token_tails.assign(
-        static_cast<std::size_t>(expected_experts_per_gpu), 0);
+    assign_expert_metadata(*it, std::move(metadata));
 
     if (config_.nvlink_forward_completion_notifications_enabled &&
         std::all_of(
@@ -693,6 +704,57 @@ void CudaBuffers::install_expert_metadata(RouterExpertMetadata metadata) {
             })) {
         initialize_router_computation_scheduler_locked();
     }
+}
+
+void CudaBuffers::install_iteration_expert_metadata(
+    std::vector<RouterExpertMetadata> tables, uint64_t iteration) {
+    if (!config_.router_dynamic_routing_enabled || iteration != metadata_generations_installed_ ||
+        tables.size() != nvlink_recv_buffers_.size())
+        throw std::runtime_error("invalid routing generation or number of sources");
+
+    // Validate the entire exchange before replacing any live source. The buffer
+    // allocation order is global source rank, independent of message arrival.
+    std::vector<bool> seen(tables.size(), false);
+    for (const auto& table : tables) {
+        validate_expert_metadata(table);
+        const auto slot = static_cast<std::size_t>(table.source_node_rank) *
+            config_.num_gpus_per_node + table.source_gpu_index;
+        if (seen.at(slot)) throw std::runtime_error("duplicate source in routing generation");
+        seen[slot] = true;
+    }
+
+    if (metadata_generations_installed_ && config_.nvlink_forward_completion_notifications_enabled) {
+        stop_cpu_scatter_worker();
+        synchronize_cuda_stream(router_notification_publication_stream_, config_.mock_mode);
+    }
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    if (metadata_generations_installed_) clear_iteration_cpu_scatter();
+    for (auto& table : tables) {
+        const auto slot = static_cast<std::size_t>(table.source_node_rank) *
+            config_.num_gpus_per_node + table.source_gpu_index;
+        assign_expert_metadata(nvlink_recv_buffers_[slot], std::move(table));
+    }
+    if (config_.nvlink_forward_completion_notifications_enabled)
+        initialize_router_computation_scheduler_locked();
+    ++metadata_generations_installed_;
+}
+
+void CudaBuffers::clear_iteration_cpu_scatter() {
+    if (cpu_scatter_worker_error_) std::rethrow_exception(cpu_scatter_worker_error_);
+    cpu_scatter_threaded_ = false;
+    cpu_scatter_worker_stop_ = false;
+    cpu_scatter_worker_epoch_valid_ = false;
+    cpu_scatter_worker_cancelled_ = false;
+    cpu_scatter_worker_submitted_ = false;
+    cpu_scatter_device_ = 0;
+    cpu_route_weights_device_ = 0;
+    cpu_scatter_routes_ = 0;
+    cpu_scatter_staged_rows_ = 0;
+    cpu_scatter_submitted_ = false;
+    cpu_scatter_lookup_.clear();
+    free_pinned_buffer(cpu_scatter_staging_);
+    free_pinned_buffer(cpu_route_weights_staging_);
+    free_pinned_buffer(cpu_scatter_deferred_staging_);
 }
 
 RouterExpertTokenHeadState CudaBuffers::expert_token_head_state_for_source(
@@ -730,7 +792,7 @@ bool CudaBuffers::is_router_computation_input(
 }
 
 void CudaBuffers::initialize_router_computation_scheduler_locked() {
-    if (router_computation_scheduler_state_.initialized) {
+    if (router_computation_scheduler_state_.initialized && !config_.router_dynamic_routing_enabled) {
         throw std::runtime_error("router computation scheduler is already initialized");
     }
     if (config_.expert_gemm_m_tile == 0 || config_.expert_gemm_n_tile == 0 ||
@@ -803,69 +865,47 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
         throw std::runtime_error("QuACK A_idx allocation size overflows size_t");
     }
     const auto receive_buffer_count = router_computation_buffer_indices_.size();
-    if (config_.router_pooled_up_gemm_enabled &&
-        a_idx_capacity > std::numeric_limits<int32_t>::max() / receive_buffer_count)
-        throw std::runtime_error("pooled A_idx capacity exceeds int32 range");
+    const auto storage_indices = config_.router_dynamic_routing_enabled
+        ? config_.num_tokens * std::min<std::size_t>(config_.router_top_k, experts_per_gpu)
+        : a_idx_capacity;
+    if (storage_indices < a_idx_capacity ||
+        storage_indices > std::numeric_limits<std::size_t>::max() / receive_buffer_count ||
+        (config_.router_pooled_up_gemm_enabled &&
+         storage_indices > std::numeric_limits<int32_t>::max() / receive_buffer_count))
+        throw std::runtime_error("routing index capacity exceeds the supported range");
     for (const auto buffer_index : router_computation_buffer_indices_) {
         auto& buffer = nvlink_recv_buffers_[buffer_index];
-        buffer.expert_token_index_count =
-            buffer.expert_metadata.expert_token_indices.size();
-        allocate_buffer(
-            buffer.expert_token_indices_device,
-            DeviceBufferAllocationRequest{
-                DeviceBufferKind::kRouterAIdx,
-                DeviceBufferElementType::kInt32,
-                -1,
-                buffer.source_node_rank,
-                buffer.source_gpu_index,
-                a_idx_capacity * sizeof(int32_t),
-                {a_idx_capacity}});
-        std::vector<int32_t> padded_indices(a_idx_capacity, 0);
-        std::copy(
-            buffer.expert_metadata.expert_token_indices.begin(),
-            buffer.expert_metadata.expert_token_indices.end(),
-            padded_indices.begin());
-        if (config_.mock_mode) {
-            std::memcpy(
-                buffer.expert_token_indices_device.ptr,
-                padded_indices.data(),
-                padded_indices.size() * sizeof(int32_t));
-        } else {
-#if RDMA_PROXY_HAVE_CUDA
-            check_cuda(cudaMemcpy(
-                buffer.expert_token_indices_device.ptr,
-                padded_indices.data(),
-                padded_indices.size() * sizeof(int32_t),
-                cudaMemcpyHostToDevice), "cudaMemcpy H2D QuACK A_idx");
-#else
-            throw std::runtime_error(
-                "QuACK A_idx initialization requested but CUDA support was not built");
-#endif
-        }
-    }
-
-    if (config_.router_weighted_contributions_enabled) {
-        for (const auto index : router_computation_buffer_indices_) {
-            auto& buffer = nvlink_recv_buffers_[index];
-            allocate_buffer(buffer.expert_route_weights_device,
-                DeviceBufferAllocationRequest{DeviceBufferKind::kRouterRouteWeights,
-                    DeviceBufferElementType::kFP32, -1, buffer.source_node_rank,
-                    buffer.source_gpu_index, a_idx_capacity * sizeof(float), {a_idx_capacity}});
-            std::vector<float> padded(a_idx_capacity, 0.0f);
-            std::copy(buffer.expert_metadata.expert_route_weights.begin(),
-                      buffer.expert_metadata.expert_route_weights.end(), padded.begin());
+        buffer.expert_token_index_count = buffer.expert_metadata.expert_token_indices.size();
+        // Padding is visible to callers, so clear the logical prefix up to the
+        // common length even when this source shrank since the prior generation.
+        const auto upload = [&](GpuBuffer& device, const auto& values, DeviceBufferKind kind,
+                                DeviceBufferElementType type) {
+            using Value = typename std::decay_t<decltype(values)>::value_type;
+            if (!device.ptr)
+                allocate_buffer(device, DeviceBufferAllocationRequest{
+                    kind, type, -1, buffer.source_node_rank, buffer.source_gpu_index,
+                    storage_indices * sizeof(Value), {storage_indices}});
+            std::vector<Value> padded(a_idx_capacity);
+            std::copy(values.begin(), values.end(), padded.begin());
             if (config_.mock_mode) {
-                std::memcpy(buffer.expert_route_weights_device.ptr, padded.data(),
-                            padded.size() * sizeof(float));
+                std::memcpy(device.ptr, padded.data(), padded.size() * sizeof(Value));
             } else {
 #if RDMA_PROXY_HAVE_CUDA
-                check_cuda(cudaMemcpy(buffer.expert_route_weights_device.ptr, padded.data(),
-                    padded.size() * sizeof(float), cudaMemcpyHostToDevice),
-                    "cudaMemcpy H2D QuACK route weights");
+                check_cuda(cudaMemcpy(device.ptr, padded.data(), padded.size() * sizeof(Value),
+                                      cudaMemcpyHostToDevice), "upload QuACK routing list");
 #endif
             }
-        }
+        };
+        upload(buffer.expert_token_indices_device, buffer.expert_metadata.expert_token_indices,
+               DeviceBufferKind::kRouterAIdx, DeviceBufferElementType::kInt32);
+        if (config_.router_weighted_contributions_enabled)
+            upload(buffer.expert_route_weights_device, buffer.expert_metadata.expert_route_weights,
+                   DeviceBufferKind::kRouterRouteWeights, DeviceBufferElementType::kFP32);
     }
+#if RDMA_PROXY_HAVE_CUDA
+    if (config_.router_dynamic_routing_enabled && !config_.mock_mode)
+        check_cuda(cudaStreamSynchronize(nullptr), "complete routing index uploads before compute");
+#endif
     std::size_t total_batches = 0;
     for (std::size_t expert = 0; expert < experts_per_gpu; ++expert) {
         const auto tokens = state.expert_total_tokens[expert];
@@ -905,18 +945,21 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
     publication.a_idx_capacity = a_idx_capacity;
     publication.n_groups_per_m_cluster = n_groups_per_m_cluster;
     publication.group_size = static_cast<int32_t>(group_size);
-    if (publication.table_rows >
-        static_cast<std::size_t>(std::numeric_limits<int32_t>::max())) {
-        throw std::runtime_error("QuACK ready-row prefix exceeds int32 range");
+    // Each expert can receive at most one assignment per source token. Bound
+    // the sum of rounded-up M-clusters, including one partial batch per expert.
+    std::size_t storage_rows = publication.table_rows;
+    if (config_.router_dynamic_routing_enabled) {
+        const auto max_assignments = storage_indices * receive_buffer_count;
+        const auto max_batches = max_assignments / m_cluster_tokens + experts_per_gpu;
+        if (max_batches > std::numeric_limits<int32_t>::max() / n_groups_per_m_cluster)
+            throw std::runtime_error("dynamic gather capacity exceeds int32 range");
+        storage_rows = max_batches * n_groups_per_m_cluster;
     }
-    if (publication.table_rows != 0 &&
-        publication.table_row_bytes >
-            std::numeric_limits<std::size_t>::max() /
-                publication.table_rows) {
-        throw std::runtime_error("QuACK gather-table allocation size overflows size_t");
-    }
-    const auto table_bytes = publication.table_rows * publication.table_row_bytes;
-    if (table_bytes != 0) {
+    if (storage_rows < publication.table_rows || storage_rows > std::numeric_limits<int32_t>::max() ||
+        (storage_rows && publication.table_row_bytes > std::numeric_limits<std::size_t>::max() / storage_rows))
+        throw std::runtime_error("QuACK gather-table allocation size exceeds the supported range");
+    const auto table_bytes = storage_rows * publication.table_row_bytes;
+    if (table_bytes && !publication.device_table.ptr) {
         allocate_pinned_buffer(publication.host_table, table_bytes);
         allocate_buffer(
             publication.device_table,
@@ -927,30 +970,31 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
                 -1,
                 -1,
                 table_bytes,
-                {publication.table_rows, publication.table_width}});
+                {storage_rows, publication.table_width}});
     }
-    if (config_.router_pooled_up_gemm_enabled) {
+    if (config_.router_pooled_up_gemm_enabled && !publication.device_pooled_a_idx.ptr) {
         // QuACK's fused entry point derives output capacity from A_idx.numel().
         // Keep the same padded capacity as the multi-buffer launch while only
         // staging and transferring the meaningful ranges.
-        const auto capacity = a_idx_capacity * receive_buffer_count;
+        const auto capacity = storage_indices * receive_buffer_count;
         allocate_buffer(publication.device_pooled_a_idx, DeviceBufferAllocationRequest{
             DeviceBufferKind::kPooledAIdx, DeviceBufferElementType::kInt32, -1, -1, -1,
             capacity * sizeof(int32_t), {capacity}});
         std::size_t routes = 0;
         for (const auto count : state.expert_total_tokens) routes += count;
+        if (config_.router_dynamic_routing_enabled) routes = capacity;
         if (routes != 0) {
             allocate_pinned_buffer(publication.host_pooled_a_idx, routes * sizeof(int32_t));
-            const auto bytes = publication.table_rows * 4 * sizeof(int32_t);
+            const auto bytes = storage_rows * 4 * sizeof(int32_t);
             allocate_pinned_buffer(publication.host_pooled_table, bytes);
             allocate_buffer(publication.device_pooled_table, DeviceBufferAllocationRequest{
                 DeviceBufferKind::kPooledGatherTable, DeviceBufferElementType::kInt32, -1, -1, -1,
-                bytes, {publication.table_rows, 4}});
+                bytes, {storage_rows, 4}});
         }
     }
-    if (config_.nvlink_forward_notification_flag_update_mode ==
+    if (!router_notification_ready_values_.ptr && config_.nvlink_forward_notification_flag_update_mode ==
         NvlinkForwardNotificationFlagUpdateMode::kMemcpy) {
-        const auto ready_value_count = publication.table_rows + 1;
+        const auto ready_value_count = storage_rows + 1;
         allocate_pinned_buffer(
             router_notification_ready_values_,
             ready_value_count * sizeof(int32_t));
@@ -1099,7 +1143,7 @@ void CudaBuffers::configure_cpu_scatter_slab_locked(std::size_t bytes) {
     // Initialize the possible alignment gap so the complete slab is defined.
     std::memset(cpu_scatter_deferred_staging_.ptr, 0, bytes);
 #if RDMA_PROXY_HAVE_CUDA
-    if (!config_.mock_mode) {
+    if (!config_.mock_mode && !cpu_scatter_ready_event_) {
         cudaEvent_t event = nullptr;
         check_cuda(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
                    "cudaEventCreate CPU scatter ready");
@@ -1506,7 +1550,7 @@ void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) 
 
     auto& publication = router_notification_publication_buffers_;
     if (publication.host_table.ptr && publication.host_table.bytes != 0) {
-        std::memset(publication.host_table.ptr, 0, publication.host_table.bytes);
+        std::memset(publication.host_table.ptr, 0, publication.table_rows * publication.table_row_bytes);
     }
     *static_cast<int32_t*>(publication.host_ready_rows.ptr) = 0;
     if (cpu_scatter_threaded_) {
@@ -1523,6 +1567,10 @@ void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) 
     }
     // Publish zero before any row for this iteration. A QuACK persistent
     // scheduler must never observe the previous iteration's ready prefix.
+    // An empty destination publishes no descriptors. Its compute timing must
+    // still have a start event, and the proxy must continue servicing peers.
+    if (config_.router_dynamic_routing_enabled && publication.table_rows == 0)
+        record_router_computation_start();
     flush_router_notification_publication_range(0, 0);
 }
 
@@ -2008,7 +2056,7 @@ CudaBuffers::router_notification_scheduling_diagnostics() const {
 void CudaBuffers::flush_router_notification_publication() {
     std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
     flush_router_notification_publication_range(
-        0, router_notification_publication_buffers_.host_table.bytes);
+        0, router_notification_publication_buffers_.table_rows * router_notification_publication_buffers_.table_row_bytes);
 }
 
 void CudaBuffers::record_router_computation_start() {
@@ -2077,7 +2125,7 @@ void CudaBuffers::flush_router_notification_publication_range(
         const auto required_ready_value_bytes =
             (publication.table_rows + 1) * sizeof(int32_t);
         if (!router_notification_ready_values_.ptr ||
-            router_notification_ready_values_.bytes !=
+            router_notification_ready_values_.bytes <
                 required_ready_value_bytes) {
             throw std::runtime_error(
                 "NVLink notification memcpy flag staging is not initialized");

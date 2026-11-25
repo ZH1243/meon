@@ -17,11 +17,15 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace rdma_proxy {
+
+class IterationRouting;
 
 class Proxy {
 public:
@@ -33,6 +37,7 @@ public:
 
     void set_external_device_buffer_allocator(ExternalDeviceBufferAllocator allocator);
     void initialize();
+    void prepare_routing(uint64_t iteration);
     void run();
     void run_once();
     void prepare_iteration_step(uint64_t iteration);
@@ -88,6 +93,7 @@ private:
         uintptr_t device_prefix{0};
         uint64_t iteration{0}, timeout_ms{0};
         std::size_t groups{0};
+        std::size_t width{0}, tile{0}, group_tiles{0}, element_bytes{0}, chunk_bytes{0};
         bool active{false}, complete{true};
         std::vector<RdmaReturnPeer> peers;
     };
@@ -278,6 +284,7 @@ private:
     void run_iteration(uint64_t iteration);
     void synchronize_iteration_start(uint64_t iteration) const;
     void synchronize_iteration(uint64_t iteration) const;
+    bool needs_local_payload_start_barrier() const;
     void synchronize_local_iteration_phase(const std::string& phase, uint64_t iteration) const;
     void fill_iteration_send_buffers(uint64_t iteration);
     std::vector<std::size_t> sequential_peer_order() const;
@@ -300,6 +307,9 @@ private:
     void start_forwarding_thread();
     void stop_forwarding_thread();
     void prepare_forwarding_routing_tables();
+    void prepare_local_forwarding_routing_table();
+    const RouterRouting& active_routing() const;
+    std::shared_lock<std::shared_mutex> lock_forwarding_routes() const;
     void prepare_forwarding_destinations();
     void publish_local_nvlink_receive_buffers();
     ForwardDestinationState load_forward_destination(int dst_gpu);
@@ -362,6 +372,15 @@ private:
     ProxyConfig config_;
     CudaBuffers cuda_buffers_;
     RouterRouting router_routing_;
+    std::unique_ptr<IterationRouting> iteration_routing_;
+    std::unique_ptr<RouterRouting> iteration_source_;
+    std::optional<uint64_t> routing_iteration_;
+    uint64_t completed_routing_iterations_{0};
+    bool routing_failed_{false};
+    // A dynamic route cannot be replaced while a forwarding poller still
+    // scans the previous generation's vectors, even after its last copy.
+    mutable std::shared_mutex forwarding_routes_mutex_;
+    std::atomic<bool> dynamic_payload_active_{false};
     RdmaContext rdma_context_;
     std::unique_ptr<RdmaContext> rdma_context2_;
     bool second_device(int qp) const;

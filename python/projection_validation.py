@@ -103,14 +103,14 @@ def original_source_routes(experts, weights, *, source_gpu, destination_node,
     return result
 
 
-def configure_original_reference(up, down, library, handle, return_exchange, *, num_experts):
-    """Capture original local-node assignments once, outside measured iterations.
+def configure_original_reference(up, down, library, handle, return_exchange, *, num_experts, iteration=None):
+    """Capture original local-node assignments for the active routing generation.
 
     SharedExchange is node-local and has bounded JSON storage. Only small file
     descriptors travel through it; temporary binary assignment files are read by
     every local worker and unlinked after a collective read barrier. Remote-node
-    sources still receive descriptor/source-weight checks. No distributed torch
-    process group, additional GPU kernels, or data-plane exchange is introduced.
+    sources receive descriptor/source-weight checks. Dynamic routing uses a fresh
+    collective key after each generation change. This reference setup is untimed.
     """
     query = library.rdma_proxy_get_local_router_assignments
     query.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
@@ -131,7 +131,8 @@ def configure_original_reference(up, down, library, handle, return_exchange, *, 
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(bytes(selected))
             stream.write(bytes(weights))
-        entries = return_exchange.control.gather("original-route-reference-files", {
+        suffix = "" if iteration is None else f"-{iteration}"
+        entries = return_exchange.control.gather(f"original-route-reference-files{suffix}", {
             "path": path, "tokens": tokens.value, "top_k": top_k.value,
         })
         up.original_reference = {}
@@ -154,7 +155,7 @@ def configure_original_reference(up, down, library, handle, return_exchange, *, 
                 source_gpu=gpu, destination_node=return_exchange.node,
                 destination_gpu=return_exchange.rank, num_nodes=len(nodes),
                 gpus_per_node=return_exchange.world, num_experts=num_experts)
-        return_exchange.control.gather("original-route-reference-read")
+        return_exchange.control.gather(f"original-route-reference-read{suffix}")
     finally:
         os.unlink(path)
 

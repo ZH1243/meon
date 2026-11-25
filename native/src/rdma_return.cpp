@@ -42,14 +42,14 @@ const std::vector<std::size_t>& Proxy::outgoing_token_indices(int destination_no
     if (!initialized_ || !config_.router_routing_enabled || destination_node < 0 ||
         destination_node >= config_.num_nodes)
         throw std::runtime_error("invalid outgoing token-index query");
-    return router_routing_.token_indices_for_node(destination_node);
+    return active_routing().token_indices_for_node(destination_node);
 }
 
 std::size_t Proxy::rdma_return_receive_rows(int peer) const {
     if (!initialized_ || peer == config_.node_rank || peer < 0 || peer >= config_.num_nodes ||
         !config_.router_routing_enabled)
         throw std::runtime_error("invalid RDMA return receive-row query");
-    return router_routing_.token_indices_for_node(peer).size();
+    return active_routing().token_indices_for_node(peer).size();
 }
 
 uintptr_t Proxy::configure_rdma_returns(
@@ -71,6 +71,11 @@ uintptr_t Proxy::configure_rdma_returns(
     rdma_returns_ = std::make_unique<RdmaReturnState>();
     auto& state = *rdma_returns_;
     state.groups = groups;
+    state.width = width;
+    state.tile = tile;
+    state.group_tiles = group_tiles;
+    state.element_bytes = element;
+    state.chunk_bytes = chunk_bytes;
     state.timeout_ms = timeout_ms;
     try {
         if (config_.mock_mode) {
@@ -98,8 +103,13 @@ uintptr_t Proxy::configure_rdma_returns(
         int last = -1;
         for (const auto& b : sorted) {
             const auto it = std::find_if(peers_.begin(), peers_.end(), [&](const auto& p) { return p.peer_rank == b.peer; });
-            if (it == peers_.end() || b.peer == last || !b.source || !b.destination ||
-                b.source_rows != it->router_x4.size() || b.destination_rows != rdma_return_receive_rows(b.peer))
+            if (it == peers_.end() || b.peer == last || !b.source || !b.destination)
+                throw std::runtime_error("RDMA return buffer identity mismatch");
+            // Dynamic callers pass full token capacity and keep the registered
+            // addresses fixed. Tile strides and writes use each epoch's lengths.
+            const auto send_rows = config_.router_dynamic_routing_enabled ? config_.num_tokens : it->router_x4.size();
+            const auto recv_rows = config_.router_dynamic_routing_enabled ? config_.num_tokens : rdma_return_receive_rows(b.peer);
+            if (b.source_rows != send_rows || b.destination_rows != recv_rows)
                 throw std::runtime_error("RDMA return buffer identity/rows mismatch");
             last = b.peer;
             state.peers.emplace_back();
@@ -117,7 +127,8 @@ uintptr_t Proxy::configure_rdma_returns(
                 p.destination2 = rdma_context2_->register_memory(reinterpret_cast<void*>(b.destination),
                     std::max(element, recv_bytes), "rdma_return_destination_device2");
             }
-            p.chunks = return_chunks(b.source_rows, width, tile, group_tiles, element, chunk_bytes);
+            if (!config_.router_dynamic_routing_enabled)
+                p.chunks = return_chunks(b.source_rows, width, tile, group_tiles, element, chunk_bytes);
             for (auto& worker : it->workers) worker->configure_return_protocol(total_groups);
         }
         for (std::size_t i = 0; i < sorted.size(); ++i) {
@@ -168,7 +179,17 @@ void Proxy::prepare_rdma_returns(uint64_t iteration) {
     state.iteration = iteration;
     state.active = true;
     state.complete = false;
-    for (auto& p : state.peers) p.next_group = 0;
+    for (auto& p : state.peers) {
+        p.next_group = 0;
+        if (config_.router_dynamic_routing_enabled) {
+            const auto& peer = peers_.at(p.peer_index);
+            const auto rows = peer.router_x4.size();
+            if (product(product(rows, state.width), state.element_bytes) > p.remote.length)
+                throw std::runtime_error("dynamic RDMA return exceeds registered capacity");
+            p.chunks = return_chunks(rows, state.width, state.tile, state.group_tiles,
+                                     state.element_bytes, state.chunk_bytes);
+        }
+    }
 }
 
 void Proxy::service_rdma_returns() const {

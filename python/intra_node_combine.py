@@ -24,7 +24,7 @@ def contribution_indices(masks, world):
 
 
 class IntraNodeCombine:
-    def __init__(self, exchange, options):
+    def __init__(self, exchange, options, *, dynamic_capacity=None):
         import torch
         import cuda.bindings.driver as cuda
         import cutlass.cute as cute
@@ -77,58 +77,36 @@ class IntraNodeCombine:
                                       self.ready_groups.data_ptr() if self.ready_groups is not None else 0],
                                      dtype=torch.int64, device=self.device)
         self.nodes = sorted({node for node, _ in exchange.down.up.source_pairs})
-        self.domains = []
-        self.entries = []
-        total_rows = 0
-        dtype = exchange.outputs[0].dtype
-        for node in self.nodes:
-            count = ctypes.c_uint64()
-            exchange.require(query(exchange.handle, node, None, 0, ctypes.byref(count)))
-            masks = (ctypes.c_uint8 * count.value)()
-            exchange.require(query(exchange.handle, node, masks, count.value, ctypes.byref(count)))
-            indices = contribution_indices(list(masks), exchange.world)
-            self.domains.append((node, total_rows, count.value))
-            for peer, selected in enumerate(indices):
-                if peer == exchange.rank:
-                    source = exchange.down.up.source_pairs.index((node, peer))
-                    buffer = exchange.outputs[source]
-                else:
-                    buffer = exchange.received[peer, node]
-                index = torch.tensor(selected, dtype=torch.int64, device=self.device)
-                self.entries.append((node, peer, total_rows, index, buffer))
-            total_rows += count.value
-        if total_rows * width > 2**31 - 1:
-            raise ValueError("intra-node combine exceeds the kernel's int32 element-index range")
-        active = [entry for entry in self.entries if entry[3].numel()]
-        inverse = torch.full((max(1, len(active)), max(1, total_rows)), -1,
-                             dtype=torch.int32, device=self.device)
-        for p, (_, _, offset, index, _) in enumerate(active):
-            inverse[p, index + offset] = torch.arange(index.numel(), dtype=torch.int32, device=self.device)
-        self.rows = inverse
+        self.dynamic_capacity = dynamic_capacity
+        self.width, self.tile = width, tile
         self.output_tile_n = tile if options.intra_node_combine_n_tile_major_output else 0
-        self.total_rows = total_rows
-        # Pack each domain independently so consecutive N tiles for a source
-        # form one contiguous transfer span, including multi-tile groups.
-        self.output = torch.empty((total_rows * width,) if self.output_tile_n else (total_rows, width),
-                                  dtype=dtype, device=self.device)
-        self.outputs = {
-            node: (self.output.view(-1)[offset * width:(offset + count) * width]
-                   .view(width // tile, count, tile)
-                   if self.output_tile_n else self.output[offset:offset + count])
-            for node, offset, count in self.domains
-        }
-        self.buffers = tuple(buffer.view(-1)[:index.numel() * width]
+        self._read_routes()
+        self.capacity_rows = (len(self.nodes) * dynamic_capacity
+                              if dynamic_capacity is not None else self.total_rows)
+        if self.capacity_rows * width > 2**31 - 1:
+            raise ValueError("intra-node combine exceeds the kernel's int32 element-index range")
+        active = self.entries if dynamic_capacity is not None else [
+            entry for entry in self.entries if entry[3].numel()]
+        self.rows = torch.full((max(1, len(active)),
+                                max(1, self.capacity_rows) + (2 if dynamic_capacity is not None else 0)),
+                               -1, dtype=torch.int32, device=self.device)
+        self.output = torch.empty((self.capacity_rows * width,) if self.output_tile_n
+                                  else (self.capacity_rows, width),
+                                  dtype=exchange.outputs[0].dtype, device=self.device)
+        self._update_views(active)
+        self.buffers = tuple(buffer.view(-1) if dynamic_capacity is not None
+                             else buffer.view(-1)[:index.numel() * width]
                              for _, _, _, index, buffer in active)
         self.compiled = None
-        self.width, self.tile = width, tile
-        self.kernel_output = self.output if total_rows else torch.empty(1, dtype=dtype, device=self.device)
+        self.kernel_output = self.output if self.capacity_rows else torch.empty(
+            1, dtype=self.output.dtype, device=self.device)
         self.rdma_return = None
         if options.rdma_return_token_results:
             from rdma_network_return import NetworkReturn
             self.rdma_return = NetworkReturn(self, options)
             self.addresses = torch.cat((self.addresses, torch.tensor(
                 [self.rdma_return.device_prefix], dtype=torch.int64, device=self.device)))
-        if total_rows or self.ready_groups is not None:
+        if self.capacity_rows or self.ready_groups is not None:
             self.arguments = (
                 tuple(from_dlpack(buffer, assumed_align=16) for buffer in self.buffers)
                 if self.buffers else None,
@@ -136,20 +114,27 @@ class IntraNodeCombine:
                 from_dlpack(self.addresses),
             )
             kernel = RegisterIntraNodeKernel(
-                tuple(entry[3].numel() for entry in active), width, tile, ctas, vec,
+                tuple(dynamic_capacity if dynamic_capacity is not None else entry[3].numel()
+                      for entry in active), width, tile, ctas, vec,
                 threads, True, self.output_tile_n)
-            kernel.output_domains = tuple((offset, count) for _, offset, count in self.domains)
+            kernel.dynamic_strides = dynamic_capacity is not None
+            kernel.dynamic_domain_capacity = dynamic_capacity
+            kernel.domain_peers = exchange.world
+            kernel.output_domains = tuple(
+                (offset, dynamic_capacity if dynamic_capacity is not None else count)
+                for _, offset, count in self.domains)
             first_peer = 0
             input_domains = []
             for node, offset, count in self.domains:
                 peers = sum(entry[0] == node for entry in active)
-                input_domains.append((offset, count, first_peer, peers))
+                input_domains.append((offset, dynamic_capacity if dynamic_capacity is not None else count,
+                                      first_peer, peers))
                 first_peer += peers
             kernel.input_domains = tuple(input_domains)
             kernel.group_tiles = self.group_tiles
             kernel.publish_ready = self.ready_groups is not None
             kernel.publish_rdma_ready = self.rdma_return is not None
-            kernel.source_tokens = total_rows
+            kernel.source_tokens = self.capacity_rows
             kernel.prefetch_peers = options.intra_node_combine_prefetch_peers
             lanes = 32
             while (tile // vec) % lanes:
@@ -166,6 +151,60 @@ class IntraNodeCombine:
               "in staging/RDMA input-row order; "
               f"SM guard={'relaxed' if relax_sm_guard else 'cluster'}, "
               f"down CTA budget={options.down_sm_count}", flush=True)
+
+    def _read_routes(self):
+        exchange, torch = self.exchange, self.torch
+        query = exchange.library.rdma_proxy_get_intra_node_source_masks
+        self.domains, self.entries = [], []
+        self.total_rows = 0
+        for i, node in enumerate(self.nodes):
+            count = ctypes.c_uint64()
+            exchange.require(query(exchange.handle, node, None, 0, ctypes.byref(count)))
+            masks = (ctypes.c_uint8 * count.value)()
+            exchange.require(query(exchange.handle, node, masks, count.value, ctypes.byref(count)))
+            if self.dynamic_capacity is not None and count.value > self.dynamic_capacity:
+                raise ValueError("intra-node route domain exceeds its source-token capacity")
+            offset = self.total_rows if self.dynamic_capacity is None else i * self.dynamic_capacity
+            self.domains.append((node, offset, count.value))
+            for peer, selected in enumerate(contribution_indices(list(masks), exchange.world)):
+                if peer == exchange.rank:
+                    source = exchange.down.up.source_pairs.index((node, peer))
+                    buffer = exchange.outputs[source]
+                else:
+                    buffer = exchange.received[peer, node]
+                indices = torch.tensor(selected, dtype=torch.int64, device=self.device)
+                self.entries.append((node, peer, offset, indices, buffer))
+            self.total_rows += count.value
+
+    def _update_views(self, entries):
+        torch = self.torch
+        self.rows.fill_(-1)
+        counts = {node: count for node, _, count in self.domains}
+        for peer, (node, _, offset, index, _) in enumerate(entries):
+            self.rows[peer, index + offset] = torch.arange(index.numel(), dtype=torch.int32,
+                                                           device=self.device)
+            if self.dynamic_capacity is not None:
+                self.rows[peer, -2] = index.numel()
+                self.rows[peer, -1] = counts[node]
+        self.outputs = {
+            node: (self.output.view(-1)[offset * self.width:(offset + count) * self.width]
+                   .view(self.width // self.tile, count, self.tile)
+                   if self.output_tile_n else self.output[offset:offset + count])
+            for node, offset, count in self.domains
+        }
+
+    def storage_for_node(self, node):
+        """Fixed base used for RDMA registration and full-capacity kernel views."""
+        offset = self.nodes.index(node) * self.dynamic_capacity * self.width
+        return self.output.view(-1).narrow(0, offset, self.dynamic_capacity * self.width)
+
+    def refresh_routes(self):
+        self._read_routes()
+        self._update_views(self.entries)
+        if self.rdma_return is not None:
+            self.rdma_return.refresh(self)
+        if self.inter_node_combine is not None:
+            self.inter_node_combine.refresh_routes(self)
 
     def _warmup(self):
         """Exercise the compiled callable before readiness-gated GPU work starts.
@@ -237,7 +276,7 @@ class IntraNodeCombine:
     def check(self):
         """Independent FP32 gather/add reference after all returns are complete."""
         torch = self.torch
-        expected = torch.zeros((self.total_rows, self.width), dtype=torch.float32, device=self.device)
+        expected = torch.zeros((self.capacity_rows, self.width), dtype=torch.float32, device=self.device)
         for node, peer, offset, index, buffer in self.entries:
             count = index.numel()
             if peer == self.exchange.rank:

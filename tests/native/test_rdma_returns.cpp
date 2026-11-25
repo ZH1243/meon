@@ -9,13 +9,14 @@ struct RdmaReturnsTestAccess {
     static void require(bool value, const char* message) {
         if (!value) throw std::runtime_error(message);
     }
-    static void exercise(bool empty, bool dual = false) {
+    static void exercise(bool empty, bool dual = false, bool dynamic = false) {
         ProxyConfig config;
         config.mock_mode = true;
         config.num_nodes = 2;
         config.num_gpus_per_node = 8;
         config.num_iterations = 2;
         config.router_routing_enabled = true;
+        config.router_dynamic_routing_enabled = dynamic;
         config.router_local_input_staging_enabled = true;
         config.router_num_experts = 128;
         config.router_top_k = empty ? 1 : 8;
@@ -38,7 +39,7 @@ struct RdmaReturnsTestAccess {
         Proxy::PeerState peer;
         peer.peer_rank = 1;
         peer.router_x4 = proxy.router_routing_.token_masks_for_node(1);
-        const auto rows = peer.router_x4.size();
+        const auto capacity = dynamic ? config.num_tokens : peer.router_x4.size();
         for (int q = 0; q < 8; ++q) {
             auto qp = std::make_unique<RdmaQueuePair>(proxy.qp_context(q), proxy.qp_config(q), 1, q);
             qp->connect(qp->local_info());
@@ -50,15 +51,19 @@ struct RdmaReturnsTestAccess {
             peer.workers.push_back(std::move(worker));
         }
         proxy.peers_.push_back(std::move(peer));
-        const auto bytes = rows * 40 * 2;
-        std::vector<unsigned char> source(std::max(std::size_t{2}, bytes));
+        const auto capacity_bytes = capacity * 40 * 2;
+        std::vector<unsigned char> source(std::max(std::size_t{2}, capacity_bytes));
         std::vector<unsigned char> dest(source.size(), 0);
         RdmaProxyNetworkReturnBuffer buffer{1, reinterpret_cast<uintptr_t>(source.data()),
-            reinterpret_cast<uintptr_t>(dest.data()), rows, rows};
+            reinterpret_cast<uintptr_t>(dest.data()), capacity, capacity};
         const auto address = proxy.configure_rdma_returns(&buffer, 1, 40, 8, 2, 2, 37, 3000);
         auto* prefix = reinterpret_cast<int32_t*>(address);
         std::vector<unsigned char> forward_source(80, 19), forward_dest(80);
         for (uint64_t iteration = 0; iteration < 2; ++iteration) {
+            // The same MR and QPs span an empty generation and a full one.
+            const auto rows = dynamic && iteration == 0 ? std::size_t{0} : capacity;
+            if (dynamic) proxy.peers_[0].router_x4.resize(rows);
+            const auto bytes = rows * 40 * 2;
             std::fill(dest.begin(), dest.end(), 0);
             for (std::size_t i = 0; i < bytes; ++i) source[i] = 1 + (i + iteration) % 254;
             proxy.prepare_rdma_returns(iteration);
@@ -126,5 +131,6 @@ int main() {
     rdma_proxy::RdmaReturnsTestAccess::exercise(true);
     rdma_proxy::RdmaReturnsTestAccess::exercise(false, true);
     rdma_proxy::RdmaReturnsTestAccess::exercise(true, true);
+    rdma_proxy::RdmaReturnsTestAccess::exercise(false, false, true);
     std::cout << "test_rdma_returns passed\n";
 }

@@ -131,8 +131,8 @@ extern "C" int rdma_proxy_configure_cpu_scatter(
     clear_error();
     try {
         if (!handle || !config || !handle->initialized || handle->shut_down ||
-            handle->finished || handle->next_iteration != 0)
-            throw std::runtime_error("CPU scatter must be configured before iteration zero");
+            handle->finished || (handle->next_iteration != 0 && !handle->config.router_dynamic_routing_enabled))
+            throw std::runtime_error("CPU scatter requires an idle handle during routing setup");
         select_proxy_cuda_device(*handle);
         handle->proxy.configure_cpu_scatter(*config);
         return 0;
@@ -146,8 +146,8 @@ extern "C" int rdma_proxy_configure_cpu_route_weights(
     clear_error();
     try {
         if (!handle || !handle->initialized || handle->shut_down || handle->finished ||
-            handle->next_iteration != 0 || routes > std::numeric_limits<std::size_t>::max())
-            throw std::runtime_error("CPU route weights must be configured before iteration zero");
+            (handle->next_iteration != 0 && !handle->config.router_dynamic_routing_enabled) || routes > std::numeric_limits<std::size_t>::max())
+            throw std::runtime_error("CPU route weights require an idle handle during routing setup");
         select_proxy_cuda_device(*handle);
         handle->proxy.configure_cpu_route_weights(packed_weights, static_cast<std::size_t>(routes));
         return 0;
@@ -158,8 +158,8 @@ extern "C" int rdma_proxy_configure_cpu_scatter_deferred(RdmaProxyHandle* handle
     clear_error();
     try {
         if (!handle || !handle->initialized || handle->shut_down || handle->finished ||
-            handle->next_iteration != 0 || bytes > std::numeric_limits<std::size_t>::max())
-            throw std::runtime_error("deferred CPU scatter must be configured before iteration zero");
+            (handle->next_iteration != 0 && !handle->config.router_dynamic_routing_enabled) || bytes > std::numeric_limits<std::size_t>::max())
+            throw std::runtime_error("deferred CPU scatter requires an idle handle during routing setup");
         select_proxy_cuda_device(*handle);
         handle->proxy.configure_cpu_scatter_deferred(static_cast<std::size_t>(bytes));
         return 0;
@@ -170,8 +170,8 @@ extern "C" int rdma_proxy_configure_cpu_scatter_threaded(RdmaProxyHandle* handle
     clear_error();
     try {
         if (!handle || !handle->initialized || handle->shut_down || handle->finished ||
-            handle->next_iteration != 0 || bytes > std::numeric_limits<std::size_t>::max())
-            throw std::runtime_error("threaded CPU scatter must be configured before iteration zero");
+            (handle->next_iteration != 0 && !handle->config.router_dynamic_routing_enabled) || bytes > std::numeric_limits<std::size_t>::max())
+            throw std::runtime_error("threaded CPU scatter requires an idle handle during routing setup");
         select_proxy_cuda_device(*handle);
         handle->proxy.configure_cpu_scatter_threaded(static_cast<std::size_t>(bytes));
         return 0;
@@ -379,6 +379,50 @@ extern "C" int rdma_proxy_run(RdmaProxyHandle* handle) {
             handle->next_iteration = handle->config.num_iterations;
             handle->finished = true;
         }
+        return 0;
+    } catch (...) {
+        return record_current_exception();
+    }
+}
+
+extern "C" int rdma_proxy_dynamic_routing_enabled(RdmaProxyHandle* handle, int32_t* enabled) {
+    clear_error();
+    if (!handle || !enabled) {
+        last_error = "invalid dynamic routing query";
+        return -1;
+    }
+    *enabled = handle->config.router_dynamic_routing_enabled;
+    return 0;
+}
+
+extern "C" int rdma_proxy_prepare_routing(RdmaProxyHandle* handle, uint64_t iteration) {
+    clear_error();
+    if (!handle || !handle->initialized || handle->shut_down || handle->finished ||
+        !handle->config.router_dynamic_routing_enabled || iteration != handle->next_iteration) {
+        last_error = "routing preparation requires the next unfinished dynamic iteration";
+        return -1;
+    }
+    try {
+        select_proxy_cuda_device(*handle);
+        handle->proxy.prepare_routing(iteration);
+        return 0;
+    } catch (...) {
+        return record_current_exception();
+    }
+}
+
+extern "C" int rdma_proxy_get_routing_extents(
+    RdmaProxyHandle* handle, uint64_t* indices_per_source, uint64_t* table_rows) {
+    clear_error();
+    if (!handle || !handle->initialized || handle->shut_down || !indices_per_source || !table_rows) {
+        last_error = "invalid routing extent query";
+        return -1;
+    }
+    try {
+        const auto& p = handle->proxy.router_notification_publication_buffers();
+        if (!p.a_idx_capacity) throw std::runtime_error("no gather metadata has been installed");
+        *indices_per_source = p.a_idx_capacity;
+        *table_rows = p.table_rows;
         return 0;
     } catch (...) {
         return record_current_exception();

@@ -5,13 +5,18 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace rdma_proxy {
 
 class RouterRouting {
 public:
-    explicit RouterRouting(ProxyConfig config);
+    // Device tables and pinned readback storage can be reused after the previous
+    // generation's device readers retire. Each instance owns its host snapshot.
+    struct Workspace;
+    static std::shared_ptr<Workspace> make_workspace(const ProxyConfig& config);
+    explicit RouterRouting(ProxyConfig config, std::shared_ptr<Workspace> workspace = {});
     ~RouterRouting();
 
     RouterRouting(const RouterRouting&) = delete;
@@ -27,13 +32,20 @@ public:
     int experts_per_gpu() const;
     const std::vector<int32_t>& original_experts() const;
     const std::vector<float>& original_weights() const;
+    struct DeviceTables {
+        const int32_t* expert_offsets{};
+        const int32_t* expert_indices{};
+        const int32_t* node_offsets{};
+        const int32_t* x3{};
+        const uint8_t* x4{};
+    };
+    DeviceTables device_tables() const { return device_tables_; }
 
 private:
     void initialize_mock();
     void generate_source_weights();
     void align_expert_weights();
     void initialize_cuda();
-    void release_cuda() noexcept;
 
     ProxyConfig config_;
     std::vector<std::vector<std::size_t>> token_indices_by_node_;
@@ -42,11 +54,8 @@ private:
     // Original [token, top_k] assignments retained independently of row packing.
     std::vector<int32_t> original_experts_;
     std::vector<float> original_weights_;
-    std::vector<void*> device_allocations_;
-    int32_t* pinned_x3_{nullptr};
-    uint8_t* pinned_x4_{nullptr};
-    int32_t* pinned_node_offsets_{nullptr};
-    int32_t* device_x3_{nullptr};
+    std::shared_ptr<Workspace> workspace_;
+    DeviceTables device_tables_{};
     bool initialized_{false};
 };
 

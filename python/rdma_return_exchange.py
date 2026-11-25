@@ -161,6 +161,18 @@ class ReturnExchange:
             message = self.library.rdma_proxy_last_error()
             raise RuntimeError(message.decode() if message else "return-copy operation failed")
 
+    def bind_down(self, down):
+        """Keep IPC bases and the pinned count pointer while replacing epoch metadata."""
+        if tuple(t.data_ptr() for t in down.inputs.output_buffers()) != tuple(t.data_ptr() for t in self.outputs):
+            raise ValueError("routing refresh changed a registered return-copy source")
+        down.return_exchange = self
+        down.intra_node_combine = self.down.intra_node_combine
+        self.down = down
+        if down.cpu_scatter_counts is not None:
+            self.rows_host.copy_(down.cpu_scatter_counts)
+        if down.intra_node_combine is not None:
+            down.intra_node_combine.refresh_routes()
+
     def publish_counts(self):
         # Called on the compute stream after mapping, before down GEMM. Seeing a
         # positive system-release ready prefix establishes that this D2H is done.

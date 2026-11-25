@@ -17,8 +17,6 @@
 namespace rdma_proxy {
 namespace {
 
-constexpr std::size_t kKernelChunkTokens = 256;
-
 uint64_t splitmix64(uint64_t value) {
     value += 0x9e3779b97f4a7c15ULL;
     value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
@@ -35,6 +33,9 @@ int gcd(int a, int b) {
     return a;
 }
 
+#if RDMA_PROXY_HAVE_CUDA
+constexpr std::size_t kKernelChunkTokens = 256;
+
 std::size_t checked_multiply(std::size_t a, std::size_t b, const char* what) {
     if (a != 0 && b > std::numeric_limits<std::size_t>::max() / a) {
         throw std::runtime_error(std::string(what) + " overflows size_t");
@@ -42,7 +43,6 @@ std::size_t checked_multiply(std::size_t a, std::size_t b, const char* what) {
     return a * b;
 }
 
-#if RDMA_PROXY_HAVE_CUDA
 void check_cuda(cudaError_t status, const char* what) {
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
@@ -52,11 +52,51 @@ void check_cuda(cudaError_t status, const char* what) {
 
 }  // namespace
 
-RouterRouting::RouterRouting(ProxyConfig config) : config_(std::move(config)) {}
+struct RouterRouting::Workspace {
+    explicit Workspace(const ProxyConfig& c)
+        : device(c.cuda_device_id), tokens(c.num_tokens), nodes(c.num_nodes),
+          gpus(c.num_gpus_per_node), experts(c.router_num_experts), top_k(c.router_top_k) {}
+    bool allocated = false;
+    int device;
+    std::size_t tokens;
+    int nodes, gpus, experts, top_k;
+    int32_t *r{}, *expert_offsets{}, *expert_indices{}, *x3{}, *node_offsets{};
+    uint8_t* x4{};
+    int32_t *input_counts{}, *input_prefixes{}, *mask_offsets{}, *reordered_counts{}, *reordered_prefixes{};
+    int32_t *host_node_offsets{}, *host_x3{};
+    uint8_t* host_x4{};
+#if RDMA_PROXY_HAVE_CUDA
+    template<class T>
+    void allocate(T*& ptr, std::size_t count, const char* name, bool pinned = false) {
+        const auto bytes = checked_multiply(count, sizeof(T), name);
+        check_cuda(pinned ? cudaMallocHost(reinterpret_cast<void**>(&ptr), bytes)
+                          : cudaMalloc(reinterpret_cast<void**>(&ptr), bytes), name);
+    }
+    ~Workspace() {
+        if (!r) return;
+        int previous = -1;
+        cudaGetDevice(&previous);
+        cudaSetDevice(device);
+        for (auto p : {r, expert_offsets, expert_indices, x3, node_offsets, input_counts,
+                       input_prefixes, mask_offsets, reordered_counts, reordered_prefixes})
+            if (p) cudaFree(p);
+        if (x4) cudaFree(x4);
+        if (host_node_offsets) cudaFreeHost(host_node_offsets);
+        if (host_x3) cudaFreeHost(host_x3);
+        if (host_x4) cudaFreeHost(host_x4);
+        if (previous >= 0 && previous != device) cudaSetDevice(previous);
+    }
+#endif
+};
 
-RouterRouting::~RouterRouting() {
-    release_cuda();
+std::shared_ptr<RouterRouting::Workspace> RouterRouting::make_workspace(const ProxyConfig& c) {
+    return std::make_shared<Workspace>(c);
 }
+
+RouterRouting::RouterRouting(ProxyConfig config, std::shared_ptr<Workspace> workspace)
+    : config_(std::move(config)), workspace_(std::move(workspace)) {}
+
+RouterRouting::~RouterRouting() = default;
 
 int RouterRouting::experts_per_gpu() const {
     return config_.router_num_experts / (config_.num_nodes * config_.num_gpus_per_node);
@@ -106,10 +146,10 @@ const int32_t* RouterRouting::device_token_indices_for_node(int node_rank) const
     }
     if (config_.mock_mode) return nullptr;
 #if RDMA_PROXY_HAVE_CUDA
-    if (!device_x3_ || !pinned_node_offsets_) {
+    if (!workspace_ || !workspace_->x3 || !workspace_->host_node_offsets) {
         throw std::runtime_error("router device x3 is not initialized");
     }
-    return device_x3_ + pinned_node_offsets_[node_rank];
+    return workspace_->x3 + workspace_->host_node_offsets[node_rank];
 #else
     throw std::runtime_error("router device x3 requested without CUDA support");
 #endif
@@ -329,93 +369,74 @@ void RouterRouting::initialize_cuda() {
     const std::size_t max_node_tokens =
         checked_multiply(num_tokens, std::min(top_k, num_nodes), "router x3 capacity");
 
-    auto allocate = [&](std::size_t bytes, const char* what) -> void* {
-        void* ptr = nullptr;
-        check_cuda(cudaMalloc(&ptr, bytes), what);
-        device_allocations_.push_back(ptr);
-        return ptr;
-    };
-
-    auto* r = static_cast<int32_t*>(allocate(
-        checked_multiply(checked_multiply(num_tokens, top_k, "R elements"), sizeof(int32_t), "R bytes"),
-        "cudaMalloc R"));
-    auto* expert_offsets = static_cast<int32_t*>(allocate(
-        (num_experts + 1) * sizeof(int32_t), "cudaMalloc expert offsets"));
-    auto* expert_token_indices = static_cast<int32_t*>(allocate(
-        checked_multiply(checked_multiply(num_tokens, top_k, "expert index elements"),
-                         sizeof(int32_t), "expert index bytes"),
-        "cudaMalloc expert token indices"));
-    auto* x3 = static_cast<int32_t*>(allocate(
-        max_node_tokens * sizeof(int32_t), "cudaMalloc x3"));
-    device_x3_ = x3;
-    auto* x4 = static_cast<uint8_t*>(allocate(max_node_tokens * sizeof(uint8_t), "cudaMalloc x4"));
-    auto* node_offsets = static_cast<int32_t*>(allocate(
-        (num_nodes + 1) * sizeof(int32_t), "cudaMalloc node offsets"));
-    const std::size_t input_scratch_elements =
-        checked_multiply(num_input_chunks, input_num_bins, "router input scratch");
-    auto* input_counts = static_cast<int32_t*>(allocate(
-        input_scratch_elements * sizeof(int32_t), "cudaMalloc input counts"));
-    auto* input_prefixes = static_cast<int32_t*>(allocate(
-        input_scratch_elements * sizeof(int32_t), "cudaMalloc input prefixes"));
-    auto* mask_offsets = static_cast<int32_t*>(allocate(
-        num_nodes * num_masks * sizeof(int32_t), "cudaMalloc node mask offsets"));
-    const std::size_t reordered_num_bins =
-        static_cast<std::size_t>(experts_per_gpu() * config_.num_gpus_per_node +
-                                 config_.num_gpus_per_node);
-    const std::size_t reordered_scratch_elements = checked_multiply(
-        checked_multiply(num_nodes, num_input_chunks, "router reordered scratch chunks"),
-        reordered_num_bins, "router reordered scratch");
-    auto* reordered_counts = static_cast<int32_t*>(allocate(
-        reordered_scratch_elements * sizeof(int32_t), "cudaMalloc reordered counts"));
-    auto* reordered_prefixes = static_cast<int32_t*>(allocate(
-        reordered_scratch_elements * sizeof(int32_t), "cudaMalloc reordered prefixes"));
-
-    check_cuda(cudaMallocHost(
-        reinterpret_cast<void**>(&pinned_node_offsets_),
-        (num_nodes + 1) * sizeof(int32_t)), "cudaMallocHost node offsets");
-    check_cuda(cudaMallocHost(
-        reinterpret_cast<void**>(&pinned_x3_),
-        max_node_tokens * sizeof(int32_t)), "cudaMallocHost x3");
-    check_cuda(cudaMallocHost(
-        reinterpret_cast<void**>(&pinned_x4_),
-        max_node_tokens * sizeof(uint8_t)), "cudaMallocHost x4");
-
+    if (!workspace_) workspace_ = make_workspace(config_);
+    auto& w = *workspace_;
+    if (w.device != config_.cuda_device_id || w.tokens != num_tokens ||
+        w.experts != config_.router_num_experts || w.top_k != config_.router_top_k ||
+        w.nodes != config_.num_nodes || w.gpus != config_.num_gpus_per_node)
+        throw std::logic_error("incompatible router workspace");
+    if (!w.allocated) {
+        if (w.r) throw std::runtime_error("previous router workspace setup failed");
+        const auto assignments = checked_multiply(num_tokens, top_k, "router assignments");
+        const auto input_scratch = checked_multiply(num_input_chunks, input_num_bins, "router input scratch");
+        const auto reordered_bins = static_cast<std::size_t>(
+            (experts_per_gpu() + 1) * config_.num_gpus_per_node);
+        const auto reordered_scratch = checked_multiply(
+            checked_multiply(num_nodes, num_input_chunks, "router reordered chunks"), reordered_bins,
+            "router reordered scratch");
+        w.allocate(w.r, assignments, "cudaMalloc R");
+        w.allocate(w.expert_offsets, num_experts + 1, "cudaMalloc expert offsets");
+        w.allocate(w.expert_indices, assignments, "cudaMalloc expert indices");
+        w.allocate(w.x3, max_node_tokens, "cudaMalloc x3");
+        w.allocate(w.x4, max_node_tokens, "cudaMalloc x4");
+        w.allocate(w.node_offsets, num_nodes + 1, "cudaMalloc node offsets");
+        w.allocate(w.input_counts, input_scratch, "cudaMalloc input counts");
+        w.allocate(w.input_prefixes, input_scratch, "cudaMalloc input prefixes");
+        w.allocate(w.mask_offsets, num_nodes * num_masks, "cudaMalloc mask offsets");
+        w.allocate(w.reordered_counts, reordered_scratch, "cudaMalloc reordered counts");
+        w.allocate(w.reordered_prefixes, reordered_scratch, "cudaMalloc reordered prefixes");
+        w.allocate(w.host_node_offsets, num_nodes + 1, "cudaMallocHost node offsets", true);
+        w.allocate(w.host_x3, max_node_tokens, "cudaMallocHost x3", true);
+        w.allocate(w.host_x4, max_node_tokens, "cudaMallocHost x4", true);
+        w.allocated = true;
+    }
+    device_tables_ = {w.expert_offsets, w.expert_indices, w.node_offsets, w.x3, w.x4};
     generate_r_cuda_raw(
-        r, static_cast<int>(num_tokens), config_.router_top_k,
+        w.r, static_cast<int>(num_tokens), config_.router_top_k,
         config_.router_num_experts, config_.router_seed, nullptr);
     get_expert_token_idx_node_mask_cuda_raw(
-        r, static_cast<int>(num_tokens), config_.router_top_k,
+        w.r, static_cast<int>(num_tokens), config_.router_top_k,
         config_.router_num_experts, experts_per_gpu(), config_.num_gpus_per_node,
-        config_.local_gpu_index, expert_token_indices, expert_offsets, x3, x4,
-        node_offsets, input_counts, input_prefixes, mask_offsets,
-        reordered_counts, reordered_prefixes, nullptr);
+        config_.local_gpu_index, w.expert_indices, w.expert_offsets, w.x3, w.x4,
+        w.node_offsets, w.input_counts, w.input_prefixes, w.mask_offsets,
+        w.reordered_counts, w.reordered_prefixes, nullptr);
 
     check_cuda(cudaMemcpy(
-        pinned_node_offsets_, node_offsets, (num_nodes + 1) * sizeof(int32_t),
+        w.host_node_offsets, w.node_offsets, (num_nodes + 1) * sizeof(int32_t),
         cudaMemcpyDeviceToHost), "cudaMemcpy D2H router node offsets");
-    const int32_t total_x3 = pinned_node_offsets_[num_nodes];
+    const int32_t total_x3 = w.host_node_offsets[num_nodes];
     if (total_x3 < 0 || static_cast<std::size_t>(total_x3) > max_node_tokens) {
         throw std::runtime_error("router kernel returned an invalid x3 length");
     }
     check_cuda(cudaMemcpy(
-        pinned_x3_, x3, static_cast<std::size_t>(total_x3) * sizeof(int32_t),
+        w.host_x3, w.x3, static_cast<std::size_t>(total_x3) * sizeof(int32_t),
         cudaMemcpyDeviceToHost), "cudaMemcpy D2H router x3 to pinned memory");
     check_cuda(cudaMemcpy(
-        pinned_x4_, x4, static_cast<std::size_t>(total_x3) * sizeof(uint8_t),
+        w.host_x4, w.x4, static_cast<std::size_t>(total_x3) * sizeof(uint8_t),
         cudaMemcpyDeviceToHost), "cudaMemcpy D2H router x4 to pinned memory");
 
     original_experts_.resize(num_tokens * top_k);
-    check_cuda(cudaMemcpy(original_experts_.data(), r, original_experts_.size() * sizeof(int32_t),
+    check_cuda(cudaMemcpy(original_experts_.data(), w.r, original_experts_.size() * sizeof(int32_t),
                           cudaMemcpyDeviceToHost), "cudaMemcpy D2H original routing assignments");
     generate_source_weights();
     std::vector<int32_t> host_expert_offsets(num_experts + 1);
     std::vector<int32_t> host_expert_token_indices(num_tokens * top_k);
     check_cuda(cudaMemcpy(
-        host_expert_offsets.data(), expert_offsets,
+        host_expert_offsets.data(), w.expert_offsets,
         host_expert_offsets.size() * sizeof(int32_t), cudaMemcpyDeviceToHost),
         "cudaMemcpy D2H router expert offsets");
     check_cuda(cudaMemcpy(
-        host_expert_token_indices.data(), expert_token_indices,
+        host_expert_token_indices.data(), w.expert_indices,
         host_expert_token_indices.size() * sizeof(int32_t), cudaMemcpyDeviceToHost),
         "cudaMemcpy D2H router expert token indices");
 
@@ -456,8 +477,8 @@ void RouterRouting::initialize_cuda() {
     }
 
     for (std::size_t node = 0; node < num_nodes; ++node) {
-        const int32_t begin = pinned_node_offsets_[node];
-        const int32_t end = pinned_node_offsets_[node + 1];
+        const int32_t begin = w.host_node_offsets[node];
+        const int32_t end = w.host_node_offsets[node + 1];
         if (begin < 0 || end < begin || end > total_x3) {
             throw std::runtime_error("router kernel returned invalid per-node x3 offsets");
         }
@@ -466,12 +487,12 @@ void RouterRouting::initialize_cuda() {
         output.reserve(static_cast<std::size_t>(end - begin));
         masks.reserve(static_cast<std::size_t>(end - begin));
         for (int32_t position = begin; position < end; ++position) {
-            const int32_t token = pinned_x3_[position];
+            const int32_t token = w.host_x3[position];
             if (token < 0 || static_cast<std::size_t>(token) >= num_tokens) {
                 throw std::runtime_error("router kernel returned an out-of-range token index");
             }
             output.push_back(static_cast<std::size_t>(token));
-            const auto mask = pinned_x4_[position];
+            const auto mask = w.host_x4[position];
             const unsigned meaningful_mask = config_.num_gpus_per_node == 8 ?
                 0xffU : ((1U << config_.num_gpus_per_node) - 1U);
             if (mask == 0 || (static_cast<unsigned>(mask) & ~meaningful_mask) != 0) {
@@ -483,22 +504,6 @@ void RouterRouting::initialize_cuda() {
 #else
     throw std::runtime_error("router routing requires a CUDA build unless mock_mode=true");
 #endif
-}
-
-void RouterRouting::release_cuda() noexcept {
-#if RDMA_PROXY_HAVE_CUDA
-    if (pinned_x3_) cudaFreeHost(pinned_x3_);
-    if (pinned_x4_) cudaFreeHost(pinned_x4_);
-    if (pinned_node_offsets_) cudaFreeHost(pinned_node_offsets_);
-    pinned_x3_ = nullptr;
-    pinned_x4_ = nullptr;
-    pinned_node_offsets_ = nullptr;
-    device_x3_ = nullptr;
-    for (auto it = device_allocations_.rbegin(); it != device_allocations_.rend(); ++it) {
-        cudaFree(*it);
-    }
-#endif
-    device_allocations_.clear();
 }
 
 }  // namespace rdma_proxy

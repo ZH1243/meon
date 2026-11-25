@@ -237,8 +237,10 @@ public:
         int source_gpu_index) const;
     void stage_local_router_input(
         const std::vector<std::size_t>& source_token_indices,
-        const int32_t* device_source_token_indices);
+        const int32_t* device_source_token_indices, void* staging_stream = nullptr);
     void install_expert_metadata(RouterExpertMetadata metadata);
+    // Called between generations, after all consumers and forward workers retire.
+    void install_iteration_expert_metadata(std::vector<RouterExpertMetadata> tables, uint64_t iteration);
     RouterExpertTokenHeadState expert_token_head_state_for_source(
         int source_node_rank,
         int source_gpu_index) const;
@@ -306,7 +308,11 @@ private:
     void free_buffer(GpuBuffer& buffer);
     void allocate_pinned_buffer(CpuPinnedBuffer& buffer, std::size_t bytes);
     void free_pinned_buffer(CpuPinnedBuffer& buffer);
+    void validate_expert_metadata(const RouterExpertMetadata& metadata) const;
+    void assign_expert_metadata(NvlinkReceiveBuffer& buffer, RouterExpertMetadata metadata);
+    void clear_iteration_cpu_scatter();
     void initialize_router_computation_scheduler_locked();
+    uint64_t metadata_generations_installed_{0};
     bool is_router_computation_input(const NvlinkReceiveBuffer& buffer) const;
     void reset_router_computation_iteration_locked(uint64_t iteration);
     void update_expert_token_heads_locked(

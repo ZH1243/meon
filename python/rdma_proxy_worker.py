@@ -289,6 +289,8 @@ class TorchDeviceBuffers:
 class GroupedGemmRunner:
     """Launch QuACK's readiness-gated up GEMM on the proxy's receive storage."""
 
+    empty_epoch = False
+
     def __init__(
         self,
         torch_module,
@@ -306,6 +308,7 @@ class GroupedGemmRunner:
         max_swizzle_size: int,
         quack_root: Path,
         sm_count: int | None = None,
+        routing_extents: tuple[int, int] | None = None,
     ) -> None:
         validate_up_sm_count(sm_count, cluster_m)
         self.torch = torch_module
@@ -404,7 +407,7 @@ class GroupedGemmRunner:
                 f"gather table shape {tuple(work_table.shape)} does not match "
                 f"{len(x_buffers)} active inputs (expected width {expected_width})"
             )
-        if work_table.shape[0] == 0:
+        if work_table.shape[0] == 0 and routing_extents is None:
             raise RuntimeError("QuACK gather table has zero rows")
 
         clusters_n = math.ceil(self.gemm_dimension / tile_n)
@@ -430,11 +433,13 @@ class GroupedGemmRunner:
         if self.gated:
             self.weights = self.weights.transpose(1, 2)
         self.weights.mul_(1.0 / math.sqrt(hidden_dimension))
-        self.output = torch_module.empty(
-            (len(x_buffers) * int(first_a_idx.numel()), output_dimension),
+        self.output_storage = torch_module.empty(
+            (len(x_buffers) * (int(first_a_idx.numel()) if routing_extents is None
+                               else routing_extents[0]), output_dimension),
             dtype=first_x.dtype,
             device=first_x.device,
         )
+        self.output = self.output_storage
         self.x_buffers = tuple(x_buffers)
         self.source_pairs = tuple(source_pairs)
         self.a_idx = tuple(a_idx)
@@ -447,7 +452,7 @@ class GroupedGemmRunner:
             self.pooled_work_table = device_buffers.only_tensor_of_kind(DEVICE_BUFFER_POOLED_GATHER_TABLE)
             if self.device_capacity != 9:
                 raise ValueError("pooled up GEMM requires Hopper SM90")
-            if (self.pooled_a_idx.shape != (self.output.shape[0],)
+            if (self.pooled_a_idx.shape != (len(x_buffers) * first_a_idx.numel(),)
                     or self.pooled_work_table.shape != (work_table.shape[0], 4)):
                 raise RuntimeError("pooled A_idx or four-column table has incompatible capacity")
         weight_entries = device_buffers.tensors_of_kind(DEVICE_BUFFER_ROUTER_ROUTE_WEIGHTS)
@@ -459,12 +464,20 @@ class GroupedGemmRunner:
             if any(weight.shape != index.shape or weight.dtype != torch_module.float32
                    for weight, index in zip(self.route_weights, self.a_idx)):
                 raise RuntimeError("routing weights must be FP32 and aligned with each source A_idx")
-        # Immutable lookup storage; only the routed-row vector changes per iteration.
+        # Static routing keeps one stacked lookup. Dynamic routing rebuilds it from each live prefix.
         self.route_weights_stacked = (torch_module.stack(self.route_weights)
-                                      if self.route_weights is not None else None)
+                                      if self.route_weights is not None and routing_extents is None else None)
         torch_module.cuda.synchronize(cuda_device_id)
         self.work_table = work_table
         self.ready_rows = ready_rows
+        self.index_storage = self.a_idx
+        self.table_storage = work_table
+        self.weight_storage = self.route_weights
+        if self.x_pool is not None:
+            self.pooled_index_storage = self.pooled_a_idx
+            self.pooled_table_storage = self.pooled_work_table
+        if routing_extents is not None:
+            self.bind_routing(*routing_extents)
         self.transposed_weights = self.weights.transpose(1, 2)
         self.tile_m = tile_m
         self.tile_n = tile_n
@@ -489,6 +502,25 @@ class GroupedGemmRunner:
             flush=True,
         )
 
+    def bind_routing(self, source_index_rows, table_rows):
+        """Bind QuACK to live prefixes. Padding is storage, never scheduler work."""
+        if (not 1 <= source_index_rows <= self.index_storage[0].numel()
+                or not 0 <= table_rows <= self.table_storage.shape[0]):
+            raise ValueError("native routing extents exceed their allocated storage")
+        self.a_idx = tuple(t[:source_index_rows] for t in self.index_storage)
+        self.work_table = self.table_storage[:table_rows]
+        self.empty_epoch = table_rows == 0
+        output_rows = source_index_rows * len(self.a_idx)
+        if output_rows > self.output_storage.shape[0]:
+            self.output_storage = self.output_storage.new_empty((output_rows, self.output_storage.shape[1]))
+        self.output = self.output_storage[:output_rows]
+        if self.x_pool is not None:
+            self.pooled_a_idx = self.pooled_index_storage[:output_rows]
+            self.pooled_work_table = self.pooled_table_storage[:table_rows]
+        if self.weight_storage is not None:
+            self.route_weights = tuple(t[:source_index_rows] for t in self.weight_storage)
+            self.route_weights_stacked = self.torch.stack(self.route_weights)
+
     def launch(self, *, pooled: bool | None = None) -> None:
         if pooled is None:
             pooled = self.x_pool is not None
@@ -497,6 +529,8 @@ class GroupedGemmRunner:
         x = self.x_pool if pooled else self.x_buffers
         indices = self.pooled_a_idx if pooled else self.a_idx
         table = self.pooled_work_table if pooled else self.work_table
+        if self.empty_epoch:
+            return
         if self.activation is not None:
             self.quack_gemm_act(
                 x,
@@ -837,15 +871,41 @@ def make_cpu_scatter_metadata_storage(torch, scatter_row_addresses, route_weight
     return storage, addresses, weights
 
 
+class EmptyDownInputs:
+    """Down projection state on a rank receiving zero expert assignments."""
+
+    wave_work_ids = None
+    scatter_table = None
+    wave_ready_host_address = None
+
+    def __init__(self, torch, args, exemplar, outputs):
+        self.n_tile_major_tile_n = args.tile_n if args.n_tile_major_output else None
+        self.outputs = outputs if outputs is not None else (exemplar.new_empty((0, args.output_dim)),)
+        self.scatter_output_rows = tuple(0 for _ in self.outputs)
+        self.ready_groups = None
+        if args.gather_table_publish_ready:
+            tiles = math.ceil(args.output_dim / args.tile_n)
+            self.groups = math.ceil(tiles / min(tiles, args.max_swizzle_size))
+            self.wave_ready_prefix = torch.tensor([self.groups], dtype=torch.int32, device=exemplar.device)
+            self.ready_groups = torch.zeros_like(self.wave_ready_prefix)
+
+    def output_buffers(self):
+        return self.outputs
+
+    def zero_up_output(self):
+        for buffer in self.outputs:
+            buffer.zero_()
+
+
 class DownProjectionRunner:
     """Compose QuACK's existing plain grouped-GEMM runner with the up output."""
 
-    def __init__(self, torch, up, counts, options, trace_configure=None):
+    def __init__(self, torch, up, counts, options, trace_configure=None, previous=None):
         # GroupedGemmRunner has already inserted the selected QuACK checkout.
         from run import hopper_pregather_gemm as pregather
 
         routes = sum(counts)
-        if len(counts) != up.weights.shape[0] or routes <= 0 or routes > up.output.shape[0]:
+        if len(counts) != up.weights.shape[0] or any(n < 0 for n in counts) or routes > up.output.shape[0]:
             raise ValueError("expert counts do not describe the up-projection output")
         # Reuse QuACK's defaults for internal options outside the exposed subset.
         parser = argparse.ArgumentParser()
@@ -864,7 +924,7 @@ class DownProjectionRunner:
                           down_projection=False, iterations=1, timing_samples=1, warmup=0)
         self.combine = options.local_gpu_combine
         self.output_reset_policy = options.down_output_reset
-        self.cpu_scatter = options.cpu_scatter_preparation
+        self.cpu_scatter = options.cpu_scatter_preparation and routes > 0
         self.cpu_scatter_publication = options.cpu_scatter_publication or "deferred"
         self.cpu_scatter_metadata = None
         self._cpu_scatter_wait = None
@@ -894,29 +954,35 @@ class DownProjectionRunner:
             # allocated source buffers can be mostly empty and have independent
             # capacities; build_scatter_row_addresses validates those below.
             validation_args.multi_buffer_scatter = False
-        pregather.validate_args(validation_args, prepacked=True)
-        self.weights = torch.randn(
-            (len(counts), hidden, output_dim), dtype=up.output.dtype, device=up.output.device
-        )
-        self.weights.mul_(1 / math.sqrt(hidden))
+        if routes:
+            pregather.validate_args(validation_args, prepacked=True)
+        if previous is None:
+            self.weights = torch.randn(
+                (len(counts), hidden, output_dim), dtype=up.output.dtype, device=up.output.device)
+            self.weights.mul_(1 / math.sqrt(hidden))
+        else:
+            self.weights = previous.weights
         # A_idx arrays are padded, but only this expert-contiguous prefix is written.
         external = {}
         if self.combine:
             from quack.gemm import build_scatter_row_addresses
 
             rows = int(up.x_buffers[0].shape[0])
-            outputs = tuple(torch.empty(
-                (math.ceil(output_dim / args.tile_n), rows * args.tile_n)
-                if args.n_tile_major_output else (rows, output_dim),
-                dtype=up.output.dtype, device=up.output.device,
-            ) for _ in up.x_buffers)
-            # Validate every possible destination once, outside iteration timing.
-            flat = torch.arange(len(outputs) * rows, device=up.output.device)
-            all_mapping = torch.stack((flat // rows, flat % rows), dim=1)
-            self.combine_addresses = build_scatter_row_addresses(
-                outputs, all_mapping, reduce=True,
-                tile_n=args.tile_n if args.n_tile_major_output else None,
-            )
+            if previous is None:
+                outputs = tuple(torch.empty(
+                    (math.ceil(output_dim / args.tile_n), rows * args.tile_n)
+                    if args.n_tile_major_output else (rows, output_dim),
+                    dtype=up.output.dtype, device=up.output.device,
+                ) for _ in up.x_buffers)
+                flat = torch.arange(len(outputs) * rows, device=up.output.device)
+                all_mapping = torch.stack((flat // rows, flat % rows), dim=1)
+                self.combine_addresses = build_scatter_row_addresses(
+                    outputs, all_mapping, reduce=True,
+                    tile_n=args.tile_n if args.n_tile_major_output else None)
+            else:
+                # These allocations are also the sources of peer IPC/return descriptors.
+                outputs = previous.inputs.output_buffers()
+                self.combine_addresses = previous.combine_addresses
             self.combine_rows = rows
             self.combine_valid_rows = torch.zeros(
                 len(outputs), dtype=torch.int64, device=up.output.device)
@@ -926,9 +992,11 @@ class DownProjectionRunner:
                 (routes, 2), dtype=torch.int64, device=up.output.device))
         if self.route_weights is not None:
             external["route_weights"] = self.route_weights
-        self.inputs = pregather.prepare_grouped_inputs(
-            args, up.output[:routes], self.weights, counts, **external
-        )
+        if routes:
+            self.inputs = pregather.prepare_grouped_inputs(
+                args, up.output[:routes], self.weights, counts, **external)
+        else:
+            self.inputs = EmptyDownInputs(torch, args, up.output, external.get("output_buffers"))
         if self.cpu_scatter and self.cpu_scatter_publication in ("deferred", "threaded"):
             (self.cpu_scatter_metadata, self.inputs.scatter_row_addresses,
              self.route_weights) = make_cpu_scatter_metadata_storage(
@@ -941,12 +1009,24 @@ class DownProjectionRunner:
             address = trace_configure(self.trace_groups)
             self.inputs.wave_ready_host_address = torch.tensor(
                 [address], dtype=torch.int64, device=up.output.device)
-        self.launch_gemm = pregather.make_launch(args, self.inputs)
+        if routes:
+            self.launch_gemm = pregather.make_launch(args, self.inputs)
+        else:
+            self.publish_empty_down = None
+            if self.inputs.wave_ready_host_address is not None:
+                from empty_down import prepare_empty_down_publisher
+                self.publish_empty_down = prepare_empty_down_publisher(
+                    self.inputs.wave_ready_host_address, self.inputs.groups, torch.cuda.current_stream(up.cuda_device_id))
+            self.launch_gemm = self._complete_empty_down
         self.combine_tile_n = args.tile_n if self.combine and args.n_tile_major_output else None
         self.return_exchange = None
         self.intra_node_combine = None
-        self._trace_first_combine_launch = self.combine
+        self._trace_first_combine_launch = self.combine and previous is None
         self.flops = 2 * routes * hidden * output_dim
+        if previous is not None:
+            self.reset_start, self.reset_end = previous.reset_start, previous.reset_end
+            self.mapping_start, self.gemm_start, self.end = previous.mapping_start, previous.gemm_start, previous.end
+            return
         self.reset_start = torch.cuda.Event(enable_timing=True)
         self.reset_end = torch.cuda.Event(enable_timing=True)
         self.mapping_start = torch.cuda.Event(enable_timing=True)
@@ -972,6 +1052,10 @@ class DownProjectionRunner:
     def warmup(self):
         """Initialize the down CUDA path before any readiness-gated up launch."""
         torch = self.up.torch
+        if isinstance(self.inputs, EmptyDownInputs):
+            self.reset_outputs()
+            torch.cuda.synchronize(self.up.cuda_device_id)
+            return
         print(f"[gpu={self.up.cuda_device_id}] DownGEMM warming up before concurrent iterations", flush=True)
         with torch.inference_mode():
             self.up.output.zero_()
@@ -1012,8 +1096,15 @@ class DownProjectionRunner:
         if self._trace_first_combine_launch:
             print(f"[gpu={self.up.cuda_device_id}] combine startup: {message}", flush=True)
 
+    def _complete_empty_down(self):
+        if self.inputs.ready_groups is None:
+            return
+        self.inputs.ready_groups.fill_(self.inputs.groups)
+        if self.publish_empty_down is not None:
+            self.publish_empty_down(self.up.torch.cuda.current_stream(self.up.cuda_device_id))
+
     def configure_cpu_scatter(self, library, handle):
-        """Register borrowed scatter storage after warmup, before iteration zero."""
+        """Bind the current route's compact maps before native iteration preparation."""
         class Config(ctypes.Structure):
             _fields_ = [(name, ctypes.c_uint64) for name in
                         ("struct_size", "num_sources", "routes", "capacity", "width",
@@ -1085,7 +1176,7 @@ class DownProjectionRunner:
                       "metadata H2D after final gather publication")
         else:
             policy = "scatter batches published before gather readiness"
-        print(f"CPU scatter preparation enabled: compact metadata fixed at setup; {policy}", flush=True)
+        print(f"CPU scatter preparation enabled: compact metadata bound to current routing; {policy}", flush=True)
 
     def wait_cpu_scatter_ready(self, iteration):
         """Join the current native upload after its event record has been submitted.
@@ -1157,10 +1248,10 @@ class DownProjectionRunner:
                 # Include an exposed upload/wakeup gap in mapping_ms. CPU packing
                 # that overlaps dispatch/up remains outside that GPU interval.
                 wait_for_metadata()
-            if self.combine and not self.cpu_scatter:
+            if self.combine and not self.cpu_scatter and not isinstance(self.inputs, EmptyDownInputs):
                 self._log_combine_startup("route mapping begin")
                 self._prepare_combine(self.up.work_table, self.up.a_idx)
-            elif self.route_weights is not None and not self.cpu_scatter:
+            elif self.route_weights is not None and not self.cpu_scatter and not isinstance(self.inputs, EmptyDownInputs):
                 source, index = local_route_positions(
                     self.up.torch, self.up.work_table, len(self.up.a_idx),
                     self.routes, self.combine_n_groups)
@@ -1316,6 +1407,8 @@ def build_proxy_argv(
         generated_args.append(f"--num_experts={args.num_experts}")
     if getattr(args, "pooled_up_gemm", None) is not None:
         generated_args.append(f"--router_pooled_up_gemm_enabled={str(args.pooled_up_gemm).lower()}")
+    if getattr(args, "dynamic_routing", None) is not None:
+        generated_args.append(f"--router_dynamic_routing_enabled={str(args.dynamic_routing).lower()}")
     if args.concurrent_kernel:
         generated_args.extend(
             [
@@ -1581,6 +1674,7 @@ def run_proxy(
         require_proxy_success(library, initialize_status, "proxy initialization")
         initialized = True
         device_buffers.finish_initialization()
+        dynamic_routing_enabled(library, handle, proxy_argv)
         require_proxy_success(library, library.rdma_proxy_run(handle), "proxy run")
         success = True
         return 0
@@ -1608,11 +1702,16 @@ class DownReadyTrace:
         self.read_fn.restype = ctypes.c_int
 
     def configure(self, groups):
+        if hasattr(self, "groups"):
+            if self.groups != groups:
+                raise ValueError("down column group geometry changed between routing generations")
+            return self.address
         self.groups = groups
         address = ctypes.c_size_t()
         require_proxy_success(self.library, self.configure_fn(
             self.handle, groups, ctypes.byref(address)), "configuring down-ready trace")
-        return address.value
+        self.address = address.value
+        return self.address
 
     def read(self, iteration):
         groups = (ctypes.c_int32 * self.groups)()
@@ -1622,6 +1721,46 @@ class DownReadyTrace:
             self.handle, iteration, groups, times, self.groups, ctypes.byref(count)),
             "reading down-ready trace")
         return [(groups[i], times[i]) for i in range(count.value)]
+
+
+def dynamic_routing_enabled(library, handle, proxy_argv):
+    query = getattr(library, "rdma_proxy_dynamic_routing_enabled", None)
+    if query is None:
+        import json
+        # ABI v1 libraries predating this mode silently ignore unknown configuration keys.
+        enabled = False
+        for i, arg in enumerate(proxy_argv):
+            if arg == "--config" or arg.startswith("--config="):
+                path = proxy_argv[i + 1] if arg == "--config" else arg.split("=", 1)[1]
+                enabled = json.loads(Path(path).read_text()).get("router_dynamic_routing_enabled", False)
+        for arg in proxy_argv:
+            if arg.startswith("--router_dynamic_routing_enabled="):
+                enabled = arg.split("=", 1)[1] in ("yes", "1", "true")
+        if enabled:
+            raise RuntimeError("dynamic routing requires rebuilding librdma_cpu_proxy")
+        return False
+    enabled = ctypes.c_int32()
+    query.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32)]
+    query.restype = ctypes.c_int
+    require_proxy_success(library, query(handle, ctypes.byref(enabled)), "querying dynamic router mode")
+    return bool(enabled.value)
+
+
+def prepare_routing(library, handle, iteration):
+    prepare = library.rdma_proxy_prepare_routing
+    prepare.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+    prepare.restype = ctypes.c_int
+    begin = time.perf_counter_ns()
+    status = prepare(handle, iteration)
+    elapsed_ns = time.perf_counter_ns() - begin
+    require_proxy_success(library, status, f"preparing routing generation {iteration}")
+    extents = library.rdma_proxy_get_routing_extents
+    extents.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64)]
+    extents.restype = ctypes.c_int
+    indices, rows = ctypes.c_uint64(), ctypes.c_uint64()
+    require_proxy_success(library, extents(handle, ctypes.byref(indices), ctypes.byref(rows)),
+                          "querying current routing extents")
+    return (indices.value, rows.value), elapsed_ns
 
 
 def run_proxy_with_concurrent_kernel(
@@ -1710,6 +1849,12 @@ def run_proxy_with_concurrent_kernel(
                 "--concurrent-kernel requires a finite, nonzero --num_iterations"
             )
 
+        dynamic = dynamic_routing_enabled(library, handle, proxy_argv)
+        routing_times_ns = []
+        extents = None
+        if dynamic:
+            extents, elapsed = prepare_routing(library, handle, 0)
+            routing_times_ns.append(elapsed)
         grouped_gemm = GroupedGemmRunner(
             torch,
             device_buffers,
@@ -1725,6 +1870,7 @@ def run_proxy_with_concurrent_kernel(
             max_swizzle_size=expert_gemm_max_swizzle_size,
             quack_root=quack_root,
             sm_count=up_sm_count,
+            routing_extents=extents,
         )
         computation_tokens = ctypes.c_uint64()
         require_proxy_success(
@@ -1734,7 +1880,7 @@ def run_proxy_with_concurrent_kernel(
             ),
             "querying GroupedGEMM routed-token count",
         )
-        if computation_tokens.value == 0:
+        if computation_tokens.value == 0 and not dynamic:
             raise RuntimeError("GroupedGEMM has zero meaningful routed tokens")
         hidden_dimension = int(grouped_gemm.x_buffers[0].shape[1])
         kernel_stream = torch.cuda.Stream(device=cuda_device_id)
@@ -1762,7 +1908,8 @@ def run_proxy_with_concurrent_kernel(
                     if down_options.trace_down_ready:
                         print(f"[gpu={cuda_device_id}] Intra-node combine setup/compilation begin",
                               flush=True)
-                    down.intra_node_combine = IntraNodeCombine(return_exchange, down_options)
+                    down.intra_node_combine = IntraNodeCombine(
+                        return_exchange, down_options, dynamic_capacity=down.combine_rows if dynamic else None)
                     if down_options.inter_node_combine:
                         from inter_node_combine import InterNodeCombine
                         if down_options.trace_down_ready:
@@ -1776,13 +1923,7 @@ def run_proxy_with_concurrent_kernel(
                 configure_original_reference(
                     grouped_gemm, down, library, handle, return_exchange,
                     num_experts=num_experts)
-        useful_flops = (
-            2
-            * int(computation_tokens.value)
-            * hidden_dimension
-            * grouped_gemm.gemm_dimension
-        )
-        iteration_throughputs: list[tuple[int, float, float]] = []
+        iteration_throughputs = []
         pipeline_timings: list[tuple[int, float]] = []
         down_timings = []
         down_traces = []
@@ -1819,6 +1960,36 @@ def run_proxy_with_concurrent_kernel(
 
         for iteration in range(num_iterations.value):
             pipeline_started_ns = time.perf_counter_ns()
+            reference_setup_ns = 0
+            if dynamic and iteration:
+                # All GPU and peer readers of the previous generation have retired.
+                # Finish Python's optional checks before the native thread reuses A_idx.
+                torch.cuda.synchronize(cuda_device_id)
+                extents, elapsed = prepare_routing(library, handle, iteration)
+                routing_times_ns.append(elapsed)
+                grouped_gemm.bind_routing(*extents)
+                counts = get_expert_counts(library, handle)
+                computation_tokens.value = sum(counts)
+                if down is not None:
+                    previous = down
+                    down = DownProjectionRunner(torch, grouped_gemm, counts, down_options,
+                                                trace_configure=trace.configure if trace else None,
+                                                previous=previous)
+                    if down.cpu_scatter:
+                        down.configure_cpu_scatter(library, handle)
+                    if down.output_reset_policy == "end-of-iteration" and not down.combine:
+                        down.reset_outputs()
+                    if return_exchange is not None:
+                        return_exchange.bind_down(down)
+                        if down_options.check_projections and down.route_weights is not None:
+                            from projection_validation import configure_original_reference
+                            reference_begin = time.perf_counter_ns()
+                            configure_original_reference(grouped_gemm, down, library, handle, return_exchange,
+                                                         num_experts=num_experts, iteration=iteration)
+                            reference_setup_ns = time.perf_counter_ns() - reference_begin
+                    del previous
+                # All route-dependent setup, including inverse maps, precedes every private stream.
+                torch.cuda.synchronize(cuda_device_id)
 
             def log_startup(message):
                 if iteration == 0 and down is not None and down.combine:
@@ -1892,7 +2063,9 @@ def run_proxy_with_concurrent_kernel(
             # Snapshot existing completion joins before projection validation;
             # append the optional tail reset separately without hiding its cost.
             # Return/combine check flags must also be disabled for performance runs.
-            pipeline_ms = (time.perf_counter_ns() - pipeline_started_ns) / 1e6
+            pipeline_ms = (time.perf_counter_ns() - pipeline_started_ns - reference_setup_ns) / 1e6
+            if dynamic and iteration == 0:
+                pipeline_ms += routing_times_ns[0] / 1e6
             if down_options.check_projections:
                 from projection_validation import check_projections
                 check_projections(torch, grouped_gemm, down, int(computation_tokens.value))
@@ -1918,14 +2091,15 @@ def run_proxy_with_concurrent_kernel(
                 ),
                 f"querying GroupedGEMM timing for iteration {iteration}",
             )
-            if elapsed_ms.value <= 0.0:
+            if elapsed_ms.value <= 0.0 and computation_tokens.value:
                 raise RuntimeError(
                     f"GroupedGEMM iteration {iteration} reported invalid "
                     f"elapsed time {elapsed_ms.value} ms"
                 )
-            effective_tflops = useful_flops / (elapsed_ms.value * 1.0e9)
+            useful_flops = 2 * computation_tokens.value * hidden_dimension * grouped_gemm.gemm_dimension
+            effective_tflops = useful_flops / (max(elapsed_ms.value, 1e-9) * 1.0e9)
             iteration_throughputs.append(
-                (iteration, float(elapsed_ms.value), effective_tflops)
+                (iteration, computation_tokens.value, float(elapsed_ms.value), effective_tflops)
             )
             if down is not None:
                 reset_ms = down.reset_start.elapsed_time(down.reset_end)
@@ -1933,30 +2107,32 @@ def run_proxy_with_concurrent_kernel(
                 down_ms = down.gemm_start.elapsed_time(down.end)
                 # Sum measured stages; excludes host launch gaps between stages.
                 tail_ms = reset_ms + mapping_ms + down_ms
-                down_timings.append((iteration, reset_ms, mapping_ms, down_ms,
+                down_timings.append((iteration, down.flops, reset_ms, mapping_ms, down_ms,
                                      elapsed_ms.value + tail_ms))
 
         commands.put(None)
         coordinator.join()
         coordinator = None
         require_proxy_success(library, library.rdma_proxy_finish(handle), "proxy finish")
-        if down_options.benchmark_ready_up_gemm:
+        if down_options.benchmark_ready_up_gemm and computation_tokens.value:
             from benchmark_ready_up_gemm import benchmark_ready_up_gemm
             kernel_stream.wait_stream(torch.cuda.current_stream(cuda_device_id))
             with torch.cuda.stream(kernel_stream):
                 benchmark_ready_up_gemm(grouped_gemm, int(computation_tokens.value))
+        route_count_label = "" if dynamic else f"useful_routes={computation_tokens.value}, "
         print(
             "GroupedGEMM effective throughput by iteration "
-            f"(useful_routes={computation_tokens.value}, K={hidden_dimension}, "
+            f"({route_count_label}K={hidden_dimension}, "
             f"projection_N={grouped_gemm.gemm_dimension}, "
             f"output_N={expert_gemm_dimension}, activation={activation or 'none'}; "
             "GEMM FLOPs only, timing includes fused activation):",
             flush=True,
         )
-        for iteration, elapsed_value, effective_tflops in iteration_throughputs:
+        for iteration, routes, elapsed_value, effective_tflops in iteration_throughputs:
             print(
                 f"  iteration {iteration}: elapsed_ms={elapsed_value:.4f} "
-                f"effective_throughput={effective_tflops:.2f} TFLOP/s",
+                f"effective_throughput={effective_tflops:.2f} TFLOP/s"
+                + (f" useful_routes={routes}" if dynamic else ""),
                 flush=True,
             )
         print("Complete pipeline host timing (preparation through GPU, return/combine "
@@ -1964,11 +2140,18 @@ def run_proxy_with_concurrent_kernel(
               "checks for performance):", flush=True)
         for iteration, pipeline_ms in pipeline_timings:
             print(f"  pipeline iteration {iteration}: elapsed_ms={pipeline_ms:.4f}", flush=True)
-        for iteration, reset_ms, mapping_ms, down_ms, combined_ms in down_timings:
+        if dynamic:
+            print("Native routing preparation host wall time includes route generation, processing, "
+                  "metadata exchange, local staging and native installation through prepare_routing return. "
+                  "Python compute rebinding follows this interval.", flush=True)
+            for iteration, elapsed in enumerate(routing_times_ns):
+                print(f"  routing node={node_rank} gpu={local_gpu_index} iteration={iteration} "
+                      f"elapsed_us={elapsed / 1000:.3f}", flush=True)
+        for iteration, flops, reset_ms, mapping_ms, down_ms, combined_ms in down_timings:
             print(f"  down iteration {iteration}: reset_ms={reset_ms:.4f} "
                   f"mapping_ms={mapping_ms:.4f} "
                   f"gemm_ms={down_ms:.4f} "
-                  f"effective_throughput={down.flops / (max(down_ms, 1e-9) * 1e9):.2f} TFLOP/s "
+                  f"effective_throughput={flops / (max(down_ms, 1e-9) * 1e9):.2f} TFLOP/s "
                   f"up_plus_down_ms={combined_ms:.4f}", flush=True)
         if down_options.trace_down_ready:
             print("CPU down-ready trace: detection times since iteration preparation "
@@ -2030,6 +2213,8 @@ def main() -> int:
         help="override GEMM, return, and combine options; run only proxy dispatch/forwarding",
     )
     parser.add_argument("--num-experts", "--num_experts", type=int)
+    parser.add_argument("--dynamic-routing", action=argparse.BooleanOptionalAction, default=None,
+                        help="regenerate, exchange and stage routing before each iteration")
     parser.add_argument("--gemm-arch", choices=("auto", "hopper", "blackwell"), default="auto",
                         help="resolve GEMM/table geometry before native initialization; explicit values are checked against the GPU")
     parser.add_argument("--check-projections", action=argparse.BooleanOptionalAction, default=False,

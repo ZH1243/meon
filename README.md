@@ -40,6 +40,8 @@ For a larger single-node run, the [annotated parameter example](docs/features.md
 
 On Hopper, add `--pooled-up-gemm` to stream up GEMM from a contiguous receive pool. The default gathers from multiple buffers. The [H200 validation and timing commands](docs/development.md#pooled-up-gemm-on-h200) cover one and two nodes, including a same-pool kernel comparison.
 
+Add `--router_dynamic_routing_enabled=true` to the matching launchers to regenerate routing, exchange metadata and stage inputs before each payload iteration. The [per-iteration routing guide](docs/development.md#per-iteration-routing) covers the extra metadata QP, compute views and numerical checks.
+
 ## Directory map
 
 | Path | Responsibility |

@@ -59,6 +59,8 @@ set(RDMA_PROXY_SOURCES
   native/src/rdma_connection.cpp
   native/src/rdma_context.cpp
   native/src/router_routing.cpp
+  native/src/iteration_routing.cpp
+  native/src/iteration_routing_transport.cpp
 )
 
 if(RDMA_PROXY_HAVE_CUDA)
@@ -67,6 +69,7 @@ if(RDMA_PROXY_HAVE_CUDA)
   set_source_files_properties(${EXPERT_TOKEN_IDX_KERNEL_SOURCE}
     PROPERTIES COMPILE_DEFINITIONS EXPERT_TOKEN_IDX_STANDALONE=1)
   list(APPEND RDMA_PROXY_SOURCES native/src/cuda_kernels.cu ${EXPERT_TOKEN_IDX_KERNEL_SOURCE})
+  list(APPEND RDMA_PROXY_SOURCES native/src/iteration_metadata_exchange.cu)
 endif()
 
 add_library(rdma_cpu_proxy_lib STATIC ${RDMA_PROXY_SOURCES})
@@ -121,6 +124,19 @@ target_link_libraries(rdma_cpu_proxy_shared PRIVATE rdma_cpu_proxy_lib)
 
 if(RDMA_PROXY_BUILD_TESTS)
   enable_testing()
+
+  add_executable(test_iteration_routing tests/native/test_iteration_routing.cpp)
+  target_link_libraries(test_iteration_routing PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_iteration_routing COMMAND test_iteration_routing)
+  set_tests_properties(test_iteration_routing PROPERTIES TIMEOUT 30)
+  add_executable(test_iteration_metadata_cuda tests/native/test_iteration_metadata_cuda.cpp)
+  target_link_libraries(test_iteration_metadata_cuda PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_iteration_metadata_cuda COMMAND test_iteration_metadata_cuda)
+  set_tests_properties(test_iteration_metadata_cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
+  add_executable(test_dynamic_gather tests/native/test_dynamic_gather.cpp)
+  target_link_libraries(test_dynamic_gather PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_dynamic_gather COMMAND test_dynamic_gather)
 
   add_executable(test_forwarding_rounds tests/native/test_forwarding_rounds.cpp)
   target_include_directories(test_forwarding_rounds PRIVATE native/include)
@@ -222,6 +238,10 @@ if(RDMA_PROXY_BUILD_TESTS)
   set_tests_properties(test_forward_events PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
 
   add_executable(test_prepared_forwarding tests/native/test_prepared_forwarding.cpp)
+  add_executable(test_dynamic_forwarding tests/native/test_dynamic_forwarding.cpp)
+  target_link_libraries(test_dynamic_forwarding PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_dynamic_forwarding COMMAND test_dynamic_forwarding)
+  set_tests_properties(test_dynamic_forwarding PROPERTIES TIMEOUT 60)
   target_link_libraries(test_prepared_forwarding PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_prepared_forwarding COMMAND test_prepared_forwarding)
   set_tests_properties(test_prepared_forwarding PROPERTIES TIMEOUT 120)

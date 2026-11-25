@@ -141,6 +141,28 @@ RDMA_PROXY_GEMM_ARCH=hopper MASTER_ADDR=127.0.0.1 \
 
 The launcher enables expert waves, the wave barrier, readiness publication and the additive `bulk_rows_reduce` epilogue. Expert waves alone determine the order of work. Enabling the wave barrier on Hopper requires ping-pong, and the worker selects it automatically if you omit `--down-pingpong`. QuACK rejects the four Blackwell shared-memory and store-warp tuning flags on Hopper. With 74 down SMs, down cluster M=1 and six combine CTAs, the standard guard requires at least 80 visible SMs. [Parameter descriptions](features.md#reading-a-single-node-command)
 
+### Per-iteration routing
+
+Build the native library from the same checkout on both hosts and use the matching Python worker. In the two-node profile, one persistent C++ metadata worker per GPU generates a fresh top-k table, exchanges per-source records and stages the input into the runtime's local receive slice. Each same-index GPU pair has one additional bidirectional RC connection for metadata, separate from the configured payload QPs. The single-node path uses local CUDA IPC. The feature is off by default.
+
+Run these commands concurrently from the repository root on the corresponding Hopper hosts, with the environment and network settings in the two-node quick start. A small workload and projection checks exercise changed routes through both projections, return and combine.
+
+```bash
+# Node 0
+bash scripts/run_node0_torchrun.sh --router_dynamic_routing_enabled=true --num_iterations=5 --num_tokens=1024 --check-projections
+
+# Node 1
+bash scripts/run_node1_torchrun.sh --router_dynamic_routing_enabled=true --num_iterations=5 --num_tokens=1024 --check-projections
+```
+
+Single-node coverage uses `bash scripts/run_single_node_torchrun.sh --router_dynamic_routing_enabled=true --num_iterations=5 --num_tokens=1024 --check-projections`. Add `--weighted-contributions` on all participating ranks for FP32 route-weight coverage. For a workload comparison use the same shape and configuration on both runs, then toggle the routing flag. Changing just an iteration count or seed in a fixed-routing run does not exercise metadata replacement.
+
+The source seed for zero-based iteration `i` is `router_seed + 0x9e3779b97f4a7c15 * (i * world_size + global_source_rank)`, modulo 2^64. Runtime setup owns the metadata arenas and peer connections. The metadata worker launches the local gather on a separate CUDA stream so it can overlap exchange. It waits for both before releasing the payload phase. The current source lists, inbound masks and valid lengths feed that iteration’s consumers. Forwarding publishes GEMM descriptors as payloads become visible. The standalone exchange benchmark ends before installing the runtime's forward plan, GEMM views and return mappings, so its end-to-end time has a different endpoint.
+
+The torchrun worker also accepts `--dynamic-routing`. At the end of a concurrent run, each rank prints `routing node=… gpu=… iteration=… elapsed_us=…`. This is host wall time from entry to return of `rdma_proxy_prepare_routing`, including generation, exchange, staging and native installation. Python then binds the new compute views. Iteration zero includes first-use allocation of route and scheduler storage. The separate `pipeline iteration … elapsed_ms=…` line includes payload and compute. The runtime uses the shared raw CUDA routing kernels and metadata QP. The CUDA graph and receiver-kernel options remain specific to the exchange benchmark.
+
+**Validation.** On macOS 15.6.1 arm64 with Apple Clang 14, CPU-only PyTorch 1.13.1 and a Debug build, the runtime native suite passed 43 tests with four CUDA tests skipped. The Python suite passed 69 tests with eight skipped. The shared metadata checks passed all four tests. The CPU exchange benchmark passed its native codec test and 38 Python tests. The GPU exchange benchmark passed its ten host tests. The exact host commands are in [Mac or CPU-only development](#mac-or-cpu-only-development). CUDA compilation, the numerical checks with QuACK, and two-node GPU/RDMA transport and timing still require the Hopper hosts. The production record-layout test runs with `ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R test_iteration_metadata_cuda --output-on-failure` on a CUDA host. Run the dynamic combine tests there with `RDMA_PROXY_TEST_CUDA=1 python -m unittest discover -s tests/python -p test_dynamic_routing.py -v`.
+
 ### Two-node test on Hopper
 
 Start these commands concurrently. The addresses below are the checked-in Hopper profile. If your hosts have different addresses, use node 0's rendezvous address for `MASTER_ADDR` in both shells and the opposite host's proxy address for each `PEER_HOST`.
@@ -273,6 +295,7 @@ The reported standalone H200 result exceeded 700 TFLOP/s with eight logical sour
 
 Local validation used an Apple M1 Max MacBook Pro running macOS 15.6.1, with Python 3.9.19 and CPU PyTorch 2.0.0. Debug CTest passed 40 tests and skipped three CUDA tests. The Python suite reported 70 tests, five CUDA skips and zero failures. These runs covered mock transport, scheduler publication, allocator aliases, weighted scatter and CPU numerical references. The H200 commands above cover the outstanding CUDA IPC, GPUDirect registration, live QuACK and timing checks.
 
+
 ```bash
 cmake -S . -B build/mock -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/mock -j4
@@ -292,6 +315,8 @@ cmake --build build/mock -j4
 ctest --test-dir build/mock --output-on-failure
 ./build/mock/rdma_cpu_proxy --config config/example_config.json --cpu_affinity=none
 python3 -m unittest discover -s tests/python -v
+# Validation on the arm64 Mac used the CPU-PyTorch Python environment.
+# PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -m unittest discover -s tests/python -p 'test_*.py'
 python3 -m unittest discover -s metadata -p test_metadata_cute.py -v
 for f in scripts/*.sh metadata/*.sh benchmarks/*/*.sh; do bash -n "$f" || exit 1; done
 TORCHRUN_BIN=echo bash scripts/run_single_node_torchrun.sh

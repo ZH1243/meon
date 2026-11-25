@@ -1,5 +1,6 @@
 #include "proxy.hpp"
 #include "forwarding_rounds.hpp"
+#include "iteration_routing.hpp"
 
 #include "logging.hpp"
 
@@ -217,6 +218,7 @@ struct Proxy::PreparedForwardingState {
     std::size_t consumed{0};
     std::atomic<bool> failed{false};
     std::atomic<uint64_t> active_iteration{0}; // iteration + 1, 0 before run
+    std::atomic<uint64_t> scanned_iteration{0}; // final metadata read by the preparer
 };
 
 struct Proxy::ForwardingBatchCompletion {
@@ -511,9 +513,14 @@ void Proxy::initialize() {
     metadata_exchange_reports_.clear();
     rdma_bandwidth_reports_.clear();
     initialize_local_iteration_sync();
-    router_routing_.initialize();
+    if (!config_.router_dynamic_routing_enabled) router_routing_.initialize();
     cuda_buffers_.initialize();
-    exchange_router_expert_metadata_all_to_all();
+    if (config_.router_dynamic_routing_enabled) {
+        iteration_routing_ = std::make_unique<IterationRouting>(config_);
+        iteration_routing_->initialize();
+    } else {
+        exchange_router_expert_metadata_all_to_all();
+    }
     rdma_context_.initialize();
     if (!config_.rdma_device_name2.empty()) {
         rdma_context2_ = std::make_unique<RdmaContext>(qp_config(config_.num_qps_per_peer / 2));
@@ -525,6 +532,76 @@ void Proxy::initialize() {
     }
     start_forwarding_thread();
     initialized_ = true;
+}
+
+const RouterRouting& Proxy::active_routing() const {
+    if (!config_.router_dynamic_routing_enabled) return router_routing_;
+    if (!iteration_source_) throw std::runtime_error("iteration routing has not been prepared");
+    return *iteration_source_;
+}
+
+std::shared_lock<std::shared_mutex> Proxy::lock_forwarding_routes() const {
+    std::shared_lock<std::shared_mutex> lock(forwarding_routes_mutex_, std::defer_lock);
+    if (config_.router_dynamic_routing_enabled) lock.lock();
+    return lock;
+}
+
+void Proxy::prepare_routing(uint64_t iteration) {
+    if (!initialized_) throw std::runtime_error("proxy is not initialized");
+    if (!config_.router_dynamic_routing_enabled) return;
+    if (routing_failed_) throw std::runtime_error("iteration routing previously failed");
+    if (iteration != completed_routing_iterations_ ||
+        (config_.num_iterations && iteration >= config_.num_iterations))
+        throw std::runtime_error("iteration routing requires the next consecutive iteration");
+    if (routing_iteration_ == iteration) return;
+    if (iteration_prepared_) throw std::runtime_error("cannot replace routing for a pending iteration");
+
+    try {
+        std::function<void(const RouterRouting&, void*)> stage;
+        if (config_.router_local_input_staging_enabled) {
+            stage = [this](const RouterRouting& route, void* stream) {
+                cuda_buffers_.stage_local_router_input(route.token_indices_for_node(config_.node_rank),
+                                                      route.device_token_indices_for_node(config_.node_rank), stream);
+            };
+        }
+        auto route = iteration_routing_->prepare(iteration, stage);
+        if (!route.source || route.incoming_nodes.size() != peers_.size())
+            throw std::runtime_error("iteration route is missing source or peer metadata");
+        // Last iteration's completion barrier retired all data WRs. Its ready
+        // thread may still be exiting the final scan. Wait before changing
+        // lists or clearing per-chunk CQ counts. The next start barrier gates
+        // the peers before they can issue data WRs against the new plan.
+        std::unique_lock<std::shared_mutex> lock(forwarding_routes_mutex_);
+        for (auto& peer : peers_) {
+            auto& remote = route.incoming_nodes.at(peer.peer_rank);
+            if (remote.token_indices.size() != remote.token_masks.size())
+                throw std::runtime_error("iteration receive x3/x4 length mismatch");
+            peer.receive_chunks = compute_chunks_from_token_indices(remote.token_indices,
+                config_.token_dimension, dtype_size(config_.dtype), config_.tokens_per_chunk,
+                config_.num_qps_per_peer);
+            peer.router_x4 = std::move(remote.token_masks);
+            for (auto& worker : peer.workers) worker->configure_expected_chunks(peer.receive_chunks.size());
+        }
+        iteration_source_ = std::move(route.source);
+        if (config_.nvlink_forwarding_enabled) {
+            cuda_buffers_.install_iteration_expert_metadata(std::move(route.incoming_experts), iteration);
+            prepare_forwarding_routing_tables();
+            prepare_local_forwarding_routing_table();
+            for (std::size_t p = 0; p < peers_.size(); ++p) {
+                forwarding_next_chunk_by_peer_[p] = 0;
+                forwarding_next_batch_by_peer_[p] = 0;
+                forwarding_ready_chunks_by_peer_[p].store(0);
+                forwarding_ready_batches_by_peer_[p].store(0);
+            }
+        }
+        local_router_input_staged_ = config_.router_local_input_staging_enabled;
+        routing_iteration_ = iteration;
+    } catch (...) {
+        // Some peers may already have published the generation. Retrying a
+        // partially installed iteration on this handle would reuse its epoch.
+        routing_failed_ = true;
+        throw;
+    }
 }
 
 const RouterExpertMetadata& Proxy::router_expert_metadata_for_source(
@@ -575,6 +652,7 @@ void Proxy::prepare_iteration_step(uint64_t iteration) {
     if (config_.num_iterations != 0 && iteration >= config_.num_iterations) {
         throw std::runtime_error("proxy iteration index exceeds configured num_iterations");
     }
+    if (config_.router_dynamic_routing_enabled) prepare_routing(iteration);
     if (config_.rdma_qp_calibration_enabled && !rdma_qp_calibration_complete_) {
         calibrate_rdma_qps();
     }
@@ -634,6 +712,10 @@ void Proxy::run_iteration_step(uint64_t iteration) {
     run_iteration(iteration);
     finish_rdma_returns();
     synchronize_iteration(iteration);
+    if (config_.router_dynamic_routing_enabled) {
+        dynamic_payload_active_.store(false);
+        ++completed_routing_iterations_;
+    }
     iteration_prepared_ = false;
 }
 
@@ -687,11 +769,11 @@ void Proxy::wait_cpu_scatter_ready(uint64_t iteration, uintptr_t cuda_stream, ui
 }
 
 const std::vector<int32_t>& Proxy::original_router_experts() const {
-    return router_routing_.original_experts();
+    return active_routing().original_experts();
 }
 
 const std::vector<float>& Proxy::original_router_weights() const {
-    return router_routing_.original_weights();
+    return active_routing().original_weights();
 }
 
 uintptr_t Proxy::configure_down_ready_trace(int groups) {
@@ -735,7 +817,7 @@ std::vector<uint8_t> Proxy::intra_node_source_masks(int source_node) const {
         throw std::runtime_error("invalid intra-node source-mask query");
     const std::vector<uint8_t>* masks = nullptr;
     if (source_node == config_.node_rank) {
-        masks = &router_routing_.token_masks_for_node(source_node);
+        masks = &active_routing().token_masks_for_node(source_node);
     } else {
         for (const auto& peer : peers_)
             if (peer.peer_rank == source_node) masks = &peer.router_x4;
@@ -865,6 +947,17 @@ void Proxy::shutdown() {
     }
     release_rdma_returns();
     peers_.clear();
+    std::exception_ptr routing_error;
+    if (iteration_routing_) {
+        try { iteration_routing_->shutdown(); }
+        catch (...) { routing_error = std::current_exception(); }
+    }
+    iteration_routing_.reset();
+    iteration_source_.reset();
+    routing_iteration_.reset();
+    completed_routing_iterations_ = 0;
+    dynamic_payload_active_.store(false);
+    routing_failed_ = false;
     release_local_iteration_sync();
     iteration_prepared_ = false;
     local_router_input_staged_ = false;
@@ -885,6 +978,7 @@ void Proxy::shutdown() {
         RDMA_PROXY_LOG_INFO(report);
     }
     rdma_bandwidth_reports_.clear();
+    if (routing_error) std::rethrow_exception(routing_error);
     check_forwarding_error();
 }
 
@@ -936,7 +1030,9 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
     peer.remote_recv_mr2 = remote_info.recv_buffer2;
     peer.remote_recv_mr = remote_info.recv_buffer;
     peer.remote_gpu_index = remote_info.gpu_index;
-    if (config_.router_routing_enabled) {
+    // Dynamic receive geometry is installed after this persistent connection
+    // is made, before the corresponding generation's payload start barrier.
+    if (config_.router_routing_enabled && !config_.router_dynamic_routing_enabled) {
         auto remote_router = exchange_router_receive_metadata(peer_addr);
         peer.receive_chunks = compute_chunks_from_token_indices(
             remote_router.token_indices,
@@ -945,7 +1041,7 @@ void Proxy::setup_peer(PeerGpuBuffers& buffers) {
             config_.tokens_per_chunk,
             config_.num_qps_per_peer);
         peer.router_x4 = std::move(remote_router.token_masks);
-    } else {
+    } else if (!config_.router_routing_enabled) {
         peer.receive_chunks = make_chunks();
     }
 
@@ -1450,7 +1546,7 @@ Proxy::LocalIterationSyncSlot* Proxy::local_iteration_sync_slot(int gpu_index) c
 
 void Proxy::initialize_local_iteration_sync() {
     const bool sync_required =
-        config_.local_iteration_sync_enabled || config_.nvlink_forward_local_batch_sync_enabled ||
+        needs_local_payload_start_barrier() || config_.nvlink_forward_local_batch_sync_enabled ||
         config_.rdma_qp_calibration_enabled;
     if (!sync_required || config_.num_gpus_per_node <= 1) return;
     if (local_iteration_sync_header_) return;
@@ -2899,6 +2995,7 @@ void Proxy::run_iteration(uint64_t iteration) {
             peers_[peer_index], peers_[peer_index].receive_chunks));
     }
     synchronize_iteration_start(iteration);
+    if (config_.router_dynamic_routing_enabled) dynamic_payload_active_.store(true);
     std::chrono::steady_clock::time_point start;
     if (config_.router_local_input_early_ready_enabled)
         start = std::chrono::steady_clock::now();
@@ -3082,8 +3179,20 @@ void Proxy::synchronize_iteration(uint64_t iteration) const {
     synchronize_local_iteration_phase("iteration_done", iteration);
 }
 
+bool Proxy::needs_local_payload_start_barrier() const {
+    if (config_.local_iteration_sync_enabled || config_.router_dynamic_routing_enabled) return true;
+    // In the legacy router path, without a local batch barrier a faster GPU
+    // can send next-iteration notifications before a destination resets its
+    // scheduler. The drain protects old records, the start gate new records.
+    return config_.num_iterations != 1 && config_.router_routing_enabled &&
+        config_.nvlink_forward_completion_notifications_enabled &&
+        !config_.nvlink_forward_preparation_enabled && !config_.nvlink_forward_local_batch_sync_enabled;
+}
+
 void Proxy::synchronize_local_iteration_phase(const std::string& phase, uint64_t iteration) const {
-    if (!config_.local_iteration_sync_enabled || config_.num_gpus_per_node <= 1) return;
+    const bool required = phase == "iteration_start" ? needs_local_payload_start_barrier() :
+        config_.local_iteration_sync_enabled || config_.router_dynamic_routing_enabled;
+    if (!required || config_.num_gpus_per_node <= 1) return;
     if (!local_iteration_sync_header_) {
         throw std::runtime_error("local iteration shared memory is not initialized");
     }
@@ -3546,7 +3655,7 @@ std::vector<ChunkDescriptor> Proxy::make_chunks(int peer_rank) const {
             throw std::runtime_error("router chunk construction requires a peer node rank");
         }
         return compute_chunks_from_token_indices(
-            router_routing_.token_indices_for_node(peer_rank),
+            active_routing().token_indices_for_node(peer_rank),
             config_.token_dimension,
             dtype_size(config_.dtype),
             config_.tokens_per_chunk,
@@ -3753,40 +3862,11 @@ void Proxy::start_forwarding_thread() {
     prepare_forwarding_destinations();
     prepare_forwarding_notification_destinations();
     initialize_nvlink_forward_notification_dispatch();
-    if (!config_.nvlink_forward_use_round_robin) {
-        prepare_forwarding_routing_tables();
+    if (!config_.router_dynamic_routing_enabled) {
+        if (!config_.nvlink_forward_use_round_robin) prepare_forwarding_routing_tables();
+        prepare_local_forwarding_routing_table();
     }
-    local_router_forwarding_chunks_.clear();
-    local_router_forwarding_routing_table_.clear();
-    local_router_next_destination_token_.clear();
-    local_router_staging_buffer_ = nullptr;
     local_router_forwarding_completed_iterations_.store(0);
-    if (config_.router_local_input_staging_enabled) {
-        const auto& local_x3 =
-            router_routing_.token_indices_for_node(config_.node_rank);
-        const auto& local_x4 =
-            router_routing_.token_masks_for_node(config_.node_rank);
-        if (local_x3.size() != local_x4.size()) {
-            throw std::runtime_error("local router x3/x4 lengths do not match");
-        }
-        local_router_forwarding_chunks_ = compute_chunks_from_token_indices(
-            local_x3,
-            config_.token_dimension,
-            dtype_size(config_.dtype),
-            config_.tokens_per_chunk,
-            config_.num_qps_per_peer);
-        local_router_forwarding_routing_table_ = normalize_router_x4_for_nvlink(
-            local_x4, config_.num_gpus_per_node);
-        local_router_staging_buffer_ = &cuda_buffers_.nvlink_receive_buffer_for_source(
-            config_.node_rank, config_.local_gpu_index).recv;
-        local_router_next_destination_token_.assign(
-            forwarding_destinations_.size(), 0);
-        RDMA_PROXY_LOG_INFO(
-            "initialized local router forwarding source node=", config_.node_rank,
-            " gpu=", config_.local_gpu_index,
-            " tokens=", local_x3.size(),
-            " chunks=", local_router_forwarding_chunks_.size());
-    }
     for (const auto& dst : forwarding_destinations_) {
         enable_cuda_peer_access(config_.cuda_device_id, dst.cuda_device_id, config_.mock_mode);
     }
@@ -3984,6 +4064,39 @@ void Proxy::stop_forwarding_thread() {
     release_nvlink_forward_notifications();
     destroy_cuda_stream(forwarding_stream_, config_.mock_mode);
     forwarding_stream_ = nullptr;
+}
+
+void Proxy::prepare_local_forwarding_routing_table() {
+    local_router_forwarding_chunks_.clear();
+    local_router_forwarding_routing_table_.clear();
+    local_router_next_destination_token_.clear();
+    local_router_staging_buffer_ = nullptr;
+    if (config_.router_local_input_staging_enabled) {
+        const auto& local_x3 =
+            active_routing().token_indices_for_node(config_.node_rank);
+        const auto& local_x4 =
+            active_routing().token_masks_for_node(config_.node_rank);
+        if (local_x3.size() != local_x4.size()) {
+            throw std::runtime_error("local router x3/x4 lengths do not match");
+        }
+        local_router_forwarding_chunks_ = compute_chunks_from_token_indices(
+            local_x3,
+            config_.token_dimension,
+            dtype_size(config_.dtype),
+            config_.tokens_per_chunk,
+            config_.num_qps_per_peer);
+        local_router_forwarding_routing_table_ = normalize_router_x4_for_nvlink(
+            local_x4, config_.num_gpus_per_node);
+        local_router_staging_buffer_ = &cuda_buffers_.nvlink_receive_buffer_for_source(
+            config_.node_rank, config_.local_gpu_index).recv;
+        local_router_next_destination_token_.assign(
+            forwarding_destinations_.size(), 0);
+        RDMA_PROXY_LOG_INFO(
+            "initialized local router forwarding source node=", config_.node_rank,
+            " gpu=", config_.local_gpu_index,
+            " tokens=", local_x3.size(),
+            " chunks=", local_router_forwarding_chunks_.size());
+    }
 }
 
 void Proxy::prepare_forwarding_routing_tables() {
@@ -4927,7 +5040,7 @@ void Proxy::request_local_router_input_ready(uint64_t iteration) {
     if (marker == requested) return;
     if (local_router_input_early_ready_completed_.load(std::memory_order_acquire) != requested)
         throw std::runtime_error("previous early local input readiness request is still pending");
-    const auto& local_x3 = router_routing_.token_indices_for_node(config_.node_rank);
+    const auto& local_x3 = active_routing().token_indices_for_node(config_.node_rank);
     const auto token_bytes = config_.token_dimension * dtype_size(config_.dtype);
     if (!token_bytes || local_x3.size() > config_.num_tokens ||
         local_x3.size() != local_router_forwarding_routing_table_.size() ||
@@ -5066,7 +5179,8 @@ void Proxy::initialize_prepared_forwarding() {
     } else {
         state.slots.resize(config_.nvlink_forward_prepared_queue_depth);
     }
-    std::size_t max_tokens = 0;
+    // Dynamic routes are installed after persistent IPC/worker startup.
+    std::size_t max_tokens = config_.router_dynamic_routing_enabled ? config_.num_tokens : 0;
     for (const auto& peer : peers_) {
         max_tokens = std::max(max_tokens, forwarding_tokens_for_peer(peer));
     }
@@ -5220,6 +5334,10 @@ void Proxy::prepared_forwarding_ready_loop() {
             }
         }
         if (cancelled()) return;
+        const auto required_count = config_.router_dynamic_routing_enabled ? 1 : iteration + 1;
+        auto routes_lock = lock_forwarding_routes();
+        if (config_.router_dynamic_routing_enabled && routing_iteration_ != iteration)
+            throw std::runtime_error("forwarding activated before installing the iteration routes");
         std::fill(next_chunk.begin(), next_chunk.end(), 0);
         while (!cancelled()) {
             bool all_prepared = true;
@@ -5234,7 +5352,7 @@ void Proxy::prepared_forwarding_ready_loop() {
                                             chunks.size() - next_chunk[p]);
                 bool ready = true;
                 for (std::size_t c = 0; !local && c < count; ++c) {
-                    if (!forwarding_chunk_available(peers_[p], chunks[next_chunk[p] + c], iteration + 1)) {
+                    if (!forwarding_chunk_available(peers_[p], chunks[next_chunk[p] + c], required_count)) {
                         ready = false;
                         break;
                     }
@@ -5300,6 +5418,7 @@ void Proxy::prepared_forwarding_ready_loop() {
                 std::this_thread::sleep_for(std::chrono::microseconds(10));
             }
         }
+        if (config_.router_dynamic_routing_enabled) state.scanned_iteration.store(iteration + 1);
     }
 }
 
@@ -5320,6 +5439,10 @@ void Proxy::ping_pong2_ready_loop() {
         }
         if (cancelled()) return;
         uint64_t ordinal = 0; // Every iteration starts on A, even after an odd tail.
+        const auto required_count = config_.router_dynamic_routing_enabled ? 1 : iteration + 1;
+        auto routes_lock = lock_forwarding_routes();
+        if (config_.router_dynamic_routing_enabled && routing_iteration_ != iteration)
+            throw std::runtime_error("forwarding activated before installing the iteration routes");
         std::fill(next_chunk.begin(), next_chunk.end(), 0);
         while (!cancelled()) {
             bool all_prepared = true;
@@ -5333,7 +5456,7 @@ void Proxy::ping_pong2_ready_loop() {
                                             chunks.size() - next_chunk[p]);
                 bool ready = true;
                 for (std::size_t c = 0; c < count; ++c) {
-                    if (!forwarding_chunk_available(peer, chunks[next_chunk[p] + c], iteration + 1)) {
+                    if (!forwarding_chunk_available(peer, chunks[next_chunk[p] + c], required_count)) {
                         ready = false;
                         break;
                     }
@@ -5378,6 +5501,7 @@ void Proxy::ping_pong2_ready_loop() {
                 std::this_thread::sleep_for(std::chrono::microseconds(10));
             }
         }
+        if (config_.router_dynamic_routing_enabled) state.scanned_iteration.store(iteration + 1);
     }
 }
 
@@ -5808,10 +5932,17 @@ void Proxy::forwarding_ready_loop() {
         const auto peer_order = nvlink_forward_peer_order();
         const bool dynamic_threshold = nvlink_forward_dynamic_threshold_enabled(config_);
         const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config_);
-        const bool finite_iterations = config_.num_iterations != 0;
+        const auto plan_iterations = config_.router_dynamic_routing_enabled ? 1 : config_.num_iterations;
+        const bool finite_iterations = plan_iterations != 0;
 
         while (!forwarding_stop_.load()) {
             check_forwarding_error();
+            auto routes_lock = lock_forwarding_routes();
+            if (config_.router_dynamic_routing_enabled && !dynamic_payload_active_.load()) {
+                routes_lock.unlock();
+                std::this_thread::sleep_for(std::chrono::microseconds(10));
+                continue;
+            }
             bool progressed = false;
             for (const auto peer_index : peer_order) {
                 if (peer_index >= forwarding_ready_peer_count_) {
@@ -5826,9 +5957,9 @@ void Proxy::forwarding_ready_loop() {
                     std::size_t{0} :
                     (forwarding_tokens + forward_threshold_tokens - 1) / forward_threshold_tokens;
                 const auto total_batches = finite_iterations ?
-                    config_.num_iterations * batches_per_iteration : std::size_t{0};
+                    plan_iterations * batches_per_iteration : std::size_t{0};
                 const auto total_chunks = finite_iterations ?
-                    config_.num_iterations * chunks_per_iteration : std::size_t{0};
+                    plan_iterations * chunks_per_iteration : std::size_t{0};
                 if (chunks.empty()) continue;
 
                 if (dynamic_threshold && config_.nvlink_forward_out_of_order_chunks_enabled) {
@@ -5952,7 +6083,7 @@ void Proxy::forwarding_ready_loop() {
                         const uint64_t iteration =
                             static_cast<uint64_t>(next_ready_chunk / chunks_per_iteration);
                         const auto chunk_in_iteration = next_ready_chunk % chunks_per_iteration;
-                        const auto required_count = iteration + 1;
+                        const auto required_count = config_.router_dynamic_routing_enabled ? 1 : iteration + 1;
                         if (!forwarding_chunk_available(
                                 peer,
                                 chunks[chunk_in_iteration],
@@ -5982,13 +6113,14 @@ void Proxy::forwarding_ready_loop() {
                         continue;
                     }
 
-                    const uint64_t iteration = static_cast<uint64_t>(next_batch / batches_per_iteration);
+                    const uint64_t iteration = config_.router_dynamic_routing_enabled ?
+                        *routing_iteration_ : static_cast<uint64_t>(next_batch / batches_per_iteration);
                     const auto batch_in_iteration = next_batch % batches_per_iteration;
                     const auto batch_start_token =
                         batch_in_iteration * forward_threshold_tokens;
                     const auto batch_tokens =
                         std::min(forward_threshold_tokens, forwarding_tokens - batch_start_token);
-                    const auto required_count = iteration + 1;
+                    const auto required_count = config_.router_dynamic_routing_enabled ? 1 : iteration + 1;
 
                     const auto availability_start = std::chrono::steady_clock::now();
                     const bool batch_available = forwarding_batch_available(
@@ -6062,7 +6194,8 @@ void Proxy::forwarding_loop(int lane) {
         const auto peer_order = nvlink_forward_peer_order();
         const bool dynamic_threshold = nvlink_forward_dynamic_threshold_enabled(config_);
         const auto forward_threshold_tokens = effective_nvlink_forward_threshold_tokens(config_);
-        const bool finite_iterations = config_.num_iterations != 0;
+        const auto plan_iterations = config_.router_dynamic_routing_enabled ? 1 : config_.num_iterations;
+        const bool finite_iterations = plan_iterations != 0;
         uint64_t legacy_sync_iteration = std::numeric_limits<uint64_t>::max();
         uint64_t legacy_sync_round = 0;
         auto& local_batch_sync_iteration = forwarding_ping_pong_ ?
@@ -6151,6 +6284,12 @@ void Proxy::forwarding_loop(int lane) {
                     check_forwarding_error();
                 }
             }
+            auto routes_lock = lock_forwarding_routes();
+            if (config_.router_dynamic_routing_enabled && !dynamic_payload_active_.load()) {
+                routes_lock.unlock();
+                std::this_thread::sleep_for(std::chrono::microseconds(10));
+                continue;
+            }
             bool progressed = false;
             for (const auto peer_index : peer_order) {
                 if (peer_index >= forwarding_ready_peer_count_) {
@@ -6164,9 +6303,9 @@ void Proxy::forwarding_loop(int lane) {
                     std::size_t{0} :
                     (forwarding_tokens + forward_threshold_tokens - 1) / forward_threshold_tokens;
                 const auto total_batches = finite_iterations ?
-                    config_.num_iterations * batches_per_iteration : std::size_t{0};
+                    plan_iterations * batches_per_iteration : std::size_t{0};
                 const auto total_chunks = finite_iterations ?
-                    config_.num_iterations * chunks_per_iteration : std::size_t{0};
+                    plan_iterations * chunks_per_iteration : std::size_t{0};
                 if (chunks.empty()) continue;
 
                 if (dynamic_threshold && config_.nvlink_forward_out_of_order_chunks_enabled) {
@@ -6314,10 +6453,11 @@ void Proxy::forwarding_loop(int lane) {
                         continue;
                     }
 
-                    const uint64_t iteration = static_cast<uint64_t>(next_chunk / chunks_per_iteration);
+                    const uint64_t iteration = config_.router_dynamic_routing_enabled ?
+                        *routing_iteration_ : static_cast<uint64_t>(next_chunk / chunks_per_iteration);
                     const auto chunk_in_iteration = next_chunk % chunks_per_iteration;
-                    const auto iteration_end_chunk =
-                        (static_cast<std::size_t>(iteration) + 1) * chunks_per_iteration;
+                    const auto iteration_end_chunk = config_.router_dynamic_routing_enabled ?
+                        chunks_per_iteration : (static_cast<std::size_t>(iteration) + 1) * chunks_per_iteration;
                     const auto ready_chunks =
                         forwarding_ready_chunks_by_peer_[peer_index].load();
                     if (next_chunk >= ready_chunks) {
@@ -6409,7 +6549,8 @@ void Proxy::forwarding_loop(int lane) {
                         continue;
                     }
 
-                    const uint64_t iteration = static_cast<uint64_t>(next_batch / batches_per_iteration);
+                    const uint64_t iteration = config_.router_dynamic_routing_enabled ?
+                        *routing_iteration_ : static_cast<uint64_t>(next_batch / batches_per_iteration);
                     const auto batch_in_iteration = next_batch % batches_per_iteration;
                     const auto batch_start_token =
                         batch_in_iteration * forward_threshold_tokens;
@@ -6479,6 +6620,8 @@ void Proxy::forwarding_loop(int lane) {
 
 void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
     if (!config_.nvlink_forwarding_enabled) return;
+    const auto plan_iterations = config_.router_dynamic_routing_enabled ? std::size_t{1} :
+        static_cast<std::size_t>(iteration + 1);
     const bool dynamic_threshold = config_.nvlink_forward_preparation_enabled ||
         nvlink_forward_dynamic_threshold_enabled(config_);
     const bool out_of_order_chunks =
@@ -6499,7 +6642,7 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
             std::lock_guard<std::mutex> lock(forwarding_mutex_);
             if (out_of_order_chunks) {
                 for (std::size_t i = 0; i < forwarding_ready_peer_count_; ++i) {
-                    const auto required_chunks = static_cast<std::size_t>(iteration + 1) *
+                    const auto required_chunks = plan_iterations *
                         peers_[i].receive_chunks.size();
                     if (forwarding_out_of_order_issued_chunks_by_peer_[i].load() < required_chunks) {
                         complete = false;
@@ -6508,7 +6651,7 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
                 }
             } else if (dynamic_threshold) {
                 for (std::size_t i = 0; i < forwarding_next_chunk_by_peer_.size(); ++i) {
-                    const auto required_chunks = static_cast<std::size_t>(iteration + 1) *
+                    const auto required_chunks = plan_iterations *
                         peers_[i].receive_chunks.size();
                     if (forwarding_next_chunk_by_peer_[i] < required_chunks) {
                         complete = false;
@@ -6521,7 +6664,7 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
                     const auto peer_batches = forwarding_tokens == 0 ? std::size_t{0} :
                         (forwarding_tokens + forward_threshold_tokens - 1) / forward_threshold_tokens;
                     const auto required_batches =
-                        static_cast<std::size_t>(iteration + 1) * peer_batches;
+                        plan_iterations * peer_batches;
                     if (forwarding_next_batch_by_peer_[i] < required_batches) {
                         complete = false;
                         break;
@@ -6529,6 +6672,8 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
                 }
             }
         }
+        if (config_.router_dynamic_routing_enabled && prepared_forwarding_ &&
+            prepared_forwarding_->scanned_iteration.load() < iteration + 1) complete = false;
         if (config_.nvlink_forward_local_staging_prepared_enabled &&
             local_router_forwarding_completed_iterations_.load() < iteration + 1) complete = false;
         if (complete && (config_.nvlink_forward_ping_pong_enabled || config_.nvlink_forward_ping_pong2_enabled ||
@@ -6546,7 +6691,10 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
             mark_local_nvlink_batch_phase_complete(
                 LocalNvlinkBatchSyncPhase::kRemoteForwarding,
                 iteration);
-            if (config_.nvlink_forward_ping_pong_enabled || config_.nvlink_forward_preparation_enabled ||
+            // The next prepare clears expert frontiers. Legacy forwarding
+            // also owes the receiver its previous-generation completions.
+            if ((config_.router_routing_enabled && config_.nvlink_forward_completion_notifications_enabled) ||
+                config_.nvlink_forward_ping_pong_enabled || config_.nvlink_forward_preparation_enabled ||
                 forwarding_rounds_ || config_.nvlink_forward_notification_scheduling_diagnostics) {
                 drain_forwarding_iteration_notifications(iteration);
             }
@@ -6620,7 +6768,7 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
             std::lock_guard<std::mutex> lock(forwarding_mutex_);
             if (out_of_order_chunks) {
                 for (std::size_t i = 0; i < forwarding_ready_peer_count_; ++i) {
-                    const auto required_chunks = static_cast<std::size_t>(iteration + 1) *
+                    const auto required_chunks = plan_iterations *
                         peers_[i].receive_chunks.size();
                     out << " peer" << peers_[i].peer_rank
                         << "_issued_chunks=" << forwarding_out_of_order_issued_chunks_by_peer_[i].load()
@@ -6628,7 +6776,7 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
                 }
             } else if (dynamic_threshold) {
                 for (std::size_t i = 0; i < forwarding_next_chunk_by_peer_.size(); ++i) {
-                    const auto required_chunks = static_cast<std::size_t>(iteration + 1) *
+                    const auto required_chunks = plan_iterations *
                         peers_[i].receive_chunks.size();
                     out << " peer" << peers_[i].peer_rank
                         << "_chunks=" << forwarding_next_chunk_by_peer_[i]
@@ -6640,7 +6788,7 @@ void Proxy::wait_for_forwarding_iteration(uint64_t iteration) {
                     const auto peer_batches = forwarding_tokens == 0 ? std::size_t{0} :
                         (forwarding_tokens + forward_threshold_tokens - 1) / forward_threshold_tokens;
                     const auto required_batches =
-                        static_cast<std::size_t>(iteration + 1) * peer_batches;
+                        plan_iterations * peer_batches;
                     out << " peer" << peers_[i].peer_rank
                         << "_batches=" << forwarding_next_batch_by_peer_[i]
                         << "/" << required_batches;

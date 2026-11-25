@@ -25,6 +25,9 @@ class RegisterIntraNodeKernel(_CombineKernel):
     # (token start, token count, first active buffer, active buffer count).
     # None retains the original scan, also used by inter-node combine.
     input_domains = None
+    dynamic_strides = False
+    dynamic_domain_capacity = None
+    domain_peers = 0
 
     @cute.kernel
     def kernel(self, received: Optional[tuple], rows: cute.Tensor, output: cute.Tensor,
@@ -111,7 +114,12 @@ class RegisterIntraNodeKernel(_CombineKernel):
                                                    sem="acquire", scope="sys")
                             cancelled = cute.arch.load(cancel_ptr.llvm_ptr, cutlass.Int32,
                                                        sem="acquire", scope="sys")
-                    if cancelled == 0:
+                    valid = cancelled == 0
+                    if cutlass.const_expr(self.dynamic_domain_capacity is not None):
+                        domain_id = token // self.dynamic_domain_capacity
+                        valid = valid & (token % self.dynamic_domain_capacity <
+                                         rows[domain_id * self.domain_peers, rows.shape[1] - 1])
+                    if valid:
                         total.fill(0.0)
                         domains = self.input_domains
                         if cutlass.const_expr(self.input_domains is None):
@@ -130,7 +138,10 @@ class RegisterIntraNodeKernel(_CombineKernel):
                                                 col = column + stripe * lanes * 8
                                                 offset = row * self.hidden + col
                                                 if cutlass.const_expr(self.tile_n > 0):
-                                                    offset = ((col // self.tile_n * self.counts[first_peer + peer] + row)
+                                                    stride = self.counts[first_peer + peer]
+                                                    if cutlass.const_expr(self.dynamic_strides):
+                                                        stride = rows[first_peer + peer, rows.shape[1] - 2]
+                                                    offset = ((col // self.tile_n * stride + row)
                                                               * self.tile_n + col % self.tile_n)
                                                 source = cute.make_tensor(
                                                     received[first_peer + peer].iterator + cute.assume(offset, divby=8),
@@ -154,6 +165,8 @@ class RegisterIntraNodeKernel(_CombineKernel):
                                     output_base = cutlass.Int32(start * self.hidden)
                                     output_row = token - start
                                     output_rows = cutlass.Int32(count)
+                                    if cutlass.const_expr(self.dynamic_domain_capacity is not None):
+                                        output_rows = rows[domain * self.domain_peers, rows.shape[1] - 1]
                             for stripe in cutlass.range_constexpr(vec // 8):
                                 col = column + stripe * lanes * 8
                                 output_offset = (output_base

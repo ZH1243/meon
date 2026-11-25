@@ -24,7 +24,7 @@ class TokenOrderCombine:
     compiled tuple, but tokens without any contribution are still written zero.
     """
 
-    def __init__(self, inputs, token_lists, num_tokens, check=False, ctas=None):
+    def __init__(self, inputs, token_lists, num_tokens, check=False, ctas=None, capacity_buffers=None):
         import torch
         import cuda.bindings.driver as cuda
         import cutlass.cute as cute
@@ -59,12 +59,16 @@ class TokenOrderCombine:
         self.compiled = None
         self.num_ctas = (ctas if ctas is not None else
                          torch.cuda.get_device_properties(first.device).multi_processor_count)
-        active = [i for i, tokens in enumerate(token_lists) if tokens]
+        active = (list(range(len(token_lists))) if capacity_buffers is not None else
+                  [i for i, tokens in enumerate(token_lists) if tokens])
+        if capacity_buffers is not None:
+            # The persistent kernel reads each live packed tile stride after the inverse row list.
+            inverse = [row + [len(tokens), 0] for row, tokens in zip(inverse, token_lists)]
         self.rows = torch.tensor([inverse[i] for i in active], dtype=torch.int32,
                                  device=first.device) if active and num_tokens else torch.full(
                                      (max(1, len(active)), max(1, num_tokens)), -1,
                                      dtype=torch.int32, device=first.device)
-        self.buffers = tuple(inputs[i].view(-1) for i in active)
+        self.buffers = tuple(inputs[i].view(-1) for i in active) if capacity_buffers is None else tuple(capacity_buffers)
         if num_tokens:
             self.arguments = (
                 tuple(from_dlpack(b, assumed_align=16) for b in self.buffers) if active else None,
@@ -77,10 +81,11 @@ class TokenOrderCombine:
             while (tile // vec) % lanes:
                 lanes //= 2
             kernel = RegisterInterNodeKernel(
-                tuple(len(token_lists[i]) for i in active), width, tile,
+                tuple(num_tokens if capacity_buffers is not None else len(token_lists[i]) for i in active), width, tile,
                 self.num_ctas,
                 vec, 256, False, 0)
             kernel.source_tokens = num_tokens
+            kernel.dynamic_strides = capacity_buffers is not None
             kernel.lanes_per_group = lanes
             kernel.prefetch_peers = min(4, max(1, len(active)))
             self.compiled = cute.compile(kernel, *self.arguments,
@@ -101,6 +106,13 @@ class TokenOrderCombine:
         self.elapsed_ms = self.start.elapsed_time(self.end)
         if self.check_enabled:
             self.check()
+
+    def bind_routes(self, inputs, token_lists):
+        """Replace live domains while retaining the registered storage and compiled launch."""
+        inverse = inverse_token_rows(token_lists, self.num_tokens)
+        self.inputs, self.token_lists = tuple(inputs), token_lists
+        self.rows.copy_(self.torch.tensor([row + [len(tokens), 0] for row, tokens in zip(inverse, token_lists)],
+                                          dtype=self.rows.dtype, device=self.rows.device))
 
     def check(self):
         """Independent scatter/add reference, bounded to 4096 output rows."""
@@ -125,6 +137,19 @@ class TokenOrderCombine:
 
 class InterNodeCombine(TokenOrderCombine):
     def __init__(self, combine, options):
+        inputs, token_lists, num_tokens = self._read_routes(combine)
+        capacity_buffers = None
+        if combine.dynamic_capacity is not None:
+            capacity_buffers = tuple(
+                combine.storage_for_node(node) if node == combine.exchange.node
+                else combine.rdma_return.receive_storage[node] for node in combine.nodes)
+        super().__init__(inputs, token_lists, num_tokens, options.check_inter_node_combine,
+                         ctas=options.inter_node_combine_ctas, capacity_buffers=capacity_buffers)
+        print(f"Inter-node combine: CTAs={self.num_ctas}, output={tuple(self.output.shape)} row-major, "
+              "original token order; runs after local combine and any RDMA returns", flush=True)
+
+    @staticmethod
+    def _read_routes(combine):
         exchange = combine.exchange
         query = exchange.library.rdma_proxy_get_outgoing_token_indices
         query.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_uint64),
@@ -146,7 +171,10 @@ class InterNodeCombine(TokenOrderCombine):
             token_lists.append(list(indices))
             inputs.append(combine.outputs[node] if node == exchange.node
                           else combine.rdma_return.received[node])
-        super().__init__(inputs, token_lists, num_tokens, options.check_inter_node_combine,
-                         ctas=options.inter_node_combine_ctas)
-        print(f"Inter-node combine: CTAs={self.num_ctas}, output={tuple(self.output.shape)} row-major, "
-              "original token order; runs after local combine and any RDMA returns", flush=True)
+        return inputs, token_lists, num_tokens
+
+    def refresh_routes(self, combine):
+        inputs, token_lists, num_tokens = self._read_routes(combine)
+        if num_tokens != self.num_tokens:
+            raise ValueError("original token capacity changed during dynamic routing")
+        self.bind_routes(inputs, token_lists)

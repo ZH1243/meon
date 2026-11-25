@@ -29,6 +29,8 @@ class NetworkReturn:
         check.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_char_p, ctypes.c_char_p]
         check.restype = ctypes.c_int
         descriptors = []
+        self.dynamic = getattr(combine, "dynamic_capacity", None) is not None
+        self.receive_storage = {}
         for peer in combine.nodes:
             if peer == exchange.node:
                 continue
@@ -37,16 +39,20 @@ class NetworkReturn:
                 raise ValueError("RDMA return source must have packed N-tile-major layout")
             rows = ctypes.c_uint64()
             exchange.require(query(exchange.handle, peer, ctypes.byref(rows)))
-            storage = torch.empty(max(1, rows.value * combine.width), dtype=source.dtype,
+            capacity = combine.dynamic_capacity if self.dynamic else rows.value
+            storage = torch.empty(max(1, capacity * combine.width), dtype=source.dtype,
                                   device=combine.device)
+            self.receive_storage[peer] = storage
             destination = storage[:rows.value * combine.width].view(
                 combine.width // combine.tile, rows.value, combine.tile)
             # Empty domains still participate in group markers, and need valid MRs.
-            source_storage = source if source.numel() else torch.empty(1, dtype=source.dtype, device=combine.device)
+            source_storage = (combine.storage_for_node(peer) if self.dynamic else
+                              source if source.numel() else torch.empty(1, dtype=source.dtype, device=combine.device))
             self.storage.extend((source_storage, storage))
             self.sources[peer], self.received[peer] = source, destination
             descriptors.append(NetworkReturnBuffer(peer, source_storage.data_ptr(), storage.data_ptr(),
-                                                   source.shape[1], rows.value))
+                                                   combine.dynamic_capacity if self.dynamic else source.shape[1],
+                                                   capacity))
         if not descriptors:
             raise ValueError("RDMA returning requires a remote source node")
         self.descriptors = (NetworkReturnBuffer * len(descriptors))(*descriptors)
@@ -59,6 +65,17 @@ class NetworkReturn:
         self.device_prefix = prefix.value
         print(f"RDMA returns: registered combine outputs, peers={list(self.received)}, "
               f"groups={combine.num_groups}, chunk_bytes={options.rdma_return_chunk_bytes}", flush=True)
+
+    def refresh(self, combine):
+        for peer, storage in self.receive_storage.items():
+            rows = ctypes.c_uint64()
+            self.exchange.require(self.exchange.library.rdma_proxy_get_rdma_return_receive_rows(
+                self.exchange.handle, peer, ctypes.byref(rows)))
+            if rows.value > combine.dynamic_capacity:
+                raise ValueError("reverse RDMA return exceeds its registered capacity")
+            self.sources[peer] = combine.outputs[peer]
+            self.received[peer] = storage[:rows.value * combine.width].view(
+                combine.width // combine.tile, rows.value, combine.tile)
 
     @staticmethod
     def digest(tensor):

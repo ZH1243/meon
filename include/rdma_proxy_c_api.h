@@ -14,13 +14,16 @@ extern "C" {
 #define RDMA_PROXY_C_API
 #endif
 
-/* Optional CPU scatter setup, after initialization and before iteration zero.
+/* Optional CPU scatter setup. Fixed routing binds this once before iteration zero.
+ * Dynamic routing binds this after prepare_routing and before prepare_iteration
+ * for each nonempty generation. Previous device reads must already have retired.
  * source_pairs is host int32[num_sources,2] in gather input order; output_bases
  * is host uint64[num_sources]. Host outputs are counts[num_sources] and
  * output_to_input[num_sources,capacity] (-1 in unused tails). All host arrays
  * are used synchronously. scatter_addresses is borrowed CUDA int64[routes,2]
  * for tile_n > 0, or int64[routes] for row-major; retain it and output buffers
- * through shutdown. Routing and output allocations must remain fixed.
+ * through their last native use (shutdown for static routing, next successful
+ * routing preparation for dynamic routing).
  */
 typedef struct RdmaProxyCpuScatterConfig {
     uint64_t struct_size;
@@ -42,17 +45,17 @@ RDMA_PROXY_C_API int rdma_proxy_configure_cpu_scatter(
     RdmaProxyHandle* handle, const RdmaProxyCpuScatterConfig* config);
 
 /* Optional weighted CPU scatter setup: call after configure_cpu_scatter and
- * before iteration zero. Borrowed FP32[routes] storage must survive shutdown.
+ * before prepare_iteration. Borrow FP32[routes] for the same lifetime as scatter_addresses.
  * Each selected range is copied once before its gather readiness publication,
  * unless deferred publication is configured below. */
 RDMA_PROXY_C_API int rdma_proxy_configure_cpu_route_weights(
     RdmaProxyHandle* handle, uintptr_t packed_weights, uint64_t routes);
 
 /* Opt-in one-copy CPU metadata publication. Call after scatter and optional
- * weights setup, before iteration zero. scatter_addresses begins a 16-byte
+ * weights setup, before prepare_iteration. scatter_addresses begins a 16-byte
  * aligned borrowed allocation. Its exact size is routes*columns*8 unweighted;
  * weighted storage places FP32[routes] at round_up(scatter_bytes,16), and bytes
- * includes that weight array. Retain the entire allocation through shutdown.
+ * includes that weight array. The whole allocation shares the scatter_addresses lifetime.
  * After final gather-ready publication is enqueued, CPU staging is reconstructed
  * from the completed host gather table, once per M batch. One slab H2D copy and
  * event record then follow on the publication stream.
@@ -63,7 +66,7 @@ RDMA_PROXY_C_API int rdma_proxy_configure_cpu_scatter_deferred(
  * native CPU worker consumes committed host gather prefixes while notification
  * publication continues. It packs each complete M-batch descriptor once, outside
  * notification locks; one slab H2D/event follows final gather submission and all
- * packing. Configure exactly one of deferred/threaded, before iteration zero.
+ * packing. Configure exactly one of deferred/threaded before prepare_iteration.
  * Native shutdown joins the worker and retires its DMA before returning. */
 RDMA_PROXY_C_API int rdma_proxy_configure_cpu_scatter_threaded(
     RdmaProxyHandle* handle, uint64_t bytes);
@@ -79,7 +82,8 @@ RDMA_PROXY_C_API int rdma_proxy_wait_cpu_scatter_ready(
 /* Original source [num_tokens,top_k] assignments, before destination row mapping.
  * Query with both arrays NULL and capacity=0; otherwise copy both host arrays.
  * Weights are normalized FP32 when enabled, exactly one when disabled.
- * These immutable arrays allow references independent of gather/scatter packing. */
+ * These assignments refer to the installed routing generation and allow
+ * references independent of gather/scatter packing. */
 RDMA_PROXY_C_API int rdma_proxy_get_local_router_assignments(
     RdmaProxyHandle* handle, int32_t* experts, float* weights, uint64_t capacity,
     uint64_t* count, uint64_t* num_tokens, uint64_t* top_k);
@@ -166,6 +170,17 @@ RDMA_PROXY_C_API int rdma_proxy_set_device_buffer_allocator(
 RDMA_PROXY_C_API int rdma_proxy_initialize(RdmaProxyHandle* handle);
 RDMA_PROXY_C_API int rdma_proxy_run(RdmaProxyHandle* handle);
 
+/* Optional per-iteration routing. After every reader of the previous iteration
+ * has finished, prepare_routing commits the next routing tables and local
+ * input staging. Repeated preparation of the same pending iteration is a no-op.
+ * prepare_iteration also does this when the caller does not need to bind compute
+ * views first. Use the current logical extents for QuACK launches; the device
+ * allocator supplies stable, capacity-sized backing allocations. */
+RDMA_PROXY_C_API int rdma_proxy_dynamic_routing_enabled(RdmaProxyHandle* handle, int32_t* enabled);
+RDMA_PROXY_C_API int rdma_proxy_prepare_routing(RdmaProxyHandle* handle, uint64_t iteration);
+RDMA_PROXY_C_API int rdma_proxy_get_routing_extents(
+    RdmaProxyHandle* handle, uint64_t* indices_per_source, uint64_t* table_rows);
+
 /* Finite-run iteration control for embedding runtimes that own the main loop. */
 RDMA_PROXY_C_API int rdma_proxy_get_num_iterations(
     RdmaProxyHandle* handle,
@@ -238,6 +253,9 @@ typedef struct RdmaProxyNetworkReturnBuffer {
 } RdmaProxyNetworkReturnBuffer;
 RDMA_PROXY_C_API int rdma_proxy_get_rdma_return_receive_rows(
     RdmaProxyHandle* handle, int32_t peer, uint64_t* rows);
+/* In dynamic mode both descriptor row fields are the registered capacity
+ * (num_tokens); buffer addresses stay fixed. Current routing supplies the
+ * valid send/receive lengths and the packed tile strides per iteration. */
 RDMA_PROXY_C_API int rdma_proxy_configure_rdma_returns(
     RdmaProxyHandle* handle, const RdmaProxyNetworkReturnBuffer* buffers, uint64_t count,
     uint64_t width, uint64_t tile_n, uint64_t group_tiles, uint64_t element_bytes,

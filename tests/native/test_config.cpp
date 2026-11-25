@@ -44,7 +44,20 @@ int main(int argc, char** argv) {
     assert(config.max_in_flight_chunks_per_qp == 4);
     assert(!config.rdma_chunk_per_token_sge_enabled);
     assert(!config.rdma_discontinuous_token_payload_enabled);
-    assert(!config.router_routing_enabled);
+    assert(!config.router_routing_enabled && !config.router_dynamic_routing_enabled);
+    {
+        std::ofstream out("dynamic_router_config.json");
+        out << R"({"num_nodes":1,"num_gpus_per_node":2,"num_tokens":7,"token_dimension":4,"num_experts":2,"top_k":1,
+                   "router_routing_enabled":true,"router_dynamic_routing_enabled":true,"fill_test_data":false,
+                   "nvlink_forwarding_enabled":true,"router_local_input_staging_enabled":true,
+                   "nvlink_forward_completion_notifications_enabled":true,"nvlink_forward_synchronize_batches":true,
+                   "nvlink_forward_threshold_tokens":2,"nvlink_forward_chunk_tokens":2})";
+        out.close();
+        const auto dynamic = rdma_proxy::load_config_file("dynamic_router_config.json");
+        assert(dynamic.router_dynamic_routing_enabled);
+        const char* args[] = {"proxy", "--config", "dynamic_router_config.json", "--router_dynamic_routing_enabled=false"};
+        assert(!rdma_proxy::load_config(4, const_cast<char**>(args)).router_dynamic_routing_enabled);
+    }
     assert(config.router_num_experts == 256);
     assert(config.router_top_k == 8);
     assert(config.router_seed == 1234);

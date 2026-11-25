@@ -4,7 +4,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <future>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -30,6 +33,43 @@ uintptr_t allocate_external_buffer(
     allocations->pointers.push_back(pointer);
     allocations->requests.push_back(*request);
     return reinterpret_cast<uintptr_t>(pointer);
+}
+
+// Exercise the same public sequence used by the Python worker, including
+// prepare_routing followed by implicit preparation inside prepare_iteration.
+void check_dynamic_rank(int gpu, const std::string& run_id, const std::string& profile) {
+    const std::string rank = "--local_gpu_index=" + std::to_string(gpu);
+    const std::string run = "--local_iteration_sync_run_id=" + run_id;
+    const std::string dir = "--nvlink_forward_exchange_dir=/tmp/" + run_id;
+    const char* args[] = {"proxy", "--config", profile.c_str(), "--mock_mode=true", "--cpu_affinity=none",
+        "--num_gpus_per_node=2", "--num_tokens=32", "--token_dimension=8", "--num_experts=4",
+        "--top_k=1", "--num_iterations=3", "--completion_timeout_ms=5000",
+        "--router_computation_kernel_enabled=false", "--router_dynamic_routing_enabled=true",
+        "--log_level=error", rank.c_str(), run.c_str(), dir.c_str()};
+    auto require = [](bool success) {
+        if (!success) throw std::runtime_error(std::string("dynamic routing ABI: ") + rdma_proxy_last_error());
+    };
+    std::unique_ptr<RdmaProxyHandle, decltype(&rdma_proxy_destroy)> owner(
+        rdma_proxy_create(sizeof(args) / sizeof(args[0]), args), rdma_proxy_destroy);
+    auto* handle = owner.get();
+    int32_t enabled = 0;
+    require(handle && rdma_proxy_dynamic_routing_enabled(handle, &enabled) == 0 && enabled == 1);
+    require(rdma_proxy_initialize(handle) == 0);
+    uint64_t indices = 0, table_rows = 0, count = 0, tokens = 0, top_k = 0;
+    require(rdma_proxy_get_routing_extents(handle, &indices, &table_rows) != 0);
+    std::vector<int32_t> previous;
+    for (uint64_t i = 0; i < 3; ++i) {
+        require(rdma_proxy_prepare_routing(handle, i + 1) != 0);
+        require(rdma_proxy_prepare_routing(handle, i) == 0 && rdma_proxy_prepare_routing(handle, i) == 0);
+        require(rdma_proxy_get_routing_extents(handle, &indices, &table_rows) == 0 && indices && table_rows);
+        std::vector<int32_t> experts(32);
+        std::vector<float> weights(32);
+        require(rdma_proxy_get_local_router_assignments(handle, experts.data(), weights.data(), 32,
+                &count, &tokens, &top_k) == 0 && count == 32 && top_k == 1 && experts != previous);
+        previous = std::move(experts);
+        require(rdma_proxy_prepare_iteration(handle, i) == 0 && rdma_proxy_run_iteration(handle, i) == 0);
+    }
+    require(rdma_proxy_finish(handle) == 0 && rdma_proxy_shutdown(handle) == 0);
 }
 
 }  // namespace
@@ -309,6 +349,13 @@ int main(int argc, char** argv) {
         std::cerr << "per-expert C ABI counts or capacity validation failed\n";
         return 1;
     }
+
+    const auto dynamic_run = "dynamic_routing_abi_" + nonce;
+    const auto profile = (std::filesystem::path(argv[1]).parent_path() / "single_node_config.json").string();
+    auto rank0 = std::async(std::launch::async, check_dynamic_rank, 0, dynamic_run, profile);
+    auto rank1 = std::async(std::launch::async, check_dynamic_rank, 1, dynamic_run, profile);
+    rank0.get();
+    rank1.get();
 
     const char* invalid_argv[] = {"rdma_cpu_proxy"};
     if (rdma_proxy_create(1, invalid_argv) != nullptr) {

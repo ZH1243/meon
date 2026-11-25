@@ -207,6 +207,21 @@ Each iteration generates fresh affine R using meon's per-rank seed sequence. The
 
 To compare with the standalone timing table, discard meon iterations 0–19. For each of the remaining 200 iterations take the largest `exchange_staging_us` across all 16 ranks, then compute median and p95 over those 200 samples. Shape, token width, GPU/NIC placement, and rank skew affect the measured values. Inspect `install_us` and `r_ready_to_up_submit_us` when investigating the generator-to-GEMM gap. The first iteration also includes compute setup.
 
+The two-node launchers enable the QuACK down gather table, expert waves and ready publication. With dynamic routing, the worker builds a fresh down schedule from the current expert counts before submitting up-GEMM. Set `QUACK_ROOT` on both hosts to the checkout containing `run.wave_ready.build_expert_wave_schedule`. It packs the four integers in each descriptor into a CPU tensor and tracks each column group's last wave as it orders the descriptors. This work falls within `r_ready_to_up_submit_us`, after the release barrier.
+
+These commands check the schedule on CPU and time construction for node 0, GPU 0 of the 20,480-token H800 run.
+
+```bash
+cd "$QUACK_ROOT"
+python -m pytest --noconftest -q tests/test_wave_ready_prefix.py
+python -m timeit -n 100 -r 5 \
+  -s 'import torch; torch.set_num_threads(1); from run.wave_ready import build_expert_wave_schedule' \
+  -s 'counts = [20394, 20430, 20592, 20392, 20444, 20405, 20549, 20491]' \
+  'build_expert_wave_schedule(counts, cluster_rows=192, num_groups=28, group_size=2, wave_work_ids=124)'
+```
+
+On macOS 15.6.1 arm64 with Python 3.9.12 and CPU PyTorch 1.13.1, a one-thread replay alternated the original QuACK builder at `05e4efc` with the packed builder for 100 measured calls each. Mean host construction time was 20.03 ms and 0.96 ms, respectively. All 24,024 descriptors and 388 ready-prefix values matched. A new two-node H800 profile is needed to measure the resulting change in gather-to-up-GEMM latency.
+
 Host coverage includes a three-epoch, eight-rank mock handoff that checks empty expert lists, distinct local and remote masks, payload destinations, and reuse of staging and metadata buffers. Both launchers passed a 10,240-token worker dry run. The two-node numerical check above, CUDA graph replay, GPUDirect registration and the 300–400 µs timing target still need a hardware run.
 
 ### Two-node test on Hopper

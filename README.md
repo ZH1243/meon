@@ -42,6 +42,8 @@ On Hopper, add `--pooled-up-gemm` to stream up GEMM from a contiguous receive po
 
 Add `--router_dynamic_routing_enabled=true` to the matching launchers to regenerate routing, exchange metadata and stage inputs before each payload iteration. The [per-iteration routing guide](docs/development.md#per-iteration-routing) covers the extra metadata QP, compute views and numerical checks.
 
+For the two-node, eight-GPU-per-node, 128-expert top-8 workload, add `--benchmark-metadata-exchange` to both meon launchers to use the GPU exchange benchmark's seven CuTe kernels, receiver and local gather on every iteration. The worker reports exchange/staging and time to up-GEMM submission separately. [Run and interpret the benchmark backend](docs/development.md#benchmark-metadata-backend)
+
 ## Directory map
 
 | Path | Responsibility |

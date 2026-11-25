@@ -122,6 +122,16 @@ set_target_properties(rdma_cpu_proxy_shared PROPERTIES
 target_include_directories(rdma_cpu_proxy_shared PUBLIC include)
 target_link_libraries(rdma_cpu_proxy_shared PRIVATE rdma_cpu_proxy_lib)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RDMA_PROXY_HAVE_CUDA AND RDMA_PROXY_HAVE_VERBS)
+  add_library(router_metadata_exchange2 SHARED
+    benchmarks/router_metadata_exchange2/native_proxy.cpp
+    benchmarks/router_metadata_exchange2/exchange.cu)
+  set_target_properties(router_metadata_exchange2 PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+  target_include_directories(router_metadata_exchange2 PRIVATE ${IBVERBS_INCLUDE_DIR})
+  target_link_libraries(router_metadata_exchange2 PRIVATE rdma_cpu_proxy_lib ${IBVERBS_LIBRARY} rt)
+  add_dependencies(rdma_cpu_proxy_shared router_metadata_exchange2)
+endif()
+
 if(RDMA_PROXY_BUILD_TESTS)
   enable_testing()
 
@@ -129,6 +139,10 @@ if(RDMA_PROXY_BUILD_TESTS)
   target_link_libraries(test_iteration_routing PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_iteration_routing COMMAND test_iteration_routing)
   set_tests_properties(test_iteration_routing PROPERTIES TIMEOUT 30)
+  add_executable(test_benchmark_routing tests/native/test_benchmark_routing.cpp)
+  target_link_libraries(test_benchmark_routing PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_benchmark_routing COMMAND test_benchmark_routing)
+  set_tests_properties(test_benchmark_routing PROPERTIES TIMEOUT 90)
   add_executable(test_iteration_metadata_cuda tests/native/test_iteration_metadata_cuda.cpp)
   target_link_libraries(test_iteration_metadata_cuda PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_iteration_metadata_cuda COMMAND test_iteration_metadata_cuda)

@@ -159,9 +159,55 @@ Single-node coverage uses `bash scripts/run_single_node_torchrun.sh --router_dyn
 
 The source seed for zero-based iteration `i` is `router_seed + 0x9e3779b97f4a7c15 * (i * world_size + global_source_rank)`, modulo 2^64. Runtime setup owns the metadata arenas and peer connections. The metadata worker launches the local gather on a separate CUDA stream so it can overlap exchange. It waits for both before releasing the payload phase. The current source lists, inbound masks and valid lengths feed that iteration’s consumers. Forwarding publishes GEMM descriptors as payloads become visible. The standalone exchange benchmark ends before installing the runtime's forward plan, GEMM views and return mappings, so its end-to-end time has a different endpoint.
 
-The torchrun worker also accepts `--dynamic-routing`. At the end of a concurrent run, each rank prints `routing node=… gpu=… iteration=… elapsed_us=…`. This is host wall time from entry to return of `rdma_proxy_prepare_routing`, including generation, exchange, staging and native installation. Python then binds the new compute views. Iteration zero includes first-use allocation of route and scheduler storage. The separate `pipeline iteration … elapsed_ms=…` line includes payload and compute. The runtime uses the shared raw CUDA routing kernels and metadata QP. The CUDA graph and receiver-kernel options remain specific to the exchange benchmark.
+The torchrun worker also accepts `--dynamic-routing`. At the end of a concurrent run, each rank prints `routing node=… gpu=… iteration=… elapsed_us=…`. This is host wall time from entry to return of `rdma_proxy_prepare_routing`, including generation, exchange, staging and native installation. Python then binds the new compute views. Iteration zero includes first-use allocation of route and scheduler storage. The separate `pipeline iteration … elapsed_ms=…` line includes payload and compute. With `--dynamic-routing` alone, the runtime uses the shared raw CUDA routing kernels and its native metadata worker.
 
-**Validation.** On macOS 15.6.1 arm64 with Apple Clang 14, CPU-only PyTorch 1.13.1 and a Debug build, the runtime native suite passed 43 tests with four CUDA tests skipped. The Python suite passed 69 tests with eight skipped. The shared metadata checks passed all four tests. The CPU exchange benchmark passed its native codec test and 38 Python tests. The GPU exchange benchmark passed its ten host tests. The exact host commands are in [Mac or CPU-only development](#mac-or-cpu-only-development). CUDA compilation, the numerical checks with QuACK, and two-node GPU/RDMA transport and timing still require the Hopper hosts. The production record-layout test runs with `ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R test_iteration_metadata_cuda --output-on-failure` on a CUDA host. Run the dynamic combine tests there with `RDMA_PROXY_TEST_CUDA=1 python -m unittest discover -s tests/python -p test_dynamic_routing.py -v`.
+**Validation.** On macOS 15.6.1 arm64 with Apple Clang 14, CPU-only PyTorch 1.13.1 and a Debug build, the runtime native suite passed 44 tests with four CUDA tests skipped. The Python suite passed 82 tests with eight skipped. The shared metadata checks passed all four tests. The CPU exchange benchmark passed its native codec test and all 38 Python tests on rerun after one loopback TCP timeout. The GPU exchange benchmark passed its ten host tests. The exact host commands are in [Mac or CPU-only development](#mac-or-cpu-only-development). CUDA compilation, the numerical checks with QuACK, and two-node GPU/RDMA transport and timing still require the Hopper hosts. The production record-layout test runs with `ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R test_iteration_metadata_cuda --output-on-failure` on a CUDA host. Run the dynamic combine tests there with `RDMA_PROXY_TEST_CUDA=1 python -m unittest discover -s tests/python -p test_dynamic_routing.py -v`.
+
+### Benchmark metadata backend
+
+From the meon root, build on both hosts using the Hopper environment above. The CUDA and verbs build produces `librouter_metadata_exchange2.so` alongside `librdma_cpu_proxy.so`. The worker imports CuTe DSL and CUDA Python from the same environment used for the GPU exchange benchmark. An alternate build of the matching benchmark library can be selected with `MEON_BENCHMARK_METADATA_LIBRARY`.
+
+```bash
+cmake -S . -B build-hopper -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=90 \
+  -DRDMA_PROXY_REQUIRE_CUDA=ON -DRDMA_PROXY_REQUIRE_VERBS=ON
+cmake --build build-hopper --target rdma_cpu_proxy_shared -j4
+```
+
+Use `--benchmark-metadata-exchange` on all ranks. The receiver requires eight visible, peer-accessible GPUs with native P2P atomics per host and CUDA ordinal equal to local rank. The meon launcher supplies 128 experts, top-8, unweighted routes and a NIC for each GPU. Each same-index pair across hosts opens one metadata RC QP on its primary NIC during setup. A persistent C++ worker per GPU drives the benchmark exchange. Gloo coordinates setup, arrival and buffer reuse. The expert records and remote x3/x4 travel over the benchmark's GPU IPC and RDMA paths.
+
+First run a small numerical check, starting the two commands concurrently in the corresponding host shells.
+
+```bash
+# Node 0
+bash scripts/run_node0_torchrun.sh --benchmark-metadata-exchange --num_tokens=1024 --num_iterations=3 --check-projections
+# Node 1
+bash scripts/run_node1_torchrun.sh --benchmark-metadata-exchange --num_tokens=1024 --num_iterations=3 --check-projections
+```
+
+For the 10,240-token experiment, use the following arguments on both hosts. The payload, up/down GEMMs and return/combine stages still execute. The four switches disable the launcher's downstream numerical checks for the timing run.
+
+```bash
+args=(--benchmark-metadata-exchange --num_tokens=10240 --num_iterations=220
+      --no-check-return-token-results --no-check-intra-node-combine
+      --no-check-rdma-return-token-results --no-check-inter-node-combine)
+# Node 0
+bash scripts/run_node0_torchrun.sh "${args[@]}"
+# Node 1, with the same args array
+bash scripts/run_node1_torchrun.sh "${args[@]}"
+```
+
+Each iteration generates fresh affine R using meon's per-rank seed sequence. The backend runs the benchmark's captured metadata graph with its native launch barrier, direct x3/x4 output, overlapping receiver and local staging after the receiver. The gather writes directly into meon's own input slice. After the benchmark worker completes, the native runtime copies the source records and local route arrays, rebuilds its forward plan and publishes the new index lists. Python binds the current compute views before up-GEMM submission.
+
+| Per-rank field | Host wall interval |
+| --- | --- |
+| `exchange_staging_us` | Aligned submission through benchmark wait completion, including the seven kernels, GPU exchange, RDMA and local gather. This matches the standalone benchmark's end-to-end timing boundary. |
+| `install_us` | Benchmark wait return through importing the source views and installing meon's dispatch and gather metadata. |
+| `r_ready_to_up_submit_us` | Fresh R completed through host return from up-GEMM submission, including alignment, installation, rank release and compute setup. Available for compute iterations that submit work. Use a GPU trace to measure the actual kernel start. |
+| `generation_us`, `reuse_barrier_us`, `release_barrier_us` | Route generation, the world alignment before submission, and the world release after installation. |
+
+To compare with the standalone timing table, discard meon iterations 0–19. For each of the remaining 200 iterations take the largest `exchange_staging_us` across all 16 ranks, then compute median and p95 over those 200 samples. Shape, token width, GPU/NIC placement, and rank skew affect the measured values. Inspect `install_us` and `r_ready_to_up_submit_us` when investigating the generator-to-GEMM gap. The first iteration also includes compute setup.
+
+Host coverage includes a three-epoch, eight-rank mock handoff that checks empty expert lists, distinct local and remote masks, payload destinations, and reuse of staging and metadata buffers. Both launchers passed a 10,240-token worker dry run. The two-node numerical check above, CUDA graph replay, GPUDirect registration and the 300–400 µs timing target still need a hardware run.
 
 ### Two-node test on Hopper
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+from functools import partial
 import math
 import os
 from pathlib import Path
@@ -284,6 +285,10 @@ class TorchDeviceBuffers:
                 f"expected one {self._KIND_NAMES[kind]} tensor, got {len(tensors)}"
             )
         return tensors[0]
+
+    def benchmark_staging_buffers(self):
+        local_source = (DEVICE_BUFFER_NVLINK_RECEIVE, -1, self.node_rank, self.local_gpu_index)
+        return self.only_tensor_of_kind(DEVICE_BUFFER_RDMA_SEND), self.tensors[local_source]
 
 
 class GroupedGemmRunner:
@@ -1407,8 +1412,16 @@ def build_proxy_argv(
         generated_args.append(f"--num_experts={args.num_experts}")
     if getattr(args, "pooled_up_gemm", None) is not None:
         generated_args.append(f"--router_pooled_up_gemm_enabled={str(args.pooled_up_gemm).lower()}")
-    if getattr(args, "dynamic_routing", None) is not None:
-        generated_args.append(f"--router_dynamic_routing_enabled={str(args.dynamic_routing).lower()}")
+    dynamic = getattr(args, "dynamic_routing", None)
+    if getattr(args, "benchmark_metadata_exchange", None):
+        if dynamic is False:
+            raise ValueError("--benchmark-metadata-exchange requires dynamic routing")
+        dynamic = True
+    if dynamic is not None:
+        generated_args.append(f"--router_dynamic_routing_enabled={str(dynamic).lower()}")
+    if getattr(args, "benchmark_metadata_exchange", None) is not None:
+        generated_args.append(
+            f"--router_benchmark_metadata_enabled={str(args.benchmark_metadata_exchange).lower()}")
     if args.concurrent_kernel:
         generated_args.extend(
             [
@@ -1622,9 +1635,11 @@ def install_python_device_buffers(
 _unclosed_input_pools = []
 
 
-def shutdown_embedded_proxy(library, handle, buffers, initialized, success, return_exchange=None):
+def shutdown_embedded_proxy(library, handle, buffers, initialized, success, return_exchange=None,
+                            benchmark_metadata=None):
     pools = buffers.tensors_of_kind(DEVICE_BUFFER_INPUT_POOL) if buffers is not None else []
     error = None
+    backend_error = None
     try:
         # A partially initialized proxy can already have exported its pool.
         if (initialized or pools) and library.rdma_proxy_shutdown(handle) != 0:
@@ -1632,9 +1647,18 @@ def shutdown_embedded_proxy(library, handle, buffers, initialized, success, retu
             _unclosed_input_pools.extend(pools)
             print(f"proxy shutdown failed: {error}", file=sys.stderr, flush=True)
     finally:
-        library.rdma_proxy_destroy(handle)
+        try:
+            if benchmark_metadata is not None:
+                benchmark_metadata.close(clean=success and error is None)
+        except Exception as exc:
+            backend_error = exc
+            print(f"benchmark metadata shutdown failed: {exc}", file=sys.stderr, flush=True)
+        finally:
+            library.rdma_proxy_destroy(handle)
     if return_exchange is not None:
-        return_exchange.close(success and error is None)
+        return_exchange.close(success and error is None and backend_error is None)
+    if success and backend_error is not None:
+        raise backend_error
     if pools and success and error is not None:
         raise RuntimeError(f"pooled receive teardown failed: {error}")
 
@@ -1655,6 +1679,7 @@ def run_proxy(
 
     initialized = False
     success = False
+    benchmark_metadata = None
     device_buffers: TorchDeviceBuffers | None = None
     try:
         device_buffers = install_python_device_buffers(
@@ -1674,12 +1699,32 @@ def run_proxy(
         require_proxy_success(library, initialize_status, "proxy initialization")
         initialized = True
         device_buffers.finish_initialization()
-        dynamic_routing_enabled(library, handle, proxy_argv)
-        require_proxy_success(library, library.rdma_proxy_run(handle), "proxy run")
+        benchmark_metadata = open_benchmark_metadata(library, handle, proxy_argv, torch, device_buffers)
+        if benchmark_metadata is None:
+            dynamic_routing_enabled(library, handle, proxy_argv)
+            require_proxy_success(library, library.rdma_proxy_run(handle), "proxy run")
+        else:
+            # The external backend supplies the route consumed by prepare/run.
+            # The monolithic native loop cannot call back into Python to supply it.
+            iterations = ctypes.c_uint64()
+            require_proxy_success(library, library.rdma_proxy_get_num_iterations(handle, ctypes.byref(iterations)),
+                                  "querying num_iterations")
+            if not iterations.value:
+                raise RuntimeError("benchmark metadata exchange requires a finite, nonzero --num_iterations")
+            for iteration in range(iterations.value):
+                _, elapsed_ns = benchmark_metadata.prepare(iteration, compute_extents=False)
+                require_proxy_success(library, library.rdma_proxy_prepare_iteration(handle, iteration),
+                                      f"preparing proxy iteration {iteration}")
+                require_proxy_success(library, library.rdma_proxy_run_iteration(handle, iteration),
+                                      f"running proxy iteration {iteration}")
+                print_benchmark_routing(node_rank, local_gpu_index, iteration, elapsed_ns,
+                                        benchmark_metadata.last_stats)
+            require_proxy_success(library, library.rdma_proxy_finish(handle), "proxy finish")
         success = True
         return 0
     finally:
-        shutdown_embedded_proxy(library, handle, device_buffers, initialized, success)
+        shutdown_embedded_proxy(library, handle, device_buffers, initialized, success,
+                                benchmark_metadata=benchmark_metadata)
 
 
 class DownReadyTrace:
@@ -1723,27 +1768,57 @@ class DownReadyTrace:
         return [(groups[i], times[i]) for i in range(count.value)]
 
 
-def dynamic_routing_enabled(library, handle, proxy_argv):
-    query = getattr(library, "rdma_proxy_dynamic_routing_enabled", None)
+def optional_router_mode(library, handle, proxy_argv, query_name, config_key, label):
+    query = getattr(library, query_name, None)
     if query is None:
         import json
         # ABI v1 libraries predating this mode silently ignore unknown configuration keys.
         enabled = False
         for i, arg in enumerate(proxy_argv):
-            if arg == "--config" or arg.startswith("--config="):
-                path = proxy_argv[i + 1] if arg == "--config" else arg.split("=", 1)[1]
-                enabled = json.loads(Path(path).read_text()).get("router_dynamic_routing_enabled", False)
+            if arg in ("--config", "-c") or arg.startswith("--config="):
+                path = proxy_argv[i + 1] if arg in ("--config", "-c") else arg.split("=", 1)[1]
+                enabled = json.loads(Path(path).read_text()).get(config_key, False)
         for arg in proxy_argv:
-            if arg.startswith("--router_dynamic_routing_enabled="):
+            if arg.startswith(f"--{config_key}="):
                 enabled = arg.split("=", 1)[1] in ("yes", "1", "true")
         if enabled:
-            raise RuntimeError("dynamic routing requires rebuilding librdma_cpu_proxy")
+            raise RuntimeError(f"{label} requires rebuilding librdma_cpu_proxy")
         return False
     enabled = ctypes.c_int32()
     query.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32)]
     query.restype = ctypes.c_int
-    require_proxy_success(library, query(handle, ctypes.byref(enabled)), "querying dynamic router mode")
+    require_proxy_success(library, query(handle, ctypes.byref(enabled)), f"querying {label}")
     return bool(enabled.value)
+
+
+def dynamic_routing_enabled(library, handle, proxy_argv):
+    return optional_router_mode(library, handle, proxy_argv, "rdma_proxy_dynamic_routing_enabled",
+                                "router_dynamic_routing_enabled", "dynamic routing")
+
+
+def open_benchmark_metadata(library, handle, argv, torch, buffers):
+    if optional_router_mode(library, handle, argv, "rdma_proxy_benchmark_metadata_enabled",
+                            "router_benchmark_metadata_enabled", "benchmark metadata exchange"):
+        from benchmark_metadata_backend import BenchmarkMetadataBackend
+        return BenchmarkMetadataBackend(library, handle, torch, buffers)
+    return None
+
+
+def print_benchmark_routing(node, gpu, iteration, elapsed_ns, stats, up_submitted_ns=None):
+    """All spans are rank-local host wall time. Up submission returns before GPU completion."""
+    print(f"  routing node={node} gpu={gpu} iteration={iteration} elapsed_us={elapsed_ns / 1000:.3f}",
+          flush=True)
+    submit = (f" r_ready_to_up_submit_us={(up_submitted_ns - stats['r_ready_ns']) / 1000:.3f}"
+              if up_submitted_ns is not None else "")
+    print(f"  benchmark_metadata node={node} gpu={gpu} iteration={iteration} "
+          f"phase={'first' if iteration == 0 else 'steady'} "
+          f"generation_us={stats['generation_elapsed_ns'] / 1000:.3f} "
+          f"exchange_staging_us={stats['exchange_staging_elapsed_ns'] / 1000:.3f} "
+          f"install_us={stats['install_elapsed_ns'] / 1000:.3f} "
+          f"r_ready_to_install_us={stats['r_ready_to_install_elapsed_ns'] / 1000:.3f} "
+          f"reuse_barrier_us={stats['reuse_barrier_ns'] / 1000:.3f} "
+          f"release_barrier_us={stats['release_barrier_ns'] / 1000:.3f}{submit}",
+          flush=True)
 
 
 def prepare_routing(library, handle, iteration):
@@ -1812,6 +1887,7 @@ def run_proxy_with_concurrent_kernel(
     device_buffers: TorchDeviceBuffers | None = None
     trace = None
     return_exchange = None
+    benchmark_metadata = None
     success = False
     kernel_stream = None
     down = None
@@ -1849,11 +1925,15 @@ def run_proxy_with_concurrent_kernel(
                 "--concurrent-kernel requires a finite, nonzero --num_iterations"
             )
 
-        dynamic = dynamic_routing_enabled(library, handle, proxy_argv)
+        benchmark_metadata = open_benchmark_metadata(library, handle, proxy_argv, torch, device_buffers)
+        dynamic = benchmark_metadata is not None or dynamic_routing_enabled(library, handle, proxy_argv)
+        prepare_epoch = (benchmark_metadata.prepare if benchmark_metadata is not None
+                         else partial(prepare_routing, library, handle))
         routing_times_ns = []
+        benchmark_timings = []
         extents = None
         if dynamic:
-            extents, elapsed = prepare_routing(library, handle, 0)
+            extents, elapsed = prepare_epoch(0)
             routing_times_ns.append(elapsed)
         grouped_gemm = GroupedGemmRunner(
             torch,
@@ -1965,7 +2045,7 @@ def run_proxy_with_concurrent_kernel(
                 # All GPU and peer readers of the previous generation have retired.
                 # Finish Python's optional checks before the native thread reuses A_idx.
                 torch.cuda.synchronize(cuda_device_id)
-                extents, elapsed = prepare_routing(library, handle, iteration)
+                extents, elapsed = prepare_epoch(iteration)
                 routing_times_ns.append(elapsed)
                 grouped_gemm.bind_routing(*extents)
                 counts = get_expert_counts(library, handle)
@@ -2009,9 +2089,12 @@ def run_proxy_with_concurrent_kernel(
             log_startup("proxy released; up GEMM launch begin")
 
             kernel_error: BaseException | None = None
+            up_submitted_ns = None
             try:
                 with torch.cuda.stream(kernel_stream):
                     grouped_gemm.launch()
+                    if benchmark_metadata is not None and not grouped_gemm.empty_epoch:
+                        up_submitted_ns = time.perf_counter_ns()
                 log_startup("up GEMM launch returned")
                 require_proxy_success(
                     library,
@@ -2083,6 +2166,8 @@ def run_proxy_with_concurrent_kernel(
                     down.finish_iteration()
                 pipeline_ms += (time.perf_counter_ns() - reset_started_ns) / 1e6
             pipeline_timings.append((iteration, pipeline_ms))
+            if benchmark_metadata is not None:
+                benchmark_timings.append((benchmark_metadata.last_stats.copy(), up_submitted_ns))
             elapsed_ms = ctypes.c_float()
             require_proxy_success(
                 library,
@@ -2140,7 +2225,16 @@ def run_proxy_with_concurrent_kernel(
               "checks for performance):", flush=True)
         for iteration, pipeline_ms in pipeline_timings:
             print(f"  pipeline iteration {iteration}: elapsed_ms={pipeline_ms:.4f}", flush=True)
-        if dynamic:
+        if benchmark_metadata is not None:
+            print("Benchmark metadata host timings include route generation and both rank barriers in "
+                  "routing elapsed_us. exchange_staging_us runs from aligned submit through benchmark wait "
+                  "after R is ready, excluding the outer barrier. r_ready_to_up_submit_us starts before "
+                  "alignment and ends at host return from up-GEMM submission. Iteration zero also includes "
+                  "compute setup in this last interval.", flush=True)
+            for iteration, (stats, submitted) in enumerate(benchmark_timings):
+                print_benchmark_routing(node_rank, local_gpu_index, iteration, routing_times_ns[iteration],
+                                        stats, submitted)
+        elif dynamic:
             print("Native routing preparation host wall time includes route generation, processing, "
                   "metadata exchange, local staging and native installation through prepare_routing return. "
                   "Python compute rebinding follows this interval.", flush=True)
@@ -2182,7 +2276,8 @@ def run_proxy_with_concurrent_kernel(
         if coordinator is not None:
             commands.put(None)
             coordinator.join()
-        shutdown_embedded_proxy(library, handle, device_buffers, initialized, success, return_exchange)
+        shutdown_embedded_proxy(library, handle, device_buffers, initialized, success, return_exchange,
+                                benchmark_metadata)
 
 
 def main() -> int:
@@ -2215,6 +2310,8 @@ def main() -> int:
     parser.add_argument("--num-experts", "--num_experts", type=int)
     parser.add_argument("--dynamic-routing", action=argparse.BooleanOptionalAction, default=None,
                         help="regenerate, exchange and stage routing before each iteration")
+    parser.add_argument("--benchmark-metadata-exchange", action=argparse.BooleanOptionalAction, default=None,
+                        help="use the CuTe benchmark metadata exchange and staging backend for dynamic routing")
     parser.add_argument("--gemm-arch", choices=("auto", "hopper", "blackwell"), default="auto",
                         help="resolve GEMM/table geometry before native initialization; explicit values are checked against the GPU")
     parser.add_argument("--check-projections", action=argparse.BooleanOptionalAction, default=False,

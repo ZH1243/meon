@@ -45,6 +45,7 @@ int main(int argc, char** argv) {
     assert(!config.rdma_chunk_per_token_sge_enabled);
     assert(!config.rdma_discontinuous_token_payload_enabled);
     assert(!config.router_routing_enabled && !config.router_dynamic_routing_enabled);
+    assert(!config.router_benchmark_metadata_enabled);
     {
         std::ofstream out("dynamic_router_config.json");
         out << R"({"num_nodes":1,"num_gpus_per_node":2,"num_tokens":7,"token_dimension":4,"num_experts":2,"top_k":1,
@@ -57,6 +58,31 @@ int main(int argc, char** argv) {
         assert(dynamic.router_dynamic_routing_enabled);
         const char* args[] = {"proxy", "--config", "dynamic_router_config.json", "--router_dynamic_routing_enabled=false"};
         assert(!rdma_proxy::load_config(4, const_cast<char**>(args)).router_dynamic_routing_enabled);
+    }
+    {
+        std::ofstream out("benchmark_router_config.json");
+        out << R"({"num_nodes":2,"num_gpus_per_node":8,"num_tokens":17,"token_dimension":4,"num_experts":128,"top_k":8,
+                   "router_routing_enabled":true,"router_dynamic_routing_enabled":true,"router_benchmark_metadata_enabled":true,
+                   "nvlink_forwarding_enabled":true,"router_local_input_staging_enabled":true,"fill_test_data":false,
+                   "nvlink_forward_completion_notifications_enabled":true,"nvlink_forward_synchronize_batches":true,
+                   "nvlink_forward_threshold_tokens":2,"nvlink_forward_chunk_tokens":2,
+                   "peers":[{"node_rank":1,"host":"localhost","port":18515}]})";
+        out.close();
+        const auto base = rdma_proxy::load_config_file("benchmark_router_config.json");
+        assert(base.router_benchmark_metadata_enabled);
+        const char* args[] = {"proxy", "--config", "benchmark_router_config.json", "--router_benchmark_metadata_enabled=false"};
+        assert(!rdma_proxy::load_config(4, const_cast<char**>(args)).router_benchmark_metadata_enabled);
+        for (const auto unsupported : {"--router_dynamic_routing_enabled=false", "--num_gpus_per_node=4",
+                                       "--num_experts=256", "--top_k=4", "--router_weighted_contributions_enabled=true",
+                                       "--num_tokens=10000001"}) {
+            args[3] = unsupported;
+            bool rejected = false;
+            try { (void)rdma_proxy::load_config(4, const_cast<char**>(args)); }
+            catch (const std::runtime_error& e) {
+                rejected = std::string(e.what()).find("benchmark metadata exchange") != std::string::npos;
+            }
+            assert(rejected);
+        }
     }
     assert(config.router_num_experts == 256);
     assert(config.router_top_k == 8);

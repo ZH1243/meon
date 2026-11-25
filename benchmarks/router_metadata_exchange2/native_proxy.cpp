@@ -488,7 +488,11 @@ struct Rme2Proxy {
             const auto status = cudaMemcpyBatchAsync(
                 payload_batch.destinations.data(), payload_batch.sources.data(),
                 payload_batch.sizes.data(), payload_batch.count, &attrs,
-                &attribute_index, 1, &failed_index, read_stream);
+                &attribute_index, 1,
+#if CUDART_VERSION < 13000
+                &failed_index,
+#endif
+                read_stream);
             stats.payload_submit_ms += ms(submit_start);
             if (status != cudaSuccess) {
                 const std::string detail = failed_index < payload_batch.count
@@ -710,9 +714,10 @@ extern "C" int rme2_set_receiver_kernel(Rme2Proxy* p, int enabled) {
                 "receiver kernel requires d2h_after_local_staging disabled");
         if (!enabled) return;
         check(cudaSetDevice(p->device), "select receiver GPU");
-        cudaDeviceProp prop{};
-        check(cudaGetDeviceProperties(&prop, p->device), "query receiver GPU");
-        require(prop.canMapHostMemory && prop.clockRate > 0, "receiver requires mapped host memory and GPU clock");
+        int can_map_host = 0, clock_rate_khz = 0;
+        check(cudaDeviceGetAttribute(&can_map_host, cudaDevAttrCanMapHostMemory, p->device), "query receiver host mapping");
+        check(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate, p->device), "query receiver GPU clock");
+        require(can_map_host && clock_rate_khz > 0, "receiver requires mapped host memory and GPU clock");
         check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&p->mapped_pinned), p->pinned, 0),
               "map pinned receiver records");
         check(cudaHostAlloc(reinterpret_cast<void**>(&p->receiver_results),
@@ -720,7 +725,7 @@ extern "C" int rme2_set_receiver_kernel(Rme2Proxy* p, int enabled) {
         std::memset(p->receiver_results, 0, rme2::receiver::records * sizeof(rme2::receiver::Result));
         check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&p->mapped_receiver_results),
                                       p->receiver_results, 0), "map receiver results");
-        p->receiver_timeout_cycles = uint64_t(std::min(p->timeout, 3600.0) * prop.clockRate * 1000.0) + 1;
+        p->receiver_timeout_cycles = uint64_t(std::min(p->timeout, 3600.0) * clock_rate_khz * 1000.0) + 1;
         check(cudaStreamCreateWithFlags(&p->receiver_stream, cudaStreamNonBlocking), "create receiver stream");
         check(cudaEventCreate(&p->receiver_begin), "create receiver start event");
         check(cudaEventCreate(&p->receiver_end), "create receiver completion event");
@@ -858,6 +863,31 @@ extern "C" int rme2_unlink(Rme2Proxy* p) {
         p->owner = false;
     });
 }
+extern "C" int rme2_abort(Rme2Proxy* p) {
+    return api([&] {
+        require(p, "null metadata proxy");
+        if (p->shared) release(&p->shared->aborted.complete, 1);
+        p->stopping.store(true);
+        p->changed.notify_all();
+        if (p->worker.joinable()) p->worker.join();
+        if (p->owner && shm_unlink(p->name.c_str()) == 0) p->owner = false;
+        // Capture is submitted and aborted by the same embedding thread. End
+        // a partial capture without releasing any still-exported allocations.
+        if (p->capturing) {
+            cudaGraph_t abandoned = nullptr;
+            cudaStreamEndCapture(p->capture_stream, &abandoned);
+            p->capturing = false;
+            if (abandoned) cudaGraphDestroy(abandoned);
+        }
+        {
+            std::lock_guard<std::mutex> lock(p->mutex);
+            if (p->failure.empty()) p->failure = "metadata exchange cancelled";
+            p->pending = false;
+            p->done = true;
+        }
+        p->changed.notify_all();
+    });
+}
 extern "C" int rme2_disconnect(Rme2Proxy* p) {
     return api([&] {
         require(p && p->connected, "invalid disconnect state");
@@ -907,7 +937,7 @@ int capture_end(Rme2Proxy* p, int launch_barrier, bool staging) {
         p->capturing = false;
         check(status, "end graph capture");
         try {
-            check(cudaGraphInstantiate(executable, graph, nullptr, nullptr, 0), "instantiate native graph");
+            check(cudaGraphInstantiateWithFlags(executable, graph, 0), "instantiate native graph");
             // Move upload/first launch costs outside measured iterations.
             check(cudaGraphUpload(*executable, p->capture_stream), "upload native graph");
             check(cudaStreamSynchronize(p->capture_stream), "complete native graph upload");

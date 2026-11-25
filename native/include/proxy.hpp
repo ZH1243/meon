@@ -26,6 +26,7 @@
 namespace rdma_proxy {
 
 class IterationRouting;
+struct IterationRouteData;
 
 class Proxy {
 public:
@@ -38,6 +39,7 @@ public:
     void set_external_device_buffer_allocator(ExternalDeviceBufferAllocator allocator);
     void initialize();
     void prepare_routing(uint64_t iteration);
+    void install_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing);
     void run();
     void run_once();
     void prepare_iteration_step(uint64_t iteration);
@@ -309,6 +311,8 @@ private:
     void prepare_forwarding_routing_tables();
     void prepare_local_forwarding_routing_table();
     const RouterRouting& active_routing() const;
+    bool routing_install_required(uint64_t iteration) const;
+    void install_iteration_routing(uint64_t iteration, IterationRouteData route);
     std::shared_lock<std::shared_mutex> lock_forwarding_routes() const;
     void prepare_forwarding_destinations();
     void publish_local_nvlink_receive_buffers();

@@ -1,0 +1,206 @@
+#include "logging.hpp"
+#include "proxy.hpp"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstring>
+#include <future>
+#include <stdexcept>
+
+using namespace rdma_proxy;
+
+namespace {
+constexpr int gpus = 8, nodes = 2, experts_per_gpu = 8, tokens = 2;
+constexpr int row_bytes = 16;
+
+struct Rank {
+    std::vector<std::unique_ptr<uint8_t[]>> allocations;
+    uint8_t* send{};
+    uint8_t* rdma_receive{};
+    std::array<uint8_t*, nodes*gpus> inputs{};
+    std::unique_ptr<Proxy> proxy;
+};
+
+template<class F> void on_all_gpus(F work) {
+    std::vector<std::future<void>> jobs;
+    for (int gpu = 0; gpu < gpus; ++gpu)
+        jobs.emplace_back(std::async(std::launch::async, work, gpu));
+    for (auto& job : jobs) job.get();
+}
+
+template<class F> void expect_error(F operation) {
+    try { operation(); } catch (const std::runtime_error&) { return; }
+    throw std::runtime_error("accepted invalid benchmark routing operation");
+}
+
+// Each token chooses all eight experts on one GPU. The mock NIC reflects
+// payloads, so the remote source uses the same source rows toward this node.
+int destination_node(int epoch, int token) {
+    if (epoch == 0) return 0;
+    if (epoch == 1) return 1;
+    return token == 0 ? 1 : 0;
+}
+int destination_gpu(int epoch, int source_gpu, int source_node) {
+    if (epoch != 2) return source_gpu;
+    // Local and remote original sources use different neighbors, so reusing
+    // an outgoing mask for the same-index incoming record is observable.
+    return (source_gpu + (source_node == 0 ? 1 : gpus - 1)) % gpus;
+}
+uint8_t payload_value(int epoch, int gpu, int token) {
+    return static_cast<uint8_t>(epoch*40 + gpu*3 + token + 1);
+}
+
+void install(Rank& rank, int gpu, int epoch) {
+    std::array<std::vector<int32_t>, nodes> rows;
+    std::vector<int32_t> r;
+    const auto dest = destination_gpu(epoch, gpu, 0);
+    for (int token = 0; token < tokens; ++token) {
+        const auto node = destination_node(epoch, token);
+        const auto first_expert = (node*gpus + dest) * experts_per_gpu;
+        for (int k = 0; k < experts_per_gpu; ++k) r.push_back(first_expert + k);
+        const auto value = payload_value(epoch, gpu, token);
+        if (node == 0) {
+            // Only the completed external gather has the correct bytes. A
+            // second native gather would overwrite them with this poison.
+            std::memset(rank.inputs[gpu] + rows[0].size()*row_bytes, value, row_bytes);
+            std::memset(rank.send + token*row_bytes, 0xff, row_bytes);
+        } else {
+            std::memset(rank.send + token*row_bytes, value, row_bytes);
+        }
+        rows[node].push_back(token);
+    }
+    std::vector<int32_t> x3 = rows[0];
+    x3.insert(x3.end(), rows[1].begin(), rows[1].end());
+    const auto mask = static_cast<uint8_t>(1u << ((gpu - dest + gpus) % gpus));
+    std::vector<uint8_t> x4(x3.size(), mask);
+    const int remote_dest = destination_gpu(epoch, gpu, 1);
+    std::vector<uint8_t> remote_masks(rows[1].size(), 1u << ((gpu - remote_dest + gpus) % gpus));
+    const int32_t node_offsets[] = {0, static_cast<int32_t>(rows[0].size()), tokens};
+    std::array<std::array<int32_t, experts_per_gpu+1>, nodes*gpus> offsets{};
+    std::array<std::vector<int32_t>, nodes*gpus> indices;
+    std::array<RdmaProxyBenchmarkSource, nodes*gpus> sources;
+    for (int s = 0; s < nodes*gpus; ++s) {
+        const auto count = destination_gpu(epoch, s % gpus, s / gpus) == gpu ? rows[s/gpus].size() : 0;
+        for (int expert = 0; expert < experts_per_gpu; ++expert) {
+            for (std::size_t i = 0; i < count; ++i) indices[s].push_back(static_cast<int32_t>(i));
+            offsets[s][expert+1] = static_cast<int32_t>(indices[s].size());
+        }
+        sources[s] = {offsets[s].data(), indices[s].data(), indices[s].size()};
+    }
+    RdmaProxyBenchmarkRouting data{sizeof(data), nodes*gpus, sources.data(), rows[1].data(),
+        remote_masks.data(), rows[1].size(), reinterpret_cast<uintptr_t>(r.data()),
+        reinterpret_cast<uintptr_t>(node_offsets), reinterpret_cast<uintptr_t>(x3.data()),
+        reinterpret_cast<uintptr_t>(x4.data())};
+    expect_error([&] { rank.proxy->prepare_routing(epoch); });
+    if (!epoch) {
+        expect_error([&] { rank.proxy->install_benchmark_routing(1, data); });
+        auto corrupt = data;
+        --corrupt.num_sources;
+        expect_error([&] { rank.proxy->install_benchmark_routing(epoch, corrupt); });
+        corrupt = data;
+        --corrupt.struct_size;
+        expect_error([&] { rank.proxy->install_benchmark_routing(epoch, corrupt); });
+        corrupt = data;
+        corrupt.remote_count = tokens + 1;
+        expect_error([&] { rank.proxy->install_benchmark_routing(epoch, corrupt); });
+        const auto saved = offsets[gpu][1];
+        offsets[gpu][1] = -1;
+        expect_error([&] { rank.proxy->install_benchmark_routing(epoch, data); });
+        offsets[gpu][1] = saved;
+    }
+    struct Extended { RdmaProxyBenchmarkRouting current; uint64_t extension; };
+    Extended extended{data, 0};
+    extended.current.struct_size = sizeof(extended);
+    rank.proxy->install_benchmark_routing(epoch, extended.current);
+    expect_error([&] { rank.proxy->install_benchmark_routing(epoch, data); });
+    rank.proxy->prepare_routing(epoch);
+    // The external buffers may now be reused, including the remote pinned views.
+    std::fill(x3.begin(), x3.end(), -1);
+    std::fill(x4.begin(), x4.end(), 0);
+    std::fill(remote_masks.begin(), remote_masks.end(), 0);
+    const auto expected_r = r;
+    std::fill(r.begin(), r.end(), -1);
+    for (auto& source_indices : indices) std::fill(source_indices.begin(), source_indices.end(), -1);
+    for (auto& source_offsets : offsets) source_offsets.fill(-1);
+    const auto& weights = rank.proxy->original_router_weights();
+    if (rank.proxy->original_router_experts() != expected_r || weights != std::vector<float>(r.size(), 1))
+        throw std::runtime_error("incorrect source routing snapshot");
+    for (int n = 0; n < nodes; ++n) {
+        const auto& outgoing = rank.proxy->outgoing_token_indices(n);
+        if (!std::equal(outgoing.begin(), outgoing.end(), rows[n].begin(), rows[n].end()) ||
+            rank.proxy->intra_node_source_masks(n) !=
+                std::vector<uint8_t>(rows[n].size(), 1u << destination_gpu(epoch, gpu, n)))
+            throw std::runtime_error("incorrect outgoing rows or incoming source masks");
+    }
+}
+}
+
+int main() {
+    Logger::instance().set_level(LogLevel::kError);
+    ProxyConfig config;
+    config.num_nodes = nodes;
+    config.num_gpus_per_node = gpus;
+    config.num_tokens = tokens;
+    config.token_dimension = row_bytes / dtype_size(config.dtype);
+    config.num_iterations = 3;
+    config.mock_mode = true;
+    config.fill_test_data = config.validate_data = false;
+    config.router_routing_enabled = config.router_dynamic_routing_enabled = true;
+    config.router_benchmark_metadata_enabled = config.router_local_input_staging_enabled = true;
+    config.router_num_experts = nodes*gpus*experts_per_gpu;
+    config.router_top_k = experts_per_gpu;
+    config.nvlink_forwarding_enabled = config.nvlink_forward_synchronize_batches = true;
+    config.nvlink_forward_completion_notifications_enabled = true;
+    config.nvlink_forward_threshold_tokens = config.nvlink_forward_chunk_tokens = 1;
+    config.local_iteration_sync_enabled = true;
+    config.completion_timeout_ms = 10000;
+    config.peers.push_back(PeerAddress{1, "mock-peer", 18515});
+    const auto id = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    config.local_iteration_sync_run_id = "bench_handoff_" + id;
+    config.nvlink_forward_exchange_dir = "/tmp/meon_bench_handoff_" + id;
+    std::array<Rank, gpus> ranks;
+    for (int gpu = 0; gpu < gpus; ++gpu) {
+        auto& rank = ranks[gpu];
+        config.cuda_device_id = config.local_gpu_index = gpu;
+        rank.proxy = std::make_unique<Proxy>(config);
+        rank.proxy->set_external_device_buffer_allocator([&rank, gpu](const DeviceBufferAllocationRequest& r) {
+            const auto source = r.source_node_rank*gpus + r.source_gpu_index;
+            if (r.kind == DeviceBufferKind::kNvlinkReceive && source == gpus + gpu)
+                return rank.inputs[source] = rank.rdma_receive;
+            rank.allocations.emplace_back(std::make_unique<uint8_t[]>(r.bytes));
+            auto* ptr = rank.allocations.back().get();
+            if (r.kind == DeviceBufferKind::kRdmaSend) rank.send = ptr;
+            if (r.kind == DeviceBufferKind::kRdmaReceive) rank.rdma_receive = ptr;
+            if (r.kind == DeviceBufferKind::kNvlinkReceive) rank.inputs.at(source) = ptr;
+            return ptr;
+        });
+    }
+    on_all_gpus([&](int gpu) { ranks[gpu].proxy->initialize(); });
+    for (int epoch = 0; epoch < 3; ++epoch) {
+        on_all_gpus([&](int gpu) {
+            install(ranks[gpu], gpu, epoch);
+            ranks[gpu].proxy->run_iteration_step(epoch);
+        });
+        for (int source = 0; source < gpus; ++source) {
+            std::array<std::size_t, nodes> row{};
+            for (int token = 0; token < tokens; ++token) {
+                const int node = destination_node(epoch, token);
+                const auto& rank = ranks[destination_gpu(epoch, source, node)];
+                auto* input = rank.inputs[node*gpus + source] + row[node]++ * row_bytes;
+                if (!std::all_of(input, input + row_bytes, [&](uint8_t v) {
+                        return v == payload_value(epoch, source, token); }))
+                    throw std::runtime_error("benchmark handoff forwarded incorrect payload");
+            }
+            for (int node = 0; node < nodes; ++node) {
+                const auto& rank = ranks[destination_gpu(epoch, source, node)];
+                const auto& table = rank.proxy->router_expert_metadata_for_source(node, source);
+                const auto state = rank.proxy->router_expert_token_head_state_for_source(node, source);
+                if (table.expert_token_indices.size() != row[node]*experts_per_gpu ||
+                    state.received_token_frontier != row[node])
+                    throw std::runtime_error("incorrect benchmark source table or completion frontier");
+            }
+        }
+    }
+    on_all_gpus([&](int gpu) { ranks[gpu].proxy->shutdown(); });
+}

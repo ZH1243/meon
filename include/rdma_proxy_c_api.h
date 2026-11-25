@@ -178,6 +178,43 @@ RDMA_PROXY_C_API int rdma_proxy_run(RdmaProxyHandle* handle);
  * allocator supplies stable, capacity-sized backing allocations. */
 RDMA_PROXY_C_API int rdma_proxy_dynamic_routing_enabled(RdmaProxyHandle* handle, int32_t* enabled);
 RDMA_PROXY_C_API int rdma_proxy_prepare_routing(RdmaProxyHandle* handle, uint64_t iteration);
+
+/* Optional benchmark exchange provider. Set struct_size before either call.
+ * Source views are in global source-rank order, offsets has local_experts + 1
+ * entries, and count is the compact index count. remote_x3/x4 describes the
+ * same-local-GPU peer's incoming payload (one destination mask per token).
+ * The four device arrays belong to this rank's completed metadata graph.
+ * Complete exchange and local input staging before install. Pointers are
+ * borrowed only for the synchronous call. Install once per retired epoch's
+ * successor, including epoch zero, before preparing or launching compute. */
+typedef struct RdmaProxyBenchmarkSource {
+    const int32_t* offsets;
+    const int32_t* indices;
+    uint64_t count;
+} RdmaProxyBenchmarkSource;
+
+typedef struct RdmaProxyBenchmarkRouting {
+    uint64_t struct_size;
+    int32_t num_sources;
+    const RdmaProxyBenchmarkSource* sources;
+    const int32_t* remote_x3;
+    const uint8_t* remote_x4;
+    uint64_t remote_count;
+    uintptr_t device_r, device_node_offsets, device_x3, device_x4;
+} RdmaProxyBenchmarkRouting;
+
+typedef struct RdmaProxyBenchmarkConfig {
+    uint64_t struct_size, num_tokens, router_seed, completion_timeout_ms;
+    int32_t cuda_device_id, node_rank, local_gpu_index, num_gpus_per_node, num_nodes;
+    int32_t rdma_port, gid_index;
+    char rdma_device_name[128];
+} RdmaProxyBenchmarkConfig;
+
+RDMA_PROXY_C_API int rdma_proxy_benchmark_metadata_enabled(RdmaProxyHandle* handle, int32_t* enabled);
+RDMA_PROXY_C_API int rdma_proxy_get_benchmark_routing_config(
+    RdmaProxyHandle* handle, RdmaProxyBenchmarkConfig* config);
+RDMA_PROXY_C_API int rdma_proxy_install_benchmark_routing(
+    RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing);
 RDMA_PROXY_C_API int rdma_proxy_get_routing_extents(
     RdmaProxyHandle* handle, uint64_t* indices_per_source, uint64_t* table_rows);
 

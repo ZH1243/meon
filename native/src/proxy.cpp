@@ -1,6 +1,6 @@
 #include "proxy.hpp"
 #include "forwarding_rounds.hpp"
-#include "iteration_routing.hpp"
+#include "iteration_routing_internal.hpp"
 
 #include "logging.hpp"
 
@@ -506,7 +506,7 @@ void Proxy::configure_distributor_memory(
 
 void Proxy::initialize() {
     if (initialized_) return;
-    if (!config_.rdma_device_name2.empty()) validate_config(config_);
+    if (config_.router_benchmark_metadata_enabled || !config_.rdma_device_name2.empty()) validate_config(config_);
     RDMA_PROXY_LOG_INFO("initializing proxy: ", config_summary(config_));
 
     rdma_iteration_bandwidth_gbps_.clear();
@@ -515,11 +515,11 @@ void Proxy::initialize() {
     initialize_local_iteration_sync();
     if (!config_.router_dynamic_routing_enabled) router_routing_.initialize();
     cuda_buffers_.initialize();
-    if (config_.router_dynamic_routing_enabled) {
+    if (!config_.router_dynamic_routing_enabled) {
+        exchange_router_expert_metadata_all_to_all();
+    } else if (!config_.router_benchmark_metadata_enabled) {
         iteration_routing_ = std::make_unique<IterationRouting>(config_);
         iteration_routing_->initialize();
-    } else {
-        exchange_router_expert_metadata_all_to_all();
     }
     rdma_context_.initialize();
     if (!config_.rdma_device_name2.empty()) {
@@ -546,16 +546,23 @@ std::shared_lock<std::shared_mutex> Proxy::lock_forwarding_routes() const {
     return lock;
 }
 
-void Proxy::prepare_routing(uint64_t iteration) {
+bool Proxy::routing_install_required(uint64_t iteration) const {
     if (!initialized_) throw std::runtime_error("proxy is not initialized");
-    if (!config_.router_dynamic_routing_enabled) return;
+    if (!config_.router_dynamic_routing_enabled) return false;
     if (routing_failed_) throw std::runtime_error("iteration routing previously failed");
     if (iteration != completed_routing_iterations_ ||
         (config_.num_iterations && iteration >= config_.num_iterations))
         throw std::runtime_error("iteration routing requires the next consecutive iteration");
-    if (routing_iteration_ == iteration) return;
+    if (routing_iteration_ == iteration) return false;
     if (iteration_prepared_) throw std::runtime_error("cannot replace routing for a pending iteration");
+    return true;
+}
 
+void Proxy::prepare_routing(uint64_t iteration) {
+    if (!routing_install_required(iteration)) return;
+    if (config_.router_benchmark_metadata_enabled)
+        throw std::runtime_error("install the completed benchmark routing before preparing payloads");
+    IterationRouteData route;
     try {
         std::function<void(const RouterRouting&, void*)> stage;
         if (config_.router_local_input_staging_enabled) {
@@ -564,7 +571,67 @@ void Proxy::prepare_routing(uint64_t iteration) {
                                                       route.device_token_indices_for_node(config_.node_rank), stream);
             };
         }
-        auto route = iteration_routing_->prepare(iteration, stage);
+        route = iteration_routing_->prepare(iteration, stage);
+    } catch (...) {
+        routing_failed_ = true;
+        throw;
+    }
+    install_iteration_routing(iteration, std::move(route));
+}
+
+void Proxy::install_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff) {
+    if (!config_.router_benchmark_metadata_enabled)
+        throw std::runtime_error("benchmark metadata handoff is disabled");
+    if (!routing_install_required(iteration))
+        throw std::runtime_error("benchmark routing already installed for this iteration");
+    const int world = config_.num_nodes * config_.num_gpus_per_node;
+    if (handoff.struct_size < sizeof(handoff) || handoff.num_sources != world || !handoff.sources)
+        throw std::runtime_error("invalid benchmark routing descriptor or source count");
+    const int experts = config_.router_num_experts / world;
+    IterationRouteData route;
+    route.source = std::make_unique<RouterRouting>(config_);
+    const int other = 1 - config_.node_rank;
+    auto remote = iteration_node_record(config_, other, config_.node_rank);
+    route.source->copy_benchmark_node_slice(handoff.remote_x3, handoff.remote_x4, handoff.remote_count,
+                                            remote.token_indices, remote.token_masks);
+    route.incoming_nodes.emplace(other, std::move(remote));
+    route.incoming_experts.reserve(world);
+    for (int source = 0; source < world; ++source) {
+        const auto& view = handoff.sources[source];
+        if (!view.offsets || (view.count && !view.indices) ||
+            view.count > config_.num_tokens * std::min(config_.router_top_k, experts) ||
+            view.offsets[0] != 0 || view.offsets[experts] < 0 ||
+            static_cast<uint64_t>(view.offsets[experts]) != view.count)
+            throw std::runtime_error("invalid benchmark expert metadata view");
+        for (int expert = 0; expert < experts; ++expert) {
+            const int32_t begin = view.offsets[expert], end = view.offsets[expert + 1];
+            if (end < begin || static_cast<std::size_t>(end - begin) > config_.num_tokens)
+                throw std::runtime_error("invalid benchmark per-expert offsets or token count");
+        }
+        auto& table = route.incoming_experts.emplace_back();
+        table.source_node_rank = source / config_.num_gpus_per_node;
+        table.source_gpu_index = source % config_.num_gpus_per_node;
+        table.destination_node_rank = config_.node_rank;
+        table.destination_gpu_index = config_.local_gpu_index;
+        table.num_nodes = config_.num_nodes;
+        table.num_gpus_per_node = config_.num_gpus_per_node;
+        table.num_experts = config_.router_num_experts;
+        table.experts_per_gpu = experts;
+        table.first_global_expert = (config_.node_rank * config_.num_gpus_per_node + config_.local_gpu_index) * experts;
+        table.num_tokens = config_.num_tokens;
+        table.top_k = config_.router_top_k;
+        table.expert_offsets.assign(view.offsets, view.offsets + experts + 1);
+        if (view.count) table.expert_token_indices.assign(view.indices, view.indices + view.count);
+    }
+    route.source->initialize_benchmark(handoff.device_r, handoff.device_node_offsets, handoff.device_x3,
+                                       handoff.device_x4);
+    // The benchmark has retired both its metadata worker and the local staging
+    // gather before handing out these views. Only owned host snapshots survive.
+    install_iteration_routing(iteration, std::move(route));
+}
+
+void Proxy::install_iteration_routing(uint64_t iteration, IterationRouteData route) {
+    try {
         if (!route.source || route.incoming_nodes.size() != peers_.size())
             throw std::runtime_error("iteration route is missing source or peer metadata");
         // Last iteration's completion barrier retired all data WRs. Its ready

@@ -6,6 +6,11 @@ eight GPUs. Two nodes load the shared [metadata kernels](../../metadata/README.m
 and add GPUDirect RDMA. Both modes gather local rows by default. Match the
 options across ranks. `python3 benchmark.py --help` lists the complete CLI.
 
+To run this two-node metadata graph, receiver and RDMA transport inside meon
+with fresh routes and the real payload buffers, pass `--benchmark-metadata-exchange`
+to both runtime launchers. The runtime reports exchange/staging and installation
+separately. [Runtime launch and timing guide](../../docs/development.md#benchmark-metadata-backend)
+
 ## Receiver-kernel D2H (two nodes, opt-in)
 
 Add **`--receiver-kernel` on both nodes** to perform all local metadata readback

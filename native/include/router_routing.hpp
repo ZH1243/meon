@@ -23,6 +23,13 @@ public:
     RouterRouting& operator=(const RouterRouting&) = delete;
 
     void initialize();
+    // Snapshot the completed benchmark's canonical source outputs. No GPU
+    // pointer is retained after this call.
+    void initialize_benchmark(uintptr_t device_r, uintptr_t device_node_offsets,
+                              uintptr_t device_x3, uintptr_t device_x4);
+    void copy_benchmark_node_slice(const int32_t* x3, const uint8_t* x4, std::size_t count,
+                                   std::vector<std::size_t>& indices,
+                                   std::vector<uint8_t>& masks) const;
     const std::vector<std::size_t>& token_indices_for_node(int node_rank) const;
     const std::vector<uint8_t>& token_masks_for_node(int node_rank) const;
     const RouterExpertMetadata& expert_metadata_for_gpu(

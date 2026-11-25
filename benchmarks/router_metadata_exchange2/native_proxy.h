@@ -89,6 +89,10 @@ int rme2_unlink(Rme2Proxy*);
 /* Collectively disconnect, barrier, then destroy: imported mappings must close
  * before any owner frees its IPC arena. */
 int rme2_disconnect(Rme2Proxy*);
+/* Failure path for embedded owners. Wake/stop the CPU worker and signal the
+ * local peers. Does not destroy allocations or close IPC mappings: those can
+ * still be referenced by other GPUs after an interrupted collective. */
+int rme2_abort(Rme2Proxy*);
 /* Setup-only capture on a nondefault stream. The proxy owns the executable;
  * caller owns all captured tensors and must keep them and submission streams
  * alive through final wait/disconnect/destroy. Capture must contain only metadata.

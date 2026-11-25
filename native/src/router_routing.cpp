@@ -3,6 +3,7 @@
 #include "logging.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -102,6 +103,85 @@ int RouterRouting::experts_per_gpu() const {
     return config_.router_num_experts / (config_.num_nodes * config_.num_gpus_per_node);
 }
 
+void RouterRouting::copy_benchmark_node_slice(
+    const int32_t* x3, const uint8_t* x4, std::size_t count,
+    std::vector<std::size_t>& indices, std::vector<uint8_t>& masks) const {
+    if (count > config_.num_tokens || (count && (!x3 || !x4)))
+        throw std::runtime_error("invalid benchmark x3/x4 slice length or address");
+    indices.resize(count);
+    masks.resize(count);
+    if (!count) return;
+    std::vector<bool> seen(config_.num_tokens, false);
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto token = x3[i];
+        if (token < 0 || static_cast<std::size_t>(token) >= config_.num_tokens ||
+            seen[token] || !x4[i] || (x4[i] >> config_.num_gpus_per_node) ||
+            (i && (x4[i] > x4[i - 1] || (x4[i] == x4[i - 1] && token <= x3[i - 1]))))
+            throw std::runtime_error("invalid benchmark x3 token, x4 mask or row order");
+        seen[token] = true;
+        indices[i] = static_cast<std::size_t>(token);
+        masks[i] = x4[i];
+    }
+}
+
+void RouterRouting::initialize_benchmark(uintptr_t device_r, uintptr_t device_node_offsets,
+                                         uintptr_t device_x3, uintptr_t device_x4) {
+    if (initialized_ || !config_.router_benchmark_metadata_enabled ||
+        config_.router_weighted_contributions_enabled)
+        throw std::runtime_error("benchmark source snapshot requires fresh unweighted routing");
+    if (!device_r || !device_node_offsets || !device_x3 || !device_x4 ||
+        device_r % alignof(int32_t) || device_node_offsets % alignof(int32_t) ||
+        device_x3 % alignof(int32_t))
+        throw std::runtime_error("invalid benchmark source buffer address");
+#if RDMA_PROXY_HAVE_CUDA
+    if (!config_.mock_mode)
+        check_cuda(cudaSetDevice(config_.cuda_device_id), "select benchmark source GPU");
+#endif
+    const auto read = [&](auto& output, uintptr_t address) {
+        if (output.empty()) return;
+        const auto bytes = output.size() * sizeof(output[0]);
+        auto* source = reinterpret_cast<const void*>(address);
+        if (config_.mock_mode) {
+            std::memcpy(output.data(), source, bytes);
+            return;
+        }
+#if RDMA_PROXY_HAVE_CUDA
+        check_cuda(cudaMemcpy(output.data(), source, bytes, cudaMemcpyDeviceToHost),
+                   "read benchmark source snapshot");
+#else
+        throw std::runtime_error("benchmark source snapshot requires CUDA");
+#endif
+    };
+    std::vector<int32_t> offsets(config_.num_nodes + 1);
+    read(offsets, device_node_offsets);
+    if (offsets.front() != 0)
+        throw std::runtime_error("benchmark node offsets must start at zero");
+    for (int node = 0; node < config_.num_nodes; ++node) {
+        if (offsets[node + 1] < offsets[node] ||
+            static_cast<std::size_t>(offsets[node + 1] - offsets[node]) > config_.num_tokens)
+            throw std::runtime_error("invalid benchmark node offsets");
+    }
+    std::vector<int32_t> x3(offsets.back());
+    std::vector<uint8_t> x4(x3.size());
+    read(x3, device_x3);
+    read(x4, device_x4);
+    token_indices_by_node_.resize(config_.num_nodes);
+    token_masks_by_node_.resize(config_.num_nodes);
+    for (int node = 0; node < config_.num_nodes; ++node) {
+        const auto count = offsets[node + 1] - offsets[node];
+        copy_benchmark_node_slice(count ? x3.data() + offsets[node] : nullptr,
+                                  count ? x4.data() + offsets[node] : nullptr, count,
+                                  token_indices_by_node_[node], token_masks_by_node_[node]);
+    }
+    original_experts_.resize(config_.num_tokens * config_.router_top_k);
+    read(original_experts_, device_r);
+    for (auto expert : original_experts_)
+        if (expert < 0 || expert >= config_.router_num_experts)
+            throw std::runtime_error("benchmark R contains an out-of-range expert");
+    generate_source_weights();
+    initialized_ = true;
+}
+
 void RouterRouting::initialize() {
     if (initialized_ || !config_.router_routing_enabled) return;
     token_indices_by_node_.assign(static_cast<std::size_t>(config_.num_nodes), {});
@@ -165,7 +245,7 @@ const RouterExpertMetadata& RouterRouting::expert_metadata_for_gpu(
     }
     const auto global_gpu = static_cast<std::size_t>(
         node_rank * config_.num_gpus_per_node + local_gpu_index);
-    return expert_metadata_by_gpu_[global_gpu];
+    return expert_metadata_by_gpu_.at(global_gpu);
 }
 
 const std::vector<int32_t>& RouterRouting::original_experts() const {

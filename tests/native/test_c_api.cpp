@@ -110,6 +110,38 @@ int main(int argc, char** argv) {
         std::cerr << "per-iteration proxy creation failed: " << rdma_proxy_last_error() << '\n';
         return 1;
     }
+    int32_t benchmark_enabled = -1;
+    RdmaProxyBenchmarkConfig benchmark_config{};
+    benchmark_config.struct_size = sizeof(benchmark_config);
+    if (rdma_proxy_benchmark_metadata_enabled(handle, &benchmark_enabled) || benchmark_enabled ||
+        rdma_proxy_benchmark_metadata_enabled(nullptr, &benchmark_enabled) == 0 ||
+        rdma_proxy_get_benchmark_routing_config(handle, &benchmark_config) == 0 ||
+        rdma_proxy_install_benchmark_routing(handle, 0, nullptr) == 0) {
+        std::cerr << "invalid benchmark metadata query or install accepted\n";
+        return 1;
+    }
+    {
+        const auto profile = (std::filesystem::path(argv[1]).parent_path() / "node0_config.json").string();
+        const char* args[] = {"proxy", "--config", profile.c_str(), "--num_gpus_per_node=8",
+            "--num_experts=128", "--router_routing_enabled=true", "--router_dynamic_routing_enabled=true",
+            "--router_benchmark_metadata_enabled=true", "--router_local_input_staging_enabled=true",
+            "--nvlink_forwarding_enabled=true", "--nvlink_forward_completion_notifications_enabled=true",
+            "--nvlink_forward_synchronize_batches=true", "--fill_test_data=false", "--rdma_device_name=test_nic",
+            "--num_tokens=10240", "--cuda_device_id=3", "--rdma_port=2", "--gid_index=5", "--cpu_affinity=none"};
+        std::unique_ptr<RdmaProxyHandle, decltype(&rdma_proxy_destroy)> provider(
+            rdma_proxy_create(sizeof(args) / sizeof(*args), args), rdma_proxy_destroy);
+        if (!provider || rdma_proxy_benchmark_metadata_enabled(provider.get(), &benchmark_enabled) ||
+            benchmark_enabled != 1 || rdma_proxy_get_benchmark_routing_config(provider.get(), &benchmark_config) ||
+            benchmark_config.num_tokens != 10240 || benchmark_config.router_seed != 1234 ||
+            benchmark_config.cuda_device_id != 3 || benchmark_config.num_gpus_per_node != 8 ||
+            benchmark_config.num_nodes != 2 || benchmark_config.rdma_port != 2 || benchmark_config.gid_index != 5 ||
+            std::string(benchmark_config.rdma_device_name) != "test_nic") {
+            std::cerr << "incorrect effective benchmark configuration: " << rdma_proxy_last_error() << '\n';
+            return 1;
+        }
+        benchmark_config.struct_size = sizeof(benchmark_config) - 1;
+        if (rdma_proxy_get_benchmark_routing_config(provider.get(), &benchmark_config) == 0) return 1;
+    }
     if (rdma_proxy_configure_cpu_scatter_threaded(nullptr, 16) == 0 ||
         rdma_proxy_configure_cpu_scatter_threaded(handle, 16) == 0) {
         std::cerr << "threaded scatter accepted a null or uninitialized proxy\n";

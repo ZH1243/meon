@@ -63,9 +63,10 @@ void run(int tokens, bool overlap_exchange) {
     for (int g = 0; g < 8; ++g) {
         check(cudaSetDevice(g));
         auto& d = gpu[g];
-        cudaDeviceProp prop{};
-        check(cudaGetDeviceProperties(&prop, g));
-        d.cycles_per_ms = prop.clockRate;
+        int clock_rate_khz = 0;
+        check(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate, g));
+        require(clock_rate_khz > 0, "receiver test requires a positive GPU clock rate");
+        d.cycles_per_ms = static_cast<uint64_t>(clock_rate_khz);
         check(cudaMalloc(reinterpret_cast<void**>(&d.arena), receiver::allocation_bytes(capacity)));
         check(cudaMemset(d.arena, 0, receiver::allocation_bytes(capacity)));
         peers.ptr[g] = d.arena;

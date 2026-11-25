@@ -313,6 +313,9 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "router_dynamic_routing_enabled") {
         config.router_dynamic_routing_enabled = (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "router_benchmark_metadata_enabled") {
+        config.router_benchmark_metadata_enabled = (value == "1" || value == "true" || value == "yes");
+    }
     else if (key == "num_experts" || key == "router_num_experts") {
         config.router_num_experts = std::stoi(value);
     }
@@ -685,6 +688,8 @@ static ProxyConfig parse_config_file(const std::string& path) {
         object, "router_routing_enabled", config.router_routing_enabled);
     config.router_dynamic_routing_enabled = get_bool(
         object, "router_dynamic_routing_enabled", config.router_dynamic_routing_enabled);
+    config.router_benchmark_metadata_enabled = get_bool(
+        object, "router_benchmark_metadata_enabled", config.router_benchmark_metadata_enabled);
     config.router_num_experts = number_as<int>(
         object, "num_experts", number_as<int>(object, "router_num_experts", config.router_num_experts));
     config.router_top_k = number_as<int>(
@@ -975,6 +980,13 @@ void validate_config(const ProxyConfig& config) {
          !config.nvlink_forwarding_enabled || config.num_nodes > 2 || !config.num_iterations))
         throw std::runtime_error("dynamic routing requires a finite one- or two-node routed run "
                                  "with NVLink forwarding and local input staging");
+    if (config.router_benchmark_metadata_enabled &&
+        (!config.router_dynamic_routing_enabled || config.num_nodes != 2 ||
+         config.num_gpus_per_node != 8 || config.router_num_experts != 128 || config.router_top_k != 8 ||
+         config.router_weighted_contributions_enabled || config.num_tokens > 10000000)) {
+        throw std::runtime_error("benchmark metadata exchange requires dynamic routing on two nodes of "
+                                 "eight GPUs, 128 experts, top-8, unweighted routes and at most 10000000 tokens");
+    }
     if (config.router_weighted_contributions_enabled && !config.router_routing_enabled)
         throw std::runtime_error("router_weighted_contributions_enabled requires router_routing_enabled");
     if (config.router_routing_enabled) {
@@ -1426,6 +1438,7 @@ std::string config_summary(const ProxyConfig& config) {
         << (config.rdma_discontinuous_token_payload_enabled ? "true" : "false")
         << " router_routing_enabled=" << (config.router_routing_enabled ? "true" : "false")
         << " router_dynamic_routing_enabled=" << (config.router_dynamic_routing_enabled ? "true" : "false")
+        << " router_benchmark_metadata_enabled=" << (config.router_benchmark_metadata_enabled ? "true" : "false")
         << " num_experts=" << config.router_num_experts
         << " top_k=" << config.router_top_k
         << " router_weighted_contributions_enabled=" << (config.router_weighted_contributions_enabled ? "true" : "false")

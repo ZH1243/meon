@@ -395,6 +395,64 @@ extern "C" int rdma_proxy_dynamic_routing_enabled(RdmaProxyHandle* handle, int32
     return 0;
 }
 
+extern "C" int rdma_proxy_benchmark_metadata_enabled(RdmaProxyHandle* handle, int32_t* enabled) {
+    clear_error();
+    if (!handle || !enabled) {
+        last_error = "invalid benchmark metadata query";
+        return -1;
+    }
+    *enabled = handle->config.router_benchmark_metadata_enabled;
+    return 0;
+}
+
+extern "C" int rdma_proxy_get_benchmark_routing_config(
+    RdmaProxyHandle* handle, RdmaProxyBenchmarkConfig* output) {
+    clear_error();
+    if (!handle || handle->shut_down || !handle->config.router_benchmark_metadata_enabled ||
+        !output || output->struct_size < sizeof(*output)) {
+        last_error = "invalid benchmark routing configuration request";
+        return -1;
+    }
+    const auto& config = handle->config;
+    if (config.rdma_device_name.size() >= sizeof(output->rdma_device_name)) {
+        last_error = "benchmark metadata RDMA device name exceeds ABI capacity";
+        return -1;
+    }
+    RdmaProxyBenchmarkConfig result{};
+    result.struct_size = sizeof(result);
+    result.num_tokens = config.num_tokens;
+    result.router_seed = config.router_seed;
+    result.completion_timeout_ms = config.completion_timeout_ms;
+    result.cuda_device_id = config.cuda_device_id;
+    result.node_rank = config.node_rank;
+    result.local_gpu_index = config.local_gpu_index;
+    result.num_gpus_per_node = config.num_gpus_per_node;
+    result.num_nodes = config.num_nodes;
+    result.rdma_port = config.rdma_port;
+    result.gid_index = config.gid_index;
+    std::copy(config.rdma_device_name.begin(), config.rdma_device_name.end(), result.rdma_device_name);
+    *output = result;
+    return 0;
+}
+
+extern "C" int rdma_proxy_install_benchmark_routing(
+    RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing) {
+    clear_error();
+    if (!handle || !handle->initialized || handle->shut_down || handle->finished ||
+        !handle->config.router_benchmark_metadata_enabled || iteration != handle->next_iteration ||
+        !routing || routing->struct_size < sizeof(*routing)) {
+        last_error = "benchmark routing installation requires the next unfinished benchmark iteration and valid views";
+        return -1;
+    }
+    try {
+        select_proxy_cuda_device(*handle);
+        handle->proxy.install_benchmark_routing(iteration, *routing);
+        return 0;
+    } catch (...) {
+        return record_current_exception();
+    }
+}
+
 extern "C" int rdma_proxy_prepare_routing(RdmaProxyHandle* handle, uint64_t iteration) {
     clear_error();
     if (!handle || !handle->initialized || handle->shut_down || handle->finished ||

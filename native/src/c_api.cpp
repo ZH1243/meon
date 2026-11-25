@@ -126,6 +126,20 @@ extern "C" int rdma_proxy_abi_version(void) {
     return 1;
 }
 
+extern "C" int rdma_proxy_reserve_threaded_cpu_scatter(
+    RdmaProxyHandle* handle, int32_t address_columns) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || handle->finished)
+            throw std::runtime_error("threaded CPU scatter reservation requires an initialized proxy");
+        if (address_columns != 1 && address_columns != 2)
+            throw std::runtime_error("threaded CPU scatter reservation requires one or two address columns");
+        select_proxy_cuda_device(*handle);
+        handle->proxy.reserve_threaded_cpu_scatter(static_cast<std::size_t>(address_columns));
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
 extern "C" int rdma_proxy_configure_cpu_scatter(
     RdmaProxyHandle* handle, const RdmaProxyCpuScatterConfig* config) {
     clear_error();

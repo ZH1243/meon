@@ -55,12 +55,17 @@ void check_dynamic_rank(int gpu, const std::string& run_id, const std::string& p
     int32_t enabled = 0;
     require(handle && rdma_proxy_dynamic_routing_enabled(handle, &enabled) == 0 && enabled == 1);
     require(rdma_proxy_initialize(handle) == 0);
+    const int32_t address_columns = gpu + 1;  // Exercise both supported layouts.
+    require(rdma_proxy_reserve_threaded_cpu_scatter(handle, 0) != 0 && *rdma_proxy_last_error());
+    require(rdma_proxy_reserve_threaded_cpu_scatter(handle, 3) != 0 && *rdma_proxy_last_error());
+    require(rdma_proxy_reserve_threaded_cpu_scatter(handle, address_columns) == 0 && !*rdma_proxy_last_error());
     uint64_t indices = 0, table_rows = 0, count = 0, tokens = 0, top_k = 0;
     require(rdma_proxy_get_routing_extents(handle, &indices, &table_rows) != 0);
     std::vector<int32_t> previous;
     for (uint64_t i = 0; i < 3; ++i) {
         require(rdma_proxy_prepare_routing(handle, i + 1) != 0);
         require(rdma_proxy_prepare_routing(handle, i) == 0 && rdma_proxy_prepare_routing(handle, i) == 0);
+        require(rdma_proxy_reserve_threaded_cpu_scatter(handle, address_columns) != 0 && *rdma_proxy_last_error());
         require(rdma_proxy_get_routing_extents(handle, &indices, &table_rows) == 0 && indices && table_rows);
         std::vector<int32_t> experts(32);
         std::vector<float> weights(32);
@@ -142,7 +147,9 @@ int main(int argc, char** argv) {
         benchmark_config.struct_size = sizeof(benchmark_config) - 1;
         if (rdma_proxy_get_benchmark_routing_config(provider.get(), &benchmark_config) == 0) return 1;
     }
-    if (rdma_proxy_configure_cpu_scatter_threaded(nullptr, 16) == 0 ||
+    if (rdma_proxy_reserve_threaded_cpu_scatter(nullptr, 1) == 0 ||
+        rdma_proxy_reserve_threaded_cpu_scatter(handle, 1) == 0 ||
+        rdma_proxy_configure_cpu_scatter_threaded(nullptr, 16) == 0 ||
         rdma_proxy_configure_cpu_scatter_threaded(handle, 16) == 0) {
         std::cerr << "threaded scatter accepted a null or uninitialized proxy\n";
         rdma_proxy_destroy(handle);
@@ -158,6 +165,11 @@ int main(int argc, char** argv) {
     }
     if (rdma_proxy_initialize(handle) != 0) {
         std::cerr << "per-iteration proxy initialization failed: " << rdma_proxy_last_error() << '\n';
+        rdma_proxy_destroy(handle);
+        return 1;
+    }
+    if (rdma_proxy_reserve_threaded_cpu_scatter(handle, 1) == 0) {
+        std::cerr << "threaded scatter reservation accepted a static route\n";
         rdma_proxy_destroy(handle);
         return 1;
     }

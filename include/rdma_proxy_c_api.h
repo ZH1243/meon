@@ -41,6 +41,15 @@ typedef struct RdmaProxyCpuScatterConfig {
  * types and standard-library objects never cross the shared-library boundary.
  */
 typedef struct RdmaProxyHandle RdmaProxyHandle;
+
+/* Optional startup reservation for threaded CPU scatter with dynamic routing.
+ * Call on an initialized handle before preparing or installing generation zero.
+ * address_columns is 1 for row-major output and 2 for N-tile-major output.
+ * The proxy owns the pinned storage through shutdown. Each nonempty generation
+ * still binds its current scatter destinations, weights and publication policy. */
+RDMA_PROXY_C_API int rdma_proxy_reserve_threaded_cpu_scatter(
+    RdmaProxyHandle* handle, int32_t address_columns);
+
 RDMA_PROXY_C_API int rdma_proxy_configure_cpu_scatter(
     RdmaProxyHandle* handle, const RdmaProxyCpuScatterConfig* config);
 

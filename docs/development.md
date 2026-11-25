@@ -161,7 +161,18 @@ The source seed for zero-based iteration `i` is `router_seed + 0x9e3779b97f4a7c1
 
 The torchrun worker also accepts `--dynamic-routing`. At the end of a concurrent run, each rank prints `routing node=… gpu=… iteration=… elapsed_us=…`. This is host wall time from entry to return of `rdma_proxy_prepare_routing`, including generation, exchange, staging and native installation. Python then binds the new compute views. Iteration zero includes first-use allocation of route and scheduler storage. The separate `pipeline iteration … elapsed_ms=…` line includes payload and compute. With `--dynamic-routing` alone, the runtime uses the shared raw CUDA routing kernels and its native metadata worker.
 
-**Validation.** On macOS 15.6.1 arm64 with Apple Clang 14, CPU-only PyTorch 1.13.1 and a Debug build, the runtime native suite passed 44 tests with four CUDA tests skipped. The Python suite passed 82 tests with eight skipped. The shared metadata checks passed all four tests. The CPU exchange benchmark passed its native codec test and all 38 Python tests on rerun after one loopback TCP timeout. The GPU exchange benchmark passed its ten host tests. The exact host commands are in [Mac or CPU-only development](#mac-or-cpu-only-development). CUDA compilation, the numerical checks with QuACK, and two-node GPU/RDMA transport and timing still require the Hopper hosts. The production record-layout test runs with `ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R test_iteration_metadata_cuda --output-on-failure` on a CUDA host. Run the dynamic combine tests there with `RDMA_PROXY_TEST_CUDA=1 python -m unittest discover -s tests/python -p test_dynamic_routing.py -v`.
+To check threaded CPU scatter staging on the host, run these commands from the meon root.
+
+```bash
+cmake -S . -B build/mock -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/mock --target test_cpu_scatter -j4
+ctest --test-dir build/mock -R '^test_cpu_scatter$' --output-on-failure
+python -m unittest discover -s tests/python -p test_cpu_scatter_publication.py -v
+```
+
+On Hopper, run `ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R '^test_cpu_scatter_cuda$' --output-on-failure` after building the CUDA tests. Rebuild the shared library on both hosts and repeat the dynamic numerical check above with `--cpu-scatter-preparation --cpu-scatter-publication=threaded`. In a CUDA API trace of the two-node timing run, look for the pinned scatter allocation during setup and the single scatter metadata H2D per nonempty iteration. Its byte count follows the current route count. The [scatter staging description](runtime.md#optional-cpu-scatter-preparation) gives the expected capacity and upload sizes.
+
+**Validation.** On macOS 15.6.1 arm64 with Apple Clang 14, CPU-only PyTorch 1.13.1 and a Debug build, the runtime native suite passed 44 tests with four CUDA tests skipped. The Python suite passed 83 tests with eight skipped. The shared metadata checks passed all four tests. The CPU exchange benchmark passed its native codec test and all 38 Python tests on rerun after one loopback TCP timeout. The GPU exchange benchmark passed its ten host tests. The exact host commands are in [Mac or CPU-only development](#mac-or-cpu-only-development). CUDA compilation, the numerical checks with QuACK, and two-node GPU/RDMA transport and timing still require the Hopper hosts. The production record-layout test runs with `ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R test_iteration_metadata_cuda --output-on-failure` on a CUDA host. Run the dynamic combine tests there with `RDMA_PROXY_TEST_CUDA=1 python -m unittest discover -s tests/python -p test_dynamic_routing.py -v`.
 
 ### Benchmark metadata backend
 
@@ -377,7 +388,7 @@ ctest --test-dir build/mock --output-on-failure
 ./build/mock/rdma_cpu_proxy --config config/example_config.json --cpu_affinity=none
 python3 -m unittest discover -s tests/python -v
 # Validation on the arm64 Mac used the CPU-PyTorch Python environment.
-# PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -m unittest discover -s tests/python -p 'test_*.py'
+# OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -v
 python3 -m unittest discover -s metadata -p test_metadata_cute.py -v
 for f in scripts/*.sh metadata/*.sh benchmarks/*/*.sh; do bash -n "$f" || exit 1; done
 TORCHRUN_BIN=echo bash scripts/run_single_node_torchrun.sh

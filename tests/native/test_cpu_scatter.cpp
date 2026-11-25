@@ -27,6 +27,12 @@ struct alignas(16) SlabBlock { unsigned char bytes[16]; };
 // Test-only access: production exposes no callbacks or thread-control API.
 namespace rdma_proxy {
 struct CpuScatterTestAccess {
+    static void require_no_batch_staging(const CudaBuffers& buffers) {
+        require(!buffers.cpu_scatter_staging_.ptr && !buffers.cpu_route_weights_staging_.ptr);
+    }
+    static const CpuPinnedBuffer& slab(const CudaBuffers& buffers) {
+        return buffers.cpu_scatter_host_slab_;
+    }
     static void set_hook(CudaBuffers& buffers, std::function<void()> hook) {
         buffers.cpu_scatter_pack_test_hook_ = std::move(hook);
     }
@@ -229,6 +235,7 @@ static void run(bool per_entry, uint64_t tile, bool cuda, int weight_mode,
         buffers.configure_cpu_route_weights(reinterpret_cast<uintptr_t>(device_weights), routes);
     }
     if (single_upload) {
+        CpuScatterTestAccess::require_no_batch_staging(buffers);
         const auto configure = [&](std::size_t bytes) {
             if (threaded) buffers.configure_cpu_scatter_threaded(bytes);
             else buffers.configure_cpu_scatter_deferred(bytes);
@@ -572,6 +579,138 @@ static void run(bool per_entry, uint64_t tile, bool cuda, int weight_mode,
 #endif
     destroy_cuda_stream(compute_stream, config.mock_mode);
 }
+
+static void test_threaded_dynamic_slab_reuse(bool reserve_at_startup, bool cuda) {
+    ProxyConfig c;
+    c.mock_mode = !cuda;
+    c.router_routing_enabled = c.router_dynamic_routing_enabled = true;
+    c.router_weighted_contributions_enabled = c.nvlink_forwarding_enabled = true;
+    c.nvlink_forward_completion_notifications_enabled = true;
+    c.num_nodes = 1;
+    c.num_gpus_per_node = c.router_num_experts = 2;
+    c.router_top_k = 1;
+    c.num_tokens = 4;
+    c.token_dimension = c.expert_gemm_dimension = c.expert_gemm_n_tile = 1;
+    c.expert_gemm_m_tile = 16;  // All assignments form a single M batch in source order.
+    c.dtype = DataType::kBF16;
+
+    const auto destroy_stream = [&](void* stream) { destroy_cuda_stream(stream, c.mock_mode); };
+    std::unique_ptr<void, decltype(destroy_stream)> consumer_stream(
+        create_cuda_stream(c.cuda_device_id, true, c.mock_mode), destroy_stream);
+    const auto stream_address = cuda ? reinterpret_cast<uintptr_t>(consumer_stream.get()) : uintptr_t{1};
+    alignas(16) unsigned char mock_destination[256];
+    auto* destination = mock_destination;
+#if RDMA_PROXY_HAVE_CUDA
+    std::unique_ptr<void, decltype(&cudaFree)> managed_destination(nullptr, cudaFree);
+    if (cuda) {
+        void* allocation = nullptr;
+        require(cudaMallocManaged(&allocation, sizeof(mock_destination)) == cudaSuccess);
+        managed_destination.reset(allocation);
+        destination = static_cast<unsigned char*>(allocation);
+    }
+#endif
+    // Join the publisher and finish all copies before releasing its destination.
+    CudaBuffers buffers(c);
+    buffers.initialize();
+    constexpr std::size_t reserved_bytes = 8 * (sizeof(int64_t) + sizeof(float));
+    void* pinned = nullptr;
+    if (reserve_at_startup) {
+        buffers.reserve_threaded_cpu_scatter(1);
+        const auto& slab = CpuScatterTestAccess::slab(buffers);
+        pinned = slab.ptr;
+        require(pinned && slab.bytes == reserved_bytes);
+    }
+    const std::vector<std::vector<std::vector<int32_t>>> epochs{
+        {{}, {}}, {{0}, {}}, {{0,1,2,3}, {0,1,2,3}}, {{}, {}}, {{1,2,3}, {}}, {{}, {1}},
+    };
+    for (std::size_t epoch = 0; epoch < epochs.size(); ++epoch) {
+        const bool per_batch = epoch + 1 == epochs.size();
+        const auto& lists = epochs[epoch];
+        std::vector<RouterExpertMetadata> metadata;
+        std::vector<float> expected_weights;
+        for (int source = 0; source < 2; ++source) {
+            auto& m = metadata.emplace_back();
+            m.destination_node_rank = m.destination_gpu_index = m.source_node_rank = 0;
+            m.source_gpu_index = source;
+            m.num_nodes = m.experts_per_gpu = m.top_k = 1;
+            m.num_gpus_per_node = m.num_experts = 2;
+            m.num_tokens = c.num_tokens;
+            m.expert_token_indices = lists[source];
+            m.expert_offsets = {0, static_cast<int32_t>(lists[source].size())};
+            m.weighted_contributions = true;
+            for (const auto row : lists[source]) {
+                const float weight = (1 + epoch + source + row) * 0.125f;
+                m.expert_route_weights.push_back(weight);
+                expected_weights.push_back(weight);
+            }
+        }
+        buffers.install_iteration_expert_metadata(std::move(metadata), epoch);
+        const auto& slab = CpuScatterTestAccess::slab(buffers);
+        if (pinned) require(slab.ptr == pinned);  // Still owned between route bindings.
+        auto& publication = buffers.router_notification_publication_buffers();
+        const auto previous_bytes = publication.cpu_scatter_copy_bytes.load();
+        const auto previous_copies = publication.cpu_scatter_copy_count.load();
+        const auto routes = expected_weights.size();
+        if (!routes) {
+            buffers.begin_router_notification_iteration(epoch);
+            buffers.flush_router_notification_publication();
+            require(publication.cpu_scatter_copy_count == previous_copies);
+            continue;
+        }
+        const auto scatter_bytes = routes * sizeof(int64_t);
+        const auto weight_offset = (scatter_bytes + 15) & ~std::size_t{15};
+        const auto active_bytes = weight_offset + routes * sizeof(float);
+        int32_t pairs[]{0, 0, 0, 1};
+        uint64_t bases[]{0x1000, 0x2000};
+        int64_t counts[2], inverse[8];
+        RdmaProxyCpuScatterConfig setup{sizeof(setup), 2, routes, c.num_tokens, 1, 0, 2,
+            reinterpret_cast<uintptr_t>(destination), pairs, bases, counts, inverse};
+        buffers.configure_cpu_scatter(setup);
+        buffers.configure_cpu_route_weights(reinterpret_cast<uintptr_t>(destination + weight_offset), routes);
+        CpuScatterTestAccess::require_no_batch_staging(buffers);
+        if (!per_batch) {
+            buffers.configure_cpu_scatter_threaded(active_bytes);
+            if (!pinned) pinned = slab.ptr;
+        }
+        require(pinned && slab.ptr == pinned && slab.bytes == reserved_bytes);
+
+        // Leave old packed bytes in the pinned slab, and detect oversized uploads
+        // into the device destination even when the new route is smaller.
+#if RDMA_PROXY_HAVE_CUDA
+        if (cuda) require(cudaDeviceSynchronize() == cudaSuccess);
+#endif
+        std::memset(destination, 0xa5, sizeof(mock_destination));
+        buffers.begin_router_notification_iteration(epoch);
+        for (int source = 0; source < 2; ++source)
+            buffers.process_router_notification_completion(0, source, epoch, 0, c.num_tokens);
+        if (per_batch) {
+            // A reservation alone must not select the one-copy publication path.
+            rejects([&] { buffers.wait_cpu_scatter_ready(epoch, stream_address, 1); });
+            buffers.synchronize_router_notification_publication();
+            require(publication.cpu_scatter_copy_count == previous_copies + 2);
+            require(publication.cpu_scatter_copy_bytes == previous_bytes + scatter_bytes + routes * sizeof(float));
+        } else {
+            buffers.wait_cpu_scatter_ready(epoch, stream_address, 5000);
+            synchronize_cuda_stream(consumer_stream.get(), c.mock_mode);
+            require(publication.cpu_scatter_copy_count == previous_copies + 1);
+            require(publication.cpu_scatter_copy_bytes == previous_bytes + active_bytes);
+        }
+        std::size_t packed = 0;
+        for (int source = 0; source < 2; ++source) {
+            for (std::size_t row = 0; row < lists[source].size(); ++row, ++packed) {
+                const auto address = bases[source] + row * 2;
+                require(std::memcmp(destination + packed * sizeof(address), &address, sizeof(address)) == 0);
+            }
+        }
+        require(std::memcmp(destination + weight_offset, expected_weights.data(), routes * sizeof(float)) == 0);
+        const unsigned char expected_padding = per_batch ? 0xa5 : 0;
+        require(std::all_of(destination + scatter_bytes, destination + weight_offset,
+                            [&](unsigned char value) { return value == expected_padding; }));
+        require(std::all_of(destination + active_bytes, destination + sizeof(mock_destination),
+                            [](unsigned char value) { return value == 0xa5; }));
+    }
+}
+
 int main(int argc, char** argv) {
     const bool cuda = argc == 2 && std::string(argv[1]) == "--cuda";
     if (cuda) {
@@ -590,6 +729,8 @@ int main(int argc, char** argv) {
     // position-specific weights in the SAME packed slots in both iterations.
     run(true, 128, cuda, 1, 0, true, 0, true);
     run(false, 128, cuda, 1, 2, false, 0, true);
+    test_threaded_dynamic_slab_reuse(true, cuda);
+    test_threaded_dynamic_slab_reuse(false, cuda);
     if (!cuda) {
         run(false, 128, false, 1, 2, false, 1); // busy reset and worker failure
         run(false, 128, false, 1, 2, false, 2); // destructor joins a busy worker

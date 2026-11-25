@@ -803,6 +803,12 @@ std::size_t Proxy::router_computation_num_tokens() const {
     return cuda_buffers_.router_computation_num_tokens();
 }
 
+void Proxy::reserve_threaded_cpu_scatter(std::size_t address_columns) {
+    if (!initialized_ || !config_.router_dynamic_routing_enabled || routing_iteration_ || routing_failed_)
+        throw std::runtime_error("reserve threaded CPU scatter before preparing the first dynamic route");
+    cuda_buffers_.reserve_threaded_cpu_scatter(address_columns);
+}
+
 void Proxy::configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config) {
     if (!initialized_ || iteration_prepared_)
         throw std::runtime_error("CPU scatter requires initialized idle proxy");

@@ -251,6 +251,7 @@ public:
     void record_router_computation_end(uint64_t iteration, uintptr_t cuda_stream);
     float router_computation_elapsed_ms(uint64_t iteration);
     std::size_t router_computation_num_tokens() const;
+    void reserve_threaded_cpu_scatter(std::size_t address_columns);
     void configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config);
     void configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes);
     void configure_cpu_scatter_deferred(std::size_t bytes);
@@ -341,7 +342,9 @@ private:
 
     ProxyConfig config_;
     friend struct CpuScatterTestAccess;
-    void configure_cpu_scatter_slab_locked(std::size_t bytes);
+    void reserve_threaded_cpu_scatter_locked(std::size_t address_columns);
+    void reserve_cpu_scatter_slab_locked(std::size_t capacity);
+    void configure_cpu_scatter_slab_locked(std::size_t bytes, bool threaded);
     std::pair<std::size_t, std::size_t> pack_cpu_scatter_batch(const int32_t* ranges);
     void prepare_cpu_scatter_batch(const int32_t* ranges);
     void upload_cpu_scatter_slab();
@@ -351,7 +354,11 @@ private:
     void publish_deferred_cpu_scatter_locked();
     CpuPinnedBuffer cpu_scatter_staging_;
     CpuPinnedBuffer cpu_route_weights_staging_;
-    CpuPinnedBuffer cpu_scatter_deferred_staging_;
+    // A threaded reservation survives route changes. The active byte count
+    // binds just this generation's prefix to its one-copy device destination.
+    CpuPinnedBuffer cpu_scatter_host_slab_;
+    std::size_t cpu_scatter_reserved_columns_{0};
+    std::size_t cpu_scatter_active_bytes_{0};
     std::size_t cpu_scatter_routes_{0};
     std::size_t cpu_scatter_weight_offset_{0};
     std::size_t cpu_scatter_staged_rows_{0};

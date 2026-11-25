@@ -47,6 +47,7 @@ public:
     void record_router_computation_end(uint64_t iteration, uintptr_t cuda_stream);
     float router_computation_elapsed_ms(uint64_t iteration);
     std::size_t router_computation_num_tokens() const;
+    void reserve_threaded_cpu_scatter(std::size_t address_columns);
     void configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config);
     void configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes);
     void configure_cpu_scatter_deferred(std::size_t bytes);

@@ -1933,6 +1933,15 @@ def run_proxy_with_concurrent_kernel(
         benchmark_timings = []
         extents = None
         if dynamic:
+            if (down_options.down_projection2 and down_options.cpu_scatter_preparation
+                    and down_options.cpu_scatter_publication == "threaded"):
+                # Older ABI-v1 libraries allocate staging during scatter configuration.
+                reserve = getattr(library, "rdma_proxy_reserve_threaded_cpu_scatter", None)
+                if reserve is not None:
+                    reserve.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+                    reserve.restype = ctypes.c_int
+                    columns = 2 if down_options.down_n_tile_major_output else 1
+                    require_proxy_success(library, reserve(handle, columns), "reserving threaded CPU scatter staging")
             extents, elapsed = prepare_epoch(0)
             routing_times_ns.append(elapsed)
         grouped_gemm = GroupedGemmRunner(

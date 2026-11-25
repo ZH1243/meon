@@ -57,7 +57,8 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                            (worker.DEVICE_BUFFER_NVLINK_RECEIVE, -1, 1, 0): object()}
         self.assertEqual(buffers.benchmark_staging_buffers(), (source, destination))
 
-    def run_worker(self, *, compute=False, fail_epoch=None):
+    def run_worker(self, *, compute=False, fail_epoch=None, scatter_publication=None,
+                   tile_major=True, has_reservation_api=True):
         events, output = [], io.StringIO()
 
         def status(name):
@@ -80,6 +81,8 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
             rdma_proxy_record_computation_end=status("up_end"), rdma_proxy_get_computation_elapsed_ms=write(1.0),
             rdma_proxy_finish=status("finish"), rdma_proxy_shutdown=status("shutdown"), rdma_proxy_destroy=status("destroy"),
         )
+        if has_reservation_api:
+            library.rdma_proxy_reserve_threaded_cpu_scatter = status("reserve_scatter")
         buffers = SimpleNamespace(finish_initialization=lambda: events.append(("buffers",)), tensors_of_kind=lambda _: [])
         test = self
 
@@ -121,8 +124,11 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
             get_device_capability=lambda _: (9, 0), Stream=lambda **_: stream,
             Event=lambda **_: SimpleNamespace(record=lambda _: None, synchronize=lambda: None),
             stream=lambda _: contextlib.nullcontext(), synchronize=lambda _: None))
-        options = SimpleNamespace(pooled_up_gemm=False, down_projection2=False, benchmark_ready_up_gemm=False,
-                                  check_projections=False, trace_down_ready=False)
+        options = SimpleNamespace(pooled_up_gemm=False, down_projection2=scatter_publication is not None,
+                                  cpu_scatter_preparation=scatter_publication is not None,
+                                  cpu_scatter_publication=scatter_publication, down_n_tile_major_output=tile_major,
+                                  down_pingpong=None, down_gather_table_wave_barrier=True,
+                                  benchmark_ready_up_gemm=False, check_projections=False, trace_down_ready=False)
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.dict(sys.modules, benchmark_metadata_backend=SimpleNamespace(
                 BenchmarkMetadataBackend=Provider)))
@@ -171,6 +177,19 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
         events, _ = self.run_worker(fail_epoch=1)
         self.assertEqual(events[-4:], [("install", 1), ("shutdown",), ("close", False), ("destroy",)])
         self.assertNotIn(("prepare", 1), events)
+
+    def test_threaded_scatter_reserves_before_first_route_counts_are_available(self):
+        for mode, tiled, has_api, expected in (
+                ("threaded", True, True, [("reserve_scatter", 2)]),
+                ("threaded", False, True, [("reserve_scatter", 1)]),
+                ("threaded", True, False, []),
+                ("deferred", True, True, []),
+                ("per-batch", True, True, [])):
+            with self.subTest(mode=mode, tiled=tiled, has_api=has_api):
+                events, _ = self.run_worker(compute=True, fail_epoch=0, scatter_publication=mode,
+                                            tile_major=tiled, has_reservation_api=has_api)
+                before_route = events[:events.index(("install", 0))]
+                self.assertEqual(before_route, [("init",), ("buffers",), ("provider",), *expected])
 
 
 if __name__ == "__main__":

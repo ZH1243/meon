@@ -1895,11 +1895,11 @@ bash ./scripts/run_node1_torchrun.sh --cpu-scatter-preparation
 
 After metadata exchange and down-runner warmup, the CPU derives sorted compact
 destinations from all meaningful expert indices for each active source. It
-returns valid counts and output-to-input maps to Python once and precomputes
+returns valid counts and output-to-input maps to Python and precomputes
 each A_idx entry's destination address. N-tile-major output also stores the
-per-source valid-count-based tile stride; in this mode tile N must divide the
-output width. Routing metadata and output allocations must remain fixed through
-the run, as they do in the supplied test.
+per-source valid-count-based tile stride. Tile N must divide the output width
+in this layout. Fixed routing binds these maps once. Dynamic routing rebuilds
+them for each nonempty generation.
 
 With the default `--cpu-scatter-publication=deferred`, the notification receiver
 does no scatter-address or routing-weight packing between gather submissions.
@@ -1931,12 +1931,24 @@ The native thread is named `rdma-scatter` for profiling.
 Compare it with deferred mode on the target node to measure whether earlier
 packing reduces the up-to-down gap enough to offset CPU contention and wakeups.
 
-Scatter addresses, optional N-tile strides, and optional FP32 routing weights
-share one contiguous allocation. Row-major addresses use 8 bytes per route;
-N-tile-major addresses use 16. Weighted mode appends 4 bytes per route, with the
-weight vector aligned to 16 bytes (at most 8 bytes of padding). No gather table
-or token payload is included in this upload. Both typed views and their owning
-allocation stay alive through native shutdown.
+In threaded and deferred modes the addresses, optional N-tile strides and optional
+FP32 weights share one contiguous metadata upload. Each row-major entry uses 8 bytes
+and each N-tile-major entry uses 16. Weighted mode appends 4 bytes per assignment,
+starting at the next 16-byte boundary after the current generation's addresses.
+Python retains the destination and its typed views until their last native use.
+
+With dynamic routing and threaded publication, the torchrun worker reserves one
+pinned host buffer during setup, even when the first generation has zero routes.
+Its maximum assignment count is `active_sources * num_tokens * min(top_k, experts_per_gpu)`.
+For 16 sources, 20,480 tokens, top-8 and eight local experts,
+the maximum is 2,621,440 assignments. Unweighted N-tile-major output reserves
+40 MiB per rank. A generation with 163,697 assignments uploads 2,619,152 bytes.
+The worker repacks each generation directly into the same buffer and transfers
+only the active bytes. An embedding can call `rdma_proxy_reserve_threaded_cpu_scatter`
+on the initialized handle before installing generation zero or let the first
+nonempty threaded configuration reserve it. Fixed routing can size
+the buffer from its known assignment count. The per-batch and deferred policies
+keep their respective per-batch and whole-generation publication schedules.
 
 Down GEMM explicitly waits on the upload's CUDA event. Because a CUDA event wait
 cannot target a future event record, the launching host thread first waits only

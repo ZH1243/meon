@@ -723,6 +723,19 @@ extern "C" int rdma_proxy_get_outgoing_token_indices(
     } catch (...) { return record_current_exception(); }
 }
 
+extern "C" int rdma_proxy_build_inter_node_combine_rows(
+    RdmaProxyHandle* handle, const int32_t* destination_nodes, uint64_t num_nodes,
+    uint64_t num_tokens, int32_t* rows, uint64_t row_elements) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || handle->finished)
+            throw std::runtime_error("combine row setup requires an initialized idle proxy");
+        handle->proxy.build_inter_node_combine_rows(
+            destination_nodes, num_nodes, num_tokens, rows, row_elements);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
 extern "C" int rdma_proxy_get_rdma_return_receive_rows(
     RdmaProxyHandle* handle, int32_t peer, uint64_t* rows) {
     clear_error();

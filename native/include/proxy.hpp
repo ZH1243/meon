@@ -68,6 +68,8 @@ public:
     std::vector<uint8_t> intra_node_source_masks(int source_node) const;
     void build_intra_node_combine_rows(const int32_t* source_nodes, uint64_t num_nodes,
         uint64_t capacity, int32_t* rows, uint64_t row_elements, uint64_t* domain_counts) const;
+    void build_inter_node_combine_rows(const int32_t* destination_nodes, uint64_t num_nodes,
+        uint64_t num_tokens, int32_t* rows, uint64_t row_elements) const;
     const std::vector<std::size_t>& outgoing_token_indices(int destination_node) const;
     std::size_t rdma_return_receive_rows(int peer) const;
     uintptr_t configure_rdma_returns(const RdmaProxyNetworkReturnBuffer* buffers, std::size_t count,
@@ -318,6 +320,7 @@ private:
     bool routing_install_required(uint64_t iteration) const;
     void install_iteration_routing(uint64_t iteration, IterationRouteData route);
     std::shared_lock<std::shared_mutex> lock_forwarding_routes() const;
+    std::shared_lock<std::shared_mutex> lock_installed_combine_route() const;
     void prepare_forwarding_destinations();
     void publish_local_nvlink_receive_buffers();
     ForwardDestinationState load_forward_destination(int dst_gpu);

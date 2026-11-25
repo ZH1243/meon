@@ -20,34 +20,45 @@ def inverse_token_rows(token_lists, num_tokens):
 class TokenOrderCombine:
     """All inputs must be complete before run(); run joins before buffer reuse.
 
-    Inputs are in ascending node order. Empty domains are omitted from the
-    compiled tuple, but tokens without any contribution are still written zero.
+    Inputs are in ascending node order. Fixed routes omit empty domains from the
+    compiled tuple. Dynamic routes retain all domains so they can grow later.
     """
 
-    def __init__(self, inputs, token_lists, num_tokens, check=False, ctas=None, capacity_buffers=None):
+    def __init__(self, inputs, token_lists, num_tokens, check=False, ctas=None, capacity_buffers=None,
+                 *, prepared_rows=None):
         import torch
         import cuda.bindings.driver as cuda
         import cutlass.cute as cute
         from cutlass.cute.runtime import from_dlpack
         from intra_node_combine_kernel import RegisterInterNodeKernel
 
-        if not inputs or len(inputs) != len(token_lists):
+        if not inputs or (prepared_rows is None and (token_lists is None or len(inputs) != len(token_lists))):
             raise ValueError("inter-node combine requires one x3 list per input")
+        if num_tokens < 0:
+            raise ValueError("num_tokens must be nonnegative")
         if ctas is not None and ctas <= 0:
             raise ValueError("inter-node combine CTA count must be positive")
         first = inputs[0]
         if first.ndim != 3 or first.dtype not in (torch.bfloat16, torch.float16):
             raise ValueError("inter-node combine requires tiled BF16/FP16 inputs")
+        if prepared_rows is not None and (
+                capacity_buffers is None or len(capacity_buffers) != len(inputs)
+                or prepared_rows.shape != (len(inputs), num_tokens + 2)
+                or prepared_rows.dtype != torch.int32 or prepared_rows.device != first.device
+                or not prepared_rows.is_contiguous()):
+            raise ValueError("invalid dynamic inter-node combine row table or capacity buffers")
         tiles, _, tile = first.shape
         width = tiles * tile
         if not width or tile % 8 or num_tokens * width > 2**31 - 1:
             raise ValueError("invalid inter-node width/alignment or int32 index overflow")
-        for tensor, tokens in zip(inputs, token_lists):
-            if (tensor.shape != (tiles, len(tokens), tile) or not tensor.is_contiguous()
+        # The native builder has already checked its live counts against the input views.
+        counts = ([tensor.shape[1] for tensor in inputs] if prepared_rows is not None
+                  else [len(tokens) for tokens in token_lists])
+        for tensor, count in zip(inputs, counts):
+            if (tensor.shape != (tiles, count, tile) or not tensor.is_contiguous()
                     or tensor.dtype != first.dtype or tensor.device != first.device
                     or tensor.numel() > 2**31 - 1):
                 raise ValueError("inter-node input layout/rows/dtype/device mismatch")
-        inverse = inverse_token_rows(token_lists, num_tokens)
         self.torch, self.cuda = torch, cuda
         self.inputs, self.token_lists = tuple(inputs), token_lists
         self.num_tokens, self.width = num_tokens, width
@@ -59,15 +70,19 @@ class TokenOrderCombine:
         self.compiled = None
         self.num_ctas = (ctas if ctas is not None else
                          torch.cuda.get_device_properties(first.device).multi_processor_count)
-        active = (list(range(len(token_lists))) if capacity_buffers is not None else
-                  [i for i, tokens in enumerate(token_lists) if tokens])
-        if capacity_buffers is not None:
-            # The persistent kernel reads each live packed tile stride after the inverse row list.
-            inverse = [row + [len(tokens), 0] for row, tokens in zip(inverse, token_lists)]
-        self.rows = torch.tensor([inverse[i] for i in active], dtype=torch.int32,
-                                 device=first.device) if active and num_tokens else torch.full(
-                                     (max(1, len(active)), max(1, num_tokens)), -1,
-                                     dtype=torch.int32, device=first.device)
+        active = (list(range(len(inputs))) if capacity_buffers is not None else
+                  [i for i, count in enumerate(counts) if count])
+        if prepared_rows is not None:
+            self.rows = prepared_rows
+        else:
+            inverse = inverse_token_rows(token_lists, num_tokens)
+            if capacity_buffers is not None:
+                # The kernel reads each live packed tile stride after the inverse row list.
+                inverse = [row + [count, 0] for row, count in zip(inverse, counts)]
+            self.rows = torch.tensor([inverse[i] for i in active], dtype=torch.int32,
+                                     device=first.device) if active and num_tokens else torch.full(
+                                         (max(1, len(active)), max(1, num_tokens)), -1,
+                                         dtype=torch.int32, device=first.device)
         self.buffers = tuple(inputs[i].view(-1) for i in active) if capacity_buffers is None else tuple(capacity_buffers)
         if num_tokens:
             self.arguments = (
@@ -81,7 +96,7 @@ class TokenOrderCombine:
             while (tile // vec) % lanes:
                 lanes //= 2
             kernel = RegisterInterNodeKernel(
-                tuple(num_tokens if capacity_buffers is not None else len(token_lists[i]) for i in active), width, tile,
+                tuple(num_tokens if capacity_buffers is not None else counts[i] for i in active), width, tile,
                 self.num_ctas,
                 vec, 256, False, 0)
             kernel.source_tokens = num_tokens
@@ -137,28 +152,67 @@ class TokenOrderCombine:
 
 class InterNodeCombine(TokenOrderCombine):
     def __init__(self, combine, options):
-        inputs, token_lists, num_tokens = self._read_routes(combine)
+        inputs, token_lists, num_tokens, rows = self._init_route_data(combine)
         capacity_buffers = None
         if combine.dynamic_capacity is not None:
             capacity_buffers = tuple(
                 combine.storage_for_node(node) if node == combine.exchange.node
                 else combine.rdma_return.receive_storage[node] for node in combine.nodes)
         super().__init__(inputs, token_lists, num_tokens, options.check_inter_node_combine,
-                         ctas=options.inter_node_combine_ctas, capacity_buffers=capacity_buffers)
+                         ctas=options.inter_node_combine_ctas, capacity_buffers=capacity_buffers,
+                         prepared_rows=rows)
+        row_builder = "native" if self._build_rows is not None else "python"
         print(f"Inter-node combine: CTAs={self.num_ctas}, output={tuple(self.output.shape)} row-major, "
-              "original token order; runs after local combine and any RDMA returns", flush=True)
+              "original token order; runs after local combine and any RDMA returns, "
+              f"row_builder={row_builder}", flush=True)
 
     @staticmethod
-    def _read_routes(combine):
-        exchange = combine.exchange
+    def _live_inputs(combine):
+        return tuple(combine.outputs[node] if node == combine.exchange.node else combine.rdma_return.received[node]
+                     for node in combine.nodes)
+
+    def _init_route_data(self, combine):
+        self._exchange = combine.exchange
+        self._nodes = (ctypes.c_int32 * len(combine.nodes))(*combine.nodes)
+        inputs = self._live_inputs(combine)
+        num_tokens = combine.dynamic_capacity
+        self._build_rows = (getattr(self._exchange.library, "rdma_proxy_build_inter_node_combine_rows", None)
+                            if num_tokens is not None else None)
+        if self._build_rows is None:
+            token_lists, num_tokens = self._read_token_lists()
+            return inputs, token_lists, num_tokens, None
+
+        torch = self._exchange.torch
+        device = inputs[0].device
+        self._build_rows.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_uint64,
+                                     ctypes.c_uint64, ctypes.POINTER(ctypes.c_int32), ctypes.c_uint64]
+        self._build_rows.restype = ctypes.c_int
+        self.rows_host = torch.empty((len(self._nodes), num_tokens + 2), dtype=torch.int32,
+                                     device="cpu", pin_memory=device.type == "cuda")
+        rows = torch.empty_like(self.rows_host, device=device)
+        self._upload_native_rows(inputs, rows, num_tokens)
+        return inputs, None, num_tokens, rows
+
+    def _upload_native_rows(self, inputs, rows, num_tokens):
+        host = self.rows_host
+        self._exchange.require(self._build_rows(
+            self._exchange.handle, self._nodes, len(self._nodes), num_tokens,
+            ctypes.cast(host.data_ptr(), ctypes.POINTER(ctypes.c_int32)), host.numel()))
+        if host[:, -2].tolist() != [tensor.shape[1] for tensor in inputs]:
+            raise ValueError("outgoing x3 lengths disagree with inter-node input views")
+        # Complete the DMA read before a subsequent generation can reuse host storage.
+        rows.copy_(host)
+
+    def _read_token_lists(self):
+        exchange = self._exchange
         query = exchange.library.rdma_proxy_get_outgoing_token_indices
         query.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_uint64),
                           ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64),
                           ctypes.POINTER(ctypes.c_uint64)]
         query.restype = ctypes.c_int
-        inputs, token_lists = [], []
+        token_lists = []
         num_tokens = None
-        for node in combine.nodes:
+        for node in self._nodes:
             count, total = ctypes.c_uint64(), ctypes.c_uint64()
             exchange.require(query(exchange.handle, node, None, 0,
                                    ctypes.byref(count), ctypes.byref(total)))
@@ -169,12 +223,26 @@ class InterNodeCombine(TokenOrderCombine):
                 raise ValueError("inconsistent original token count")
             num_tokens = total.value
             token_lists.append(list(indices))
-            inputs.append(combine.outputs[node] if node == exchange.node
-                          else combine.rdma_return.received[node])
-        return inputs, token_lists, num_tokens
+        return token_lists, num_tokens
 
     def refresh_routes(self, combine):
-        inputs, token_lists, num_tokens = self._read_routes(combine)
+        inputs = self._live_inputs(combine)
+        if self._build_rows is not None:
+            self._upload_native_rows(inputs, self.rows, self.num_tokens)
+            self.inputs, self.token_lists = inputs, None
+            return
+        token_lists, num_tokens = self._read_token_lists()
         if num_tokens != self.num_tokens:
             raise ValueError("original token capacity changed during dynamic routing")
         self.bind_routes(inputs, token_lists)
+
+    def check(self):
+        # Fetch original x3 independently for the numerical reference after the kernel finishes.
+        if self.token_lists is None:
+            token_lists, num_tokens = self._read_token_lists()
+            if num_tokens != self.num_tokens:
+                raise ValueError("original token capacity changed during inter-node check")
+            if [len(tokens) for tokens in token_lists] != [tensor.shape[1] for tensor in self.inputs]:
+                raise ValueError("outgoing x3 lengths disagree with inter-node input views")
+            self.token_lists = token_lists
+        super().check()

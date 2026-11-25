@@ -72,7 +72,13 @@ void check_dynamic_rank(int gpu, const std::string& run_id, const std::string& p
         return rdma_proxy_build_intra_node_combine_rows(h, &source_node, 1, capacity,
             combine_rows.data(), combine_rows.size(), &domain_count);
     };
+    std::array<int32_t, stride> inter_rows;
+    auto build_inter = [&](RdmaProxyHandle* h) {
+        return rdma_proxy_build_inter_node_combine_rows(h, &source_node, 1, capacity,
+            inter_rows.data(), inter_rows.size());
+    };
     require(build_rows(nullptr) != 0 && build_rows(handle) != 0);
+    require(build_inter(nullptr) != 0 && build_inter(handle) != 0);
     std::vector<int32_t> previous;
     for (uint64_t i = 0; i < 3; ++i) {
         require(rdma_proxy_prepare_routing(handle, i + 1) != 0);
@@ -85,6 +91,17 @@ void check_dynamic_rank(int gpu, const std::string& run_id, const std::string& p
                 &count, &tokens, &top_k) == 0 && count == experts.size() && top_k == 2 && experts != previous);
         previous = std::move(experts);
         if (i == 0) {
+            auto invalid_inter = [&](const int32_t* nodes, uint64_t n, uint64_t num_tokens,
+                                     int32_t* out, uint64_t elements) {
+                require(rdma_proxy_build_inter_node_combine_rows(handle, nodes, n, num_tokens,
+                    out, elements) != 0 && *rdma_proxy_last_error());
+            };
+            invalid_inter(nullptr, 1, capacity, inter_rows.data(), stride);
+            invalid_inter(&source_node, 1, capacity, nullptr, stride);
+            invalid_inter(&source_node, 0, capacity, inter_rows.data(), stride);
+            invalid_inter(&source_node, UINT64_MAX, capacity, inter_rows.data(), stride);
+            invalid_inter(&source_node, 1, UINT64_MAX, inter_rows.data(), stride);
+            invalid_inter(&source_node, 1, capacity, inter_rows.data(), stride - 1);
             require(rdma_proxy_build_intra_node_combine_rows(handle, nullptr, 1, capacity,
                     combine_rows.data(), combine_rows.size(), &domain_count) != 0);
             require(rdma_proxy_build_intra_node_combine_rows(handle, &source_node, 1, capacity,
@@ -96,6 +113,18 @@ void check_dynamic_rank(int gpu, const std::string& run_id, const std::string& p
             require(rdma_proxy_build_intra_node_combine_rows(handle, &source_node, 1, UINT64_MAX,
                     combine_rows.data(), combine_rows.size(), &domain_count) != 0);
         }
+        require(build_inter(handle) == 0 && !*rdma_proxy_last_error());
+        std::array<uint64_t, capacity> outgoing;
+        uint64_t outgoing_rows = 0, original_tokens = 0;
+        require(rdma_proxy_get_outgoing_token_indices(handle, source_node, outgoing.data(), capacity,
+                    &outgoing_rows, &original_tokens) == 0 && original_tokens == capacity);
+        std::array<int32_t, stride> expected_inter;
+        expected_inter.fill(-1);
+        for (uint64_t slot = 0; slot < outgoing_rows; ++slot)
+            expected_inter.at(outgoing[slot]) = static_cast<int32_t>(slot);
+        expected_inter[capacity] = static_cast<int32_t>(outgoing_rows);
+        expected_inter[capacity + 1] = 0;
+        require(inter_rows == expected_inter);
         require(build_rows(handle) == 0 && !*rdma_proxy_last_error());
         std::array<uint8_t, capacity> masks{};
         uint64_t mask_count = 0;
@@ -112,12 +141,12 @@ void check_dynamic_rank(int gpu, const std::string& run_id, const std::string& p
                     combine_rows[peer * stride + capacity + 1] == static_cast<int32_t>(mask_count));
         }
         require(rdma_proxy_prepare_iteration(handle, i) == 0);
-        require(build_rows(handle) != 0);
+        require(build_rows(handle) != 0 && build_inter(handle) != 0);
         require(rdma_proxy_run_iteration(handle, i) == 0);
-        require(build_rows(handle) != 0);  // The completed generation is no longer bindable.
+        require(build_rows(handle) != 0 && build_inter(handle) != 0);  // Completed generation.
     }
     require(rdma_proxy_finish(handle) == 0 && rdma_proxy_shutdown(handle) == 0);
-    require(build_rows(handle) != 0);
+    require(build_rows(handle) != 0 && build_inter(handle) != 0);
 }
 
 }  // namespace
@@ -390,7 +419,10 @@ int main(int argc, char** argv) {
                 rdma_proxy_get_intra_node_source_masks(router, 0, masks.data(), 0, &mask_count) != 0;
             counts_ok[gpu] = counts_ok[gpu] && masks_ok;
             uint64_t token_count = 0, original_tokens = 0;
-            bool tokens_ok = true;
+            const int32_t destination = 0;
+            std::array<int32_t, 32 + 2> inter_rows;
+            bool tokens_ok = rdma_proxy_build_inter_node_combine_rows(router, &destination, 1, 32,
+                inter_rows.data(), inter_rows.size()) != 0 && *rdma_proxy_last_error();
             for (int node = 0; node < 4; ++node) {
                 tokens_ok = tokens_ok && rdma_proxy_get_outgoing_token_indices(
                     router, node, nullptr, 0, &token_count, &original_tokens) == 0 && original_tokens == 32;

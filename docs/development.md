@@ -182,7 +182,30 @@ For the timing run, use `--no-check-intra-node-combine`. With 20,480 tokens and
 eight GPUs per node, look for one 2,621,568-byte host-to-device copy per rank and
 iteration for this table. [Table layout](runtime.md#intra-node-combine-concurrent-with-down-gemm)
 
-**Validation.** On macOS 15.6.1 arm64 with Apple Clang 14, CPU-only PyTorch 1.13.1 and a Debug build, the runtime native suite passed 44 tests with four CUDA tests skipped. The Python suite passed 84 tests with eight skipped. The shared metadata checks passed all four tests. The CPU exchange benchmark passed its native codec test and all 38 Python tests on rerun after one loopback TCP timeout. The GPU exchange benchmark passed its ten host tests. The exact host commands are in [Mac or CPU-only development](#mac-or-cpu-only-development). CUDA compilation, the numerical checks with QuACK, and two-node GPU/RDMA transport and timing still require the Hopper hosts. The production record-layout test runs with `ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R test_iteration_metadata_cuda --output-on-failure` on a CUDA host. Run the dynamic combine tests there with `RDMA_PROXY_TEST_CUDA=1 python -m unittest discover -s tests/python -p test_dynamic_routing.py -v`.
+For the dynamic **inter-node** combine table, the same native tests check each
+original token's packed row, including a route where the outgoing and incoming
+remote token IDs differ. `test_inter_node_combine.py` checks host and device
+buffer reuse, a single copy per generation, and the independent numerical
+reference. Run it on Hopper with
+`RDMA_PROXY_TEST_CUDA=1 python -m unittest discover -s tests/python -p test_inter_node_combine.py -v`.
+On both H800 hosts, rebuild the shared library in the launcher's build directory.
+Use `--dynamic-routing --benchmark-metadata-exchange --check-inter-node-combine`
+for a numerical run. The setup log should show `row_builder=native`. With
+`--no-check-inter-node-combine` in the timing run, look for one 163,856-byte
+host-to-device upload per rank per iteration at 20,480 tokens and two nodes.
+The earlier path followed that upload with a device-to-device copy of the same size.
+[Table layout](runtime.md#inter-node-combine-in-original-token-order)
+
+On an Apple M1 Max with CPU PyTorch 1.13.1 set to one thread, the median
+`InterNodeCombine.refresh_routes` time fell from 6.20 ms at `f4103bd` to
+0.062 ms with the native builder. The paired replay used 120 fresh mock routes
+after three warmups, two nodes, eight GPUs per node, 20,480 tokens per GPU,
+128 experts and top-8 routing. It alternated the execution order of the two
+implementations on each installed route and compared every table entry. The
+timings include the Python call and the copy into a CPU destination tensor.
+GPU upload time and the gather-to-up-GEMM gap require a two-node hardware run.
+
+**Validation.** On macOS 15.6.1 arm64 with Apple Clang 14, CPU-only PyTorch 1.13.1 and a Debug build, the runtime native suite passed 44 tests with four CUDA tests skipped. The Python suite passed 86 tests with eight skipped. The shared metadata checks passed all four tests. The CPU exchange benchmark passed its native codec test and all 38 Python tests. The GPU exchange benchmark passed its ten host tests. The exact host commands are in [Mac or CPU-only development](#mac-or-cpu-only-development). CUDA compilation, the numerical checks with QuACK, and two-node GPU/RDMA transport and timing still require the Hopper hosts. The production record-layout test runs with `ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R test_iteration_metadata_cuda --output-on-failure` on a CUDA host. Run the dynamic combine tests there with `RDMA_PROXY_TEST_CUDA=1 python -m unittest discover -s tests/python -p test_dynamic_routing.py -v`.
 
 ### Benchmark metadata backend
 

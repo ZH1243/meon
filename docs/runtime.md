@@ -3172,15 +3172,27 @@ of intra-node combine. Omitting it uses one CTA per GPU SM. Each CTA has 256
 threads and processes a strided share of the output; this is a launch-grid
 size, not SM affinity. It works for both single-node and multi-node runs.
 
-The new C ABI `rdma_proxy_get_outgoing_token_indices` exposes this source GPU's
-per-destination x3 lists, including the local domain, and full input token count.
-The inverse row maps are constructed once during setup because benchmark routing
-is fixed. Each node's input has its own row count and order; equal row indices
-across node buffers are not assumed to identify the same token.
+Each destination node returns its partial sums in the order of this source GPU's
+outgoing x3 list. For example, if a node's x3 is `[5, 1]`, original token 1
+reads packed row 1 and original token 5 reads packed row 0. The final combine
+looks up each token independently for each node and skips entries marked `-1`.
+
+With dynamic routing, `rdma_proxy_build_inter_node_combine_rows` builds this
+inverse from the installed x3 lists before up-GEMM submission. A single host
+call fills one reusable pinned int32 table shaped `[num_nodes, num_tokens + 2]`.
+Each row ends with that node's live packed row count (the stride between column
+tiles) and a reserved zero. The worker copies the whole table once into the GPU
+buffer bound to the compiled kernel. With two nodes and 20,480 tokens per GPU
+this is 163,856 bytes per rank per iteration. The setup log reports
+`row_builder=native` when this path is active. Fixed routing builds the map
+once in Python. Workers using an older library can also rebuild it in Python
+from `rdma_proxy_get_outgoing_token_indices`.
 
 Add `--check-inter-node-combine` for an independent FP32 scatter/add reference
-check each iteration. It uses bounded output-row blocks and casts to the output
-dtype before comparison. Combine with the existing intra-node and RDMA-return
+check each iteration. After the kernel finishes, the dynamic native path reads
+the original outgoing x3 lists separately for this check. The reference uses
+bounded output-row blocks and casts to the output dtype before comparison.
+Combine with the existing intra-node and RDMA-return
 checks to validate the earlier stages as well. Checks add overhead.
 
 Run the standalone kernel tests on Hopper:

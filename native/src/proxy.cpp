@@ -909,13 +909,18 @@ std::vector<uint8_t> Proxy::intra_node_source_masks(int source_node) const {
     return result;
 }
 
-void Proxy::build_intra_node_combine_rows(
-    const int32_t* source_nodes, uint64_t num_nodes, uint64_t capacity, int32_t* rows,
-    uint64_t row_elements, uint64_t* domain_counts) const {
+std::shared_lock<std::shared_mutex> Proxy::lock_installed_combine_route() const {
     auto routes_lock = lock_forwarding_routes();
     if (!initialized_ || !config_.router_dynamic_routing_enabled || iteration_prepared_ ||
         routing_failed_ || routing_iteration_ != completed_routing_iterations_)
         throw std::runtime_error("combine rows require a freshly installed, idle dynamic route");
+    return routes_lock;
+}
+
+void Proxy::build_intra_node_combine_rows(
+    const int32_t* source_nodes, uint64_t num_nodes, uint64_t capacity, int32_t* rows,
+    uint64_t row_elements, uint64_t* domain_counts) const {
+    auto routes_lock = lock_installed_combine_route();
     if (!source_nodes || !rows || !domain_counts || !num_nodes ||
         num_nodes > static_cast<uint64_t>(config_.num_nodes) || capacity != config_.num_tokens ||
         capacity > std::numeric_limits<int32_t>::max() / num_nodes)
@@ -957,6 +962,45 @@ void Proxy::build_intra_node_combine_rows(
             row[stride - 2] = selected;
             row[stride - 1] = static_cast<int32_t>(masks.size());
         }
+    }
+}
+
+void Proxy::build_inter_node_combine_rows(
+    const int32_t* destination_nodes, uint64_t num_nodes, uint64_t num_tokens,
+    int32_t* rows, uint64_t row_elements) const {
+    auto routes_lock = lock_installed_combine_route();
+    if (!destination_nodes || !rows || !num_nodes ||
+        num_nodes > static_cast<uint64_t>(config_.num_nodes) || num_tokens != config_.num_tokens ||
+        num_tokens > std::numeric_limits<int32_t>::max())
+        throw std::runtime_error("invalid inter-node combine row table dimensions or host arrays");
+    const auto stride = num_tokens + 2;
+    if (num_nodes > std::numeric_limits<std::size_t>::max() / sizeof(int32_t) / stride ||
+        row_elements != num_nodes * stride)
+        throw std::runtime_error("inter-node combine row table has incorrect element count");
+
+    std::vector<const std::vector<std::size_t>*> domains;
+    domains.reserve(num_nodes);
+    for (uint64_t d = 0; d < num_nodes; ++d) {
+        if (std::find(destination_nodes, destination_nodes + d, destination_nodes[d]) !=
+            destination_nodes + d)
+            throw std::runtime_error("duplicate inter-node combine destination node");
+        const auto& tokens = outgoing_token_indices(destination_nodes[d]);
+        if (tokens.size() > num_tokens)
+            throw std::runtime_error("inter-node combine destination exceeds token capacity");
+        domains.push_back(&tokens);
+    }
+    for (uint64_t d = 0; d < num_nodes; ++d) {
+        const auto& tokens = *domains[d];
+        auto* row = rows + d * stride;
+        std::fill_n(row, num_tokens, -1);
+        for (std::size_t ordinal = 0; ordinal < tokens.size(); ++ordinal) {
+            const auto token = tokens[ordinal];
+            if (token >= num_tokens || row[token] != -1)
+                throw std::runtime_error("invalid original token in inter-node combine route");
+            row[token] = static_cast<int32_t>(ordinal);
+        }
+        row[num_tokens] = static_cast<int32_t>(tokens.size());
+        row[num_tokens + 1] = 0;
     }
 }
 

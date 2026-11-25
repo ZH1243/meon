@@ -21,6 +21,7 @@ struct Rank {
     uint8_t* rdma_receive{};
     std::array<uint8_t*, nodes*gpus> inputs{};
     std::array<int32_t, nodes * gpus * combine_row_stride> combine_rows{};
+    std::array<int32_t, nodes * (tokens + 2)> inter_rows{};
     std::unique_ptr<Proxy> proxy;
 };
 
@@ -37,7 +38,7 @@ template<class F> void expect_error(F operation) {
 }
 
 // Each token chooses all eight experts on one GPU. The mock NIC reflects
-// payloads, so the remote source uses the same source rows toward this node.
+// payloads, so incoming and outgoing remote compact buffers have equal lengths.
 int destination_node(int epoch, int token) {
     if (epoch == 0) return 0;
     if (epoch == 1) return 1;
@@ -77,7 +78,9 @@ void install(Rank& rank, int gpu, int epoch) {
     const auto mask = static_cast<uint8_t>(1u << ((gpu - dest + gpus) % gpus));
     std::vector<uint8_t> x4(x3.size(), mask);
     const int remote_dest = destination_gpu(epoch, gpu, 1);
-    std::vector<uint8_t> remote_masks(rows[1].size(), 1u << ((gpu - remote_dest + gpus) % gpus));
+    auto remote_rows = rows[1];
+    if (epoch == 2) remote_rows = {1};  // This GPU sends token 0 and receives the remote source's token 1.
+    std::vector<uint8_t> remote_masks(remote_rows.size(), 1u << ((gpu - remote_dest + gpus) % gpus));
     const int32_t node_offsets[] = {0, static_cast<int32_t>(rows[0].size()), tokens};
     std::array<std::array<int32_t, experts_per_gpu+1>, nodes*gpus> offsets{};
     std::array<std::vector<int32_t>, nodes*gpus> indices;
@@ -90,8 +93,8 @@ void install(Rank& rank, int gpu, int epoch) {
         }
         sources[s] = {offsets[s].data(), indices[s].data(), indices[s].size()};
     }
-    RdmaProxyBenchmarkRouting data{sizeof(data), nodes*gpus, sources.data(), rows[1].data(),
-        remote_masks.data(), rows[1].size(), reinterpret_cast<uintptr_t>(r.data()),
+    RdmaProxyBenchmarkRouting data{sizeof(data), nodes*gpus, sources.data(), remote_rows.data(),
+        remote_masks.data(), remote_rows.size(), reinterpret_cast<uintptr_t>(r.data()),
         reinterpret_cast<uintptr_t>(node_offsets), reinterpret_cast<uintptr_t>(x3.data()),
         reinterpret_cast<uintptr_t>(x4.data())};
     expect_error([&] { rank.proxy->prepare_routing(epoch); });
@@ -135,9 +138,42 @@ void install(Rank& rank, int gpu, int epoch) {
                 std::vector<uint8_t>(rows[n].size(), 1u << destination_gpu(epoch, gpu, n)))
             throw std::runtime_error("incorrect outgoing rows or incoming source masks");
     }
-    // Reverse the source-node order. The caller's domain order determines both
-    // table axes even when one domain is empty or shrinks after being full.
-    const std::array<int32_t, nodes> source_nodes{1, 0};
+    // Use remote-first order for both combine kernels, including when one
+    // domain is empty or shrinks after being full in the previous generation.
+    const std::array<int32_t, nodes> domain_nodes{1, 0};
+    if (!epoch) {
+        rank.inter_rows.fill(37);
+        for (int32_t bad_node : {1, -1, nodes}) {
+            const std::array<int32_t, nodes> invalid{1, bad_node};
+            expect_error([&] {
+                rank.proxy->build_inter_node_combine_rows(invalid.data(), nodes, tokens,
+                    rank.inter_rows.data(), rank.inter_rows.size());
+            });
+            if (!std::all_of(rank.inter_rows.begin(), rank.inter_rows.end(), [](int32_t x) { return x == 37; }))
+                throw std::runtime_error("partial inter-node combine table after invalid destinations");
+        }
+    }
+    rank.proxy->build_inter_node_combine_rows(domain_nodes.data(), nodes, tokens,
+        rank.inter_rows.data(), rank.inter_rows.size());
+    // Expected inverse of outgoing x3. Include missing tokens, the packed stride
+    // and the zero trailer in every comparison so stale storage is observable.
+    constexpr int inter_stride = tokens + 2;
+    for (int domain = 0; domain < nodes; ++domain) {
+        const auto& outgoing = rows[domain_nodes[domain]];
+        std::array<int32_t, inter_stride> expected;
+        expected.fill(-1);
+        for (std::size_t slot = 0; slot < outgoing.size(); ++slot)
+            expected[outgoing[slot]] = static_cast<int32_t>(slot);
+        expected[tokens] = static_cast<int32_t>(outgoing.size());
+        expected[tokens + 1] = 0;
+        if (!std::equal(expected.begin(), expected.end(), rank.inter_rows.begin() + domain * inter_stride))
+            throw std::runtime_error("incorrect original-token to outgoing x3 lookup");
+    }
+    std::array<int32_t, inter_stride> remote_only;
+    rank.proxy->build_inter_node_combine_rows(domain_nodes.data(), 1, tokens,
+        remote_only.data(), remote_only.size());
+    if (!std::equal(remote_only.begin(), remote_only.end(), rank.inter_rows.begin()))
+        throw std::runtime_error("incorrect remote-only inter-node combine lookup");
     std::array<uint64_t, nodes> domain_counts{};
     if (!epoch) {
         rank.combine_rows.fill(37);
@@ -151,10 +187,10 @@ void install(Rank& rank, int gpu, int epoch) {
             domain_counts != std::array<uint64_t, nodes>{99, 99})
             throw std::runtime_error("partial combine table after invalid source nodes");
     }
-    rank.proxy->build_intra_node_combine_rows(source_nodes.data(), nodes, tokens,
+    rank.proxy->build_intra_node_combine_rows(domain_nodes.data(), nodes, tokens,
         rank.combine_rows.data(), rank.combine_rows.size(), domain_counts.data());
     for (int domain = 0; domain < nodes; ++domain) {
-        const int node = source_nodes[domain];
+        const int node = domain_nodes[domain];
         const int valid = static_cast<int>(rows[node].size());
         if (domain_counts[domain] != static_cast<uint64_t>(valid))
             throw std::runtime_error("incorrect combine domain length");

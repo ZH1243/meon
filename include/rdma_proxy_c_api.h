@@ -290,6 +290,17 @@ RDMA_PROXY_C_API int rdma_proxy_finish(RdmaProxyHandle* handle);
 RDMA_PROXY_C_API int rdma_proxy_get_outgoing_token_indices(
     RdmaProxyHandle* handle, int32_t destination_node, uint64_t* indices,
     uint64_t capacity, uint64_t* count, uint64_t* num_tokens);
+/* Build the final combine kernel's original-token row table after installing a
+ * dynamic route and before preparing its payload iteration. destination_nodes
+ * lists distinct node IDs in kernel input order. num_tokens is the configured
+ * source token count. rows is contiguous host int32[num_nodes][num_tokens + 2],
+ * with row_elements equal to the total number of int32 elements. Row d maps
+ * each original token to its ordinal in outgoing x3 for destination_nodes[d],
+ * or -1 if absent. Its final two elements are the x3 length and zero.
+ * Arrays must not overlap. All pointers are borrowed only for this synchronous call. */
+RDMA_PROXY_C_API int rdma_proxy_build_inter_node_combine_rows(
+    RdmaProxyHandle* handle, const int32_t* destination_nodes, uint64_t num_nodes,
+    uint64_t num_tokens, int32_t* rows, uint64_t row_elements);
 
 /* Reverse RDMA: caller owns the stable tiled source/destination GPU storage.
  * Empty buffers still supply a non-null one-element allocation for registration.

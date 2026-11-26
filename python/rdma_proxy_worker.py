@@ -132,10 +132,28 @@ class TorchDeviceBuffers:
         self.local_gpu_index = local_gpu_index
         self.num_gpus_per_node = num_gpus_per_node
         self.tensors: dict[tuple[int, int, int, int], object] = {}
+        self.benchmark_index_views = {}
         self.allocation_error: BaseException | None = None
         # ctypes callbacks must themselves remain strongly referenced for as
         # long as C++ can invoke them.
         self.callback = DeviceBufferAllocatorCallback(self._allocate)
+
+    def bind_benchmark_index_arrays(self, arrays, gpus_per_node, capacity):
+        """Expose the exchange's per-source slots through the native allocation callback."""
+        if self.benchmark_index_views or self.tensors_of_kind(DEVICE_BUFFER_ROUTER_A_IDX):
+            raise RuntimeError("benchmark device indices must be bound before the first index allocation")
+        views = {}
+        device = self.torch.device("cuda", self.cuda_device_id)
+        for source, array in enumerate(arrays):
+            # Infer the device and dtype from the provider; coercing either could copy the slot.
+            tensor = self.torch.as_tensor(array)
+            if (array.capacity != capacity or tensor.data_ptr() != array.address
+                    or tensor.device != device or tensor.dtype != self.torch.int32
+                    or tuple(tensor.shape) != (capacity,) or tensor.stride() != (1,)):
+                raise RuntimeError(f"source {source} has an incompatible benchmark device index view")
+            # Keep both the non-owning tensor and its provider (which owns the session).
+            views[divmod(source, gpus_per_node)] = (tensor, array)
+        self.benchmark_index_views = views
 
     def _allocate(
         self,
@@ -214,6 +232,8 @@ class TorchDeviceBuffers:
                     node, gpu = request.source_node_rank, request.source_gpu_index
                 row_base = (node * self.num_gpus_per_node + gpu) * shape[0]
                 tensor = pool.narrow(0, row_base, shape[0])
+            elif request.kind == DEVICE_BUFFER_ROUTER_A_IDX and self.benchmark_index_views:
+                tensor, _ = self.benchmark_index_views[request.source_node_rank, request.source_gpu_index]
             else:
                 tensor = self.torch.empty(
                     shape,
@@ -1855,7 +1875,8 @@ def print_benchmark_routing(node, gpu, iteration, elapsed_ns, stats, up_submitte
           f"retire_us={stats['retire_elapsed_ns'] / 1000:.3f} "
           f"reuse_barrier_us={stats['reuse_barrier_ns'] / 1000:.3f} "
           f"release_barrier_us={stats['release_barrier_ns'] / 1000:.3f}{submit} "
-          f"source_route={stats['source_route']} source_route_storage={stats['source_route_storage']}",
+          f"source_route={stats['source_route']} source_route_storage={stats['source_route_storage']} "
+          f"a_idx_storage={stats['a_idx_storage']}",
           flush=True)
 
 

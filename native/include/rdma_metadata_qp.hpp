@@ -21,6 +21,13 @@ class MetadataQp {
     QPInfo info{};
     int port, gid;
 public:
+    // Optional plain write on the same RC send queue, using the same local
+    // MR. Its bytes precede the signaled write-with-immediate; only the latter
+    // consumes a remote receive credit and reports successful completion.
+    struct WritePrefix {
+        uint64_t from, to;
+        uint32_t rkey, bytes;
+    };
     MetadataQp(RdmaContext& context, const ProxyConfig& config)
         : port(config.rdma_port), gid(config.gid_index) {
 #if RDMA_PROXY_HAVE_VERBS
@@ -82,7 +89,7 @@ public:
 #endif
     }
     void post(uint64_t id, uint64_t from, uint32_t lkey, uint64_t to,
-              uint32_t rkey, uint32_t bytes, uint32_t source) {
+              uint32_t rkey, uint32_t bytes, uint32_t source, WritePrefix prefix = {}) {
 #if RDMA_PROXY_HAVE_VERBS
         ibv_sge sge{};
         sge.addr = from; sge.lkey = lkey; sge.length = bytes;
@@ -90,9 +97,20 @@ public:
         wr.wr_id = id; wr.sg_list = &sge; wr.num_sge = 1;
         wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM; wr.send_flags = IBV_SEND_SIGNALED;
         wr.imm_data = htonl(source); wr.wr.rdma.remote_addr = to; wr.wr.rdma.rkey = rkey;
-        if (ibv_post_send(qp.get(), &wr, &bad)) throw std::runtime_error("metadata post HBM write failed");
+        ibv_sge first_sge{};
+        ibv_send_wr first{};
+        if (prefix.bytes) {
+            first_sge.addr = prefix.from; first_sge.lkey = lkey; first_sge.length = prefix.bytes;
+            first.wr_id = id; first.sg_list = &first_sge; first.num_sge = 1;
+            first.opcode = IBV_WR_RDMA_WRITE;
+            first.wr.rdma.remote_addr = prefix.to; first.wr.rdma.rkey = prefix.rkey;
+            first.next = &wr;
+        }
+        if (ibv_post_send(qp.get(), prefix.bytes ? &first : &wr, &bad))
+            throw std::runtime_error("metadata post RDMA write failed");
 #else
         (void)id; (void)from; (void)lkey; (void)to; (void)rkey; (void)bytes; (void)source;
+        (void)prefix;
 #endif
     }
     void poll(std::vector<Completion>& completions) {

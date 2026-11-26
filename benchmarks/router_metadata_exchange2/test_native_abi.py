@@ -58,6 +58,31 @@ class NativeAbiTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'invalid native'):
                     proxy.enable_direct_x3_x4()
 
+    def test_device_indices_preserve_address_capacity_and_session(self):
+        proxy = Proxy.__new__(Proxy)
+        proxy.handle, proxy.tokens = 123, 33
+        proxy.lib = SimpleNamespace()
+        self.assertFalse(proxy.supports_device_indices())
+        for pointer, elements, valid in ((4096, 264, True), (0, 264, False),
+                                         (4097, 264, False), (4096, 263, False)):
+            def lookup(handle, source, address, capacity):
+                self.assertEqual((handle, source), (123, 15))
+                ctypes.cast(address, ctypes.POINTER(ctypes.c_void_p))[0] = pointer
+                ctypes.cast(capacity, ctypes.POINTER(ctypes.c_int))[0] = elements
+                return 0
+            proxy.lib = SimpleNamespace(rme2_enable_device_indices=lambda handle: 0,
+                                        rme2_device_indices=lookup)
+            self.assertTrue(proxy.supports_device_indices())
+            if valid:
+                view = proxy.device_index_array(15)
+                self.assertIs(view.owner, proxy)
+                self.assertEqual(view.__cuda_array_interface__['data'], (pointer, False))
+                self.assertEqual(view.__cuda_array_interface__['shape'], (elements,))
+                self.assertEqual(view.__cuda_array_interface__['typestr'], '<i4')
+            else:
+                with self.assertRaisesRegex(RuntimeError, 'invalid native GPU index'):
+                    proxy.device_index_array(15)
+
     def test_staging_capture_retains_tensor_owners_and_uses_separate_api(self):
         calls = []
         proxy = Proxy.__new__(Proxy)

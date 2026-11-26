@@ -18,12 +18,14 @@ class ProviderTests(unittest.TestCase):
         p.next_iteration = 0
         p.retire_routing = None
         p.install_host_routing = p.source_snapshot_view = None
+        p.install_device_indices = p.device_indices = None
         p.borrow_source_route = False
         p.last_stats = {}
         p.group = None
         p.session = None
         p.config = backend.BenchmarkConfig(struct_size=C.sizeof(backend.BenchmarkConfig),
-                                           num_tokens=20, num_nodes=2, completion_timeout_ms=20_000)
+                                           num_tokens=20, num_nodes=2, num_gpus_per_node=8,
+                                           completion_timeout_ms=20_000)
         return p
 
     def test_uint64_generation_seed_and_epoch(self):
@@ -146,6 +148,22 @@ class ProviderTests(unittest.TestCase):
         p.r, p.plan = None, None  # A host install gets every pointer from the receiver.
         p._install(7)
         p.install_host_routing.assert_called_once()
+        arrays = [SimpleNamespace(address=2**40 + source * 4096, capacity=160) for source in range(16)]
+        p.device_buffers = MagicMock()
+        p.session.device_index_array = arrays.__getitem__
+        p._bind_device_indices()
+        p.device_buffers.bind_benchmark_index_arrays.assert_called_once_with(arrays, 8, 160)
+        def install_direct(handle, epoch, ptr, local, device):
+            install_host(handle, epoch, ptr, local)
+            slots = C.cast(device, C.POINTER(backend.BenchmarkDeviceIndices)).contents
+            self.assertEqual(slots.struct_size, C.sizeof(backend.BenchmarkDeviceIndices))
+            self.assertEqual((slots.num_sources, slots.capacity_per_source), (16, 160))
+            self.assertEqual(slots.indices[:16], [array.address for array in arrays])
+            return 0
+        p.install_device_indices = MagicMock(side_effect=install_direct)
+        p._install(7)
+        p.install_device_indices.assert_called_once()
+        p.install_host_routing.assert_called_once()
         p.source_snapshot_view = MagicMock(return_value=-1)
         def check(status):
             if status:
@@ -154,6 +172,21 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "failed receiver view"):
             p._install(8)
         p.install_host_routing.assert_called_once()
+        p.install_device_indices.assert_called_once()
+
+    def test_index_destination_agrees_before_enabling_the_exchange(self):
+        for local_payload, local_exchange, peer, expected in (
+                (False, True, True, False), (True, False, True, False),
+                (True, True, False, False), (True, True, True, True)):
+            with self.subTest(local_payload=local_payload, local_exchange=local_exchange, peer=peer):
+                p = self.provider()
+                p.install_device_indices = MagicMock() if local_payload else None
+                p.session = MagicMock()
+                p.session.supports_device_indices.return_value = local_exchange
+                p._all = lambda capable: [capable] + [peer] * 15
+                p._setup_step = lambda operation, work: work()
+                self.assertIs(p._enable_device_indices(), expected)
+                self.assertEqual(p.session.enable_device_indices.call_count, int(expected))
 
     def test_borrowed_install_requires_both_native_entry_points(self):
         for has_install in (False, True):
@@ -233,11 +266,13 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(p.last_stats["release_barrier_ns"], 4)
         self.assertEqual(p.last_stats["rme2_stats"]["metadata_gpu_ms"], 0.125)
         self.assertEqual(p.last_stats["source_route_storage"], "copied")
+        self.assertEqual(p.last_stats["a_idx_storage"], "host_upload")
         with self.assertRaisesRegex(RuntimeError, "consecutive"):
             p.prepare(0)
         events.clear()
         p.borrow_source_route = True
         p.source_snapshot_view = MagicMock()
+        p.device_indices = backend.BenchmarkDeviceIndices()
         with patch.object(backend.time, "perf_counter_ns", side_effect=[220, 235, 240, 250, 272, 292, 300]):
             self.assertEqual(p.prepare(1), ((18, 4), 80))
         self.assertEqual(events, [("R", 1), "R complete", ("retire", 3, 0), "world", ("rme2", 2),
@@ -245,6 +280,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(p.last_stats["retire_elapsed_ns"], 5)
         self.assertEqual(p.last_stats["reuse_barrier_ns"], 10)
         self.assertEqual(p.last_stats["source_route_storage"], "borrowed")
+        self.assertEqual(p.last_stats["a_idx_storage"], "exchange_device")
 
     def test_failed_retirement_prevents_reuse(self):
         p = self.provider()

@@ -11,6 +11,50 @@ template<class F> void rejects(F f) {
     try { f(); } catch (const std::runtime_error&) { rejected = true; }
     check(rejected);
 }
+void test_device_index_endpoint() {
+    constexpr int capacity = 256;
+    const auto gpu_bytes = rme2::two::remote_indices_bytes(capacity);
+    rme2::MetadataEndpoint endpoint;
+    endpoint.host.node_rank = 1;
+    endpoint.host.gpu_index = 3;
+    endpoint.host.recv_buffer = {0x10000, 17, 18, 4096};
+    endpoint.host.qps.resize(1);
+    const auto legacy = endpoint.serialize();
+    check(legacy == rdma_proxy::serialize_peer_info(endpoint.host));
+    check(!rme2::MetadataEndpoint::parse(legacy, 0).indices.addr);
+    rejects([&] { rme2::MetadataEndpoint::parse(legacy, gpu_bytes); });
+
+    endpoint.indices = {0x20000, 21, 22, gpu_bytes};
+    const auto direct = endpoint.serialize();
+    const auto peer = rme2::MetadataEndpoint::parse(direct, gpu_bytes);
+    check(peer.host.node_rank == 1 && peer.host.gpu_index == 3 && peer.host.recv_buffer.rkey == 18);
+    check(peer.indices.addr == endpoint.indices.addr && peer.indices.rkey == 22 && peer.indices.length == gpu_bytes);
+    rejects([&] { rme2::MetadataEndpoint::parse(direct, 0); });
+    rejects([&] { rme2::MetadataEndpoint::parse(direct, gpu_bytes - 4); });
+    rejects([&] { rme2::MetadataEndpoint::parse(direct.substr(0, direct.find('\n')), gpu_bytes); });
+    rejects([&] { rme2::MetadataEndpoint::parse("unknown_indices_v2 131072 22 8192\n" + legacy, gpu_bytes); });
+    endpoint.indices.addr++;
+    rejects([&] { rme2::MetadataEndpoint::parse(endpoint.serialize(), gpu_bytes); });
+    endpoint.indices.addr = endpoint.host.recv_buffer.addr;
+    rejects([&] { rme2::MetadataEndpoint::parse(endpoint.serialize(), gpu_bytes); });
+    // Every source's live values are mirrored from its outbound relay record.
+    // The incoming host record still holds the complete header and indices.
+    constexpr uint64_t send = 0x400000;
+    for (int node = 0; node < 2; ++node)
+        for (int source = 0; source < 8; ++source)
+            for (int count : {0, 1, capacity / 3, capacity}) {
+                const auto prefix = rme2::device_index_write(send, peer.indices, node, source, capacity, count);
+                check(rme2::device_index_write(send, {}, node, source, capacity, count).bytes == 0);
+                check(prefix.bytes == size_t(count) * sizeof(int32_t));
+                if (!count) continue;
+                const int outbound_slot = (node == 0 ? 8 : 0) + source;
+                const auto record = rme2::two::record_offset(outbound_slot, capacity);
+                check(prefix.from == send + record * sizeof(int32_t) + 64);
+                check(prefix.to == peer.indices.addr + size_t(source) * capacity * sizeof(int32_t));
+                check(prefix.rkey == peer.indices.rkey && prefix.to + prefix.bytes <= peer.indices.addr + gpu_bytes);
+            }
+}
+
 void test_x3_x4(const std::vector<std::size_t>& indices, const std::vector<uint8_t>& masks,
                 int tokens, int source) {
     namespace two = rme2::two;
@@ -63,6 +107,7 @@ int main() {
         namespace two = rme2::two;
         rdma_proxy::Logger::instance().set_level(rdma_proxy::LogLevel::kError);
         constexpr int tokens = 257, capacity = tokens * 8;
+        test_device_index_endpoint();
         for (int source = 0; source < 16; ++source) {
             rdma_proxy::ProxyConfig c;
             c.num_nodes = 2; c.num_gpus_per_node = 8; c.num_tokens = tokens;

@@ -223,6 +223,15 @@ typedef struct RdmaProxyBenchmarkHostRoute {
     const int32_t* r;
 } RdmaProxyBenchmarkHostRoute;
 
+/* One destination GPU's writable exchange slots, in global source-rank order.
+ * indices points to num_sources device addresses (each starts at the first
+ * int32 index, after any record header). Capacity is in int32 elements. */
+typedef struct RdmaProxyBenchmarkDeviceIndices {
+    uint32_t struct_size, num_sources;
+    uint64_t capacity_per_source;
+    const uintptr_t* indices;
+} RdmaProxyBenchmarkDeviceIndices;
+
 typedef struct RdmaProxyBenchmarkConfig {
     uint64_t struct_size, num_tokens, router_seed, completion_timeout_ms;
     int32_t cuda_device_id, node_rank, local_gpu_index, num_gpus_per_node, num_nodes;
@@ -261,6 +270,17 @@ RDMA_PROXY_C_API int rdma_proxy_install_borrowed_benchmark_host_routing(
 RDMA_PROXY_C_API int rdma_proxy_install_borrowed_benchmark_route_views(
     RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing,
     const RdmaProxyBenchmarkHostRoute* host_route);
+/* Same host-view lifetime as install_borrowed_benchmark_route_views. For each
+ * source, already publish routing->sources[i].count int32 indices (identical
+ * to the host list) in the corresponding device slot. Complete incoming DMA
+ * and establish owner-GPU visibility before calling. The external allocator
+ * must return these exact disjoint slots for ROUTER_A_IDX and keep their
+ * addresses stable until successful shutdown. The installer zeros the tails
+ * up to the current common length. Retire all CPU/GPU readers on every rank
+ * before reusing any slot. The device descriptor/address array is call-scoped. */
+RDMA_PROXY_C_API int rdma_proxy_install_borrowed_benchmark_device_indices(
+    RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing,
+    const RdmaProxyBenchmarkHostRoute* host_route, const RdmaProxyBenchmarkDeviceIndices* device_indices);
 /* Call after run_iteration and any external consumers of this iteration have
  * completed. Drains the remaining native readers. Retire on every rank before
  * any rank starts the next exchange or otherwise reuses the records. */

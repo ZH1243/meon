@@ -1,4 +1,5 @@
 #include "cuda_buffers.hpp"
+#include "benchmark_index_padding.hpp"
 
 #include "logging.hpp"
 
@@ -168,9 +169,9 @@ CudaBuffers::~CudaBuffers() {
     catch (const std::exception& error) {
         RDMA_PROXY_LOG_WARN("CPU scatter worker cleanup failed: ", error.what());
     }
-    try { finish_borrowed_index_uploads(); }
+    try { finish_borrowed_index_writes(); }
     catch (const std::exception& error) {
-        RDMA_PROXY_LOG_WARN("borrowed index upload cleanup failed: ", error.what());
+        RDMA_PROXY_LOG_WARN("borrowed index write cleanup failed: ", error.what());
     }
 #if RDMA_PROXY_HAVE_CUDA
     if (!config_.mock_mode && router_notification_publication_stream_) {
@@ -733,7 +734,8 @@ void CudaBuffers::install_expert_metadata(RouterExpertMetadata metadata) {
 }
 
 void CudaBuffers::install_iteration_expert_metadata(
-    std::vector<RouterExpertMetadata> tables, uint64_t iteration) {
+    std::vector<RouterExpertMetadata> tables, uint64_t iteration,
+    const RdmaProxyBenchmarkDeviceIndices* device_indices) {
     if (!config_.router_dynamic_routing_enabled || iteration != metadata_generations_installed_ ||
         tables.size() != nvlink_recv_buffers_.size())
         throw std::runtime_error("invalid routing generation or number of sources");
@@ -765,7 +767,7 @@ void CudaBuffers::install_iteration_expert_metadata(
         assign_expert_metadata(nvlink_recv_buffers_[slot], std::move(table));
     }
     if (config_.nvlink_forward_completion_notifications_enabled)
-        initialize_router_computation_scheduler_locked();
+        initialize_router_computation_scheduler_locked(device_indices);
     ++metadata_generations_installed_;
 }
 
@@ -773,9 +775,9 @@ void CudaBuffers::retire_borrowed_expert_metadata() {
     std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
     if (cpu_scatter_threaded_ && cpu_scatter_worker_thread_.joinable())
         quiesce_cpu_scatter_worker();
-    // Installation normally drained these copies. An allocator or CUDA error
-    // partway through the source list may have left earlier H2Ds in flight.
-    finish_borrowed_index_uploads();
+    // A failed installation can leave index copies or the tail-clear kernel in
+    // flight. Fence those writes before the exchange can recycle its slots.
+    finish_borrowed_index_writes();
     for (auto& buffer : nvlink_recv_buffers_) {
         if (buffer.expert_metadata.has_borrowed_expert_lists()) {
             buffer.expert_metadata_ready = false;
@@ -784,12 +786,12 @@ void CudaBuffers::retire_borrowed_expert_metadata() {
     }
 }
 
-void CudaBuffers::finish_borrowed_index_uploads() {
-    if (!borrowed_index_uploads_pending_) return;
+void CudaBuffers::finish_borrowed_index_writes() {
+    if (!borrowed_index_writes_pending_) return;
 #if RDMA_PROXY_HAVE_CUDA
     select_cuda_device_for_thread(config_.cuda_device_id, config_.mock_mode);
-    check_cuda(cudaStreamSynchronize(cudaStreamLegacy), "complete borrowed routing index uploads");
-    borrowed_index_uploads_pending_ = false;
+    check_cuda(cudaStreamSynchronize(cudaStreamLegacy), "complete borrowed routing index copies and padding");
+    borrowed_index_writes_pending_ = false;
 #endif
 }
 
@@ -842,7 +844,7 @@ bool CudaBuffers::is_router_computation_input(
         buffer.source_gpu_index >= 0;
 }
 
-void CudaBuffers::initialize_router_computation_scheduler_locked() {
+void CudaBuffers::initialize_router_computation_scheduler_locked(const RdmaProxyBenchmarkDeviceIndices* device_indices) {
     if (router_computation_scheduler_state_.initialized && !config_.router_dynamic_routing_enabled) {
         throw std::runtime_error("router computation scheduler is already initialized");
     }
@@ -924,6 +926,14 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
         (config_.router_pooled_up_gemm_enabled &&
          storage_indices > std::numeric_limits<int32_t>::max() / receive_buffer_count))
         throw std::runtime_error("routing index capacity exceeds the supported range");
+    BenchmarkIndexPadding padding{};
+    uint32_t max_padding = 0;
+    if (device_indices) {
+        if (receive_buffer_count != BenchmarkIndexPadding::sources || config_.router_weighted_contributions_enabled ||
+            a_idx_capacity > std::numeric_limits<uint32_t>::max())
+            throw std::runtime_error("benchmark device indices require 16 unweighted source lists");
+        padding.common_count = static_cast<uint32_t>(a_idx_capacity);
+    }
     for (const auto buffer_index : router_computation_buffer_indices_) {
         auto& buffer = nvlink_recv_buffers_[buffer_index];
         const auto indices = buffer.expert_metadata.indices_view();
@@ -937,6 +947,16 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
                 allocate_buffer(device, DeviceBufferAllocationRequest{
                     kind, type, -1, buffer.source_node_rank, buffer.source_gpu_index,
                     storage_indices * sizeof(Value), {storage_indices}});
+            if (device_indices) {
+                const auto source = buffer.source_node_rank * config_.num_gpus_per_node + buffer.source_gpu_index;
+                if (!device.is_externally_owned || reinterpret_cast<uintptr_t>(device.ptr) != device_indices->indices[source] ||
+                    device.bytes < storage_indices * sizeof(int32_t))
+                    throw std::runtime_error("benchmark device index slot disagrees with this source's A_idx allocation");
+                padding.indices[source] = static_cast<int32_t*>(device.ptr);
+                padding.counts[source] = static_cast<uint32_t>(values.size());
+                max_padding = std::max(max_padding, padding.common_count - padding.counts[source]);
+                return;
+            }
             if (buffer.expert_metadata.has_borrowed_expert_lists()) {
                 // The benchmark exposes only its valid prefix. Never read its
                 // unused host capacity, even when another source is longer.
@@ -950,7 +970,7 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
 #if RDMA_PROXY_HAVE_CUDA
                     // Use the explicit device default stream so even shutdown
                     // from a different host thread can fence a partial upload.
-                    borrowed_index_uploads_pending_ = true;
+                    borrowed_index_writes_pending_ = true;
                     if (live_bytes)
                         check_cuda(cudaMemcpyAsync(device.ptr, values.data(), live_bytes,
                                                    cudaMemcpyHostToDevice, cudaStreamLegacy),
@@ -979,10 +999,21 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
             upload(buffer.expert_route_weights_device, buffer.expert_metadata.expert_route_weights,
                    DeviceBufferKind::kRouterRouteWeights, DeviceBufferElementType::kFP32);
     }
+    // Verify all aliases before touching any slot. The NIC/IPC producer has
+    // already written the live prefix; only stale logical padding is writable.
+    if (max_padding && config_.mock_mode) {
+        for (uint32_t source = 0; source < BenchmarkIndexPadding::sources; ++source)
+            std::fill(padding.indices[source] + padding.counts[source],
+                      padding.indices[source] + padding.common_count, 0);
+    }
 #if RDMA_PROXY_HAVE_CUDA
-    if (borrowed_index_uploads_pending_)
-        finish_borrowed_index_uploads();
-    else if (config_.router_dynamic_routing_enabled && !config_.mock_mode)
+    if (max_padding && !config_.mock_mode) {
+        borrowed_index_writes_pending_ = true;
+        clear_benchmark_index_padding(padding, max_padding);
+    }
+    if (borrowed_index_writes_pending_)
+        finish_borrowed_index_writes();
+    else if (!device_indices && config_.router_dynamic_routing_enabled && !config_.mock_mode)
         check_cuda(cudaStreamSynchronize(nullptr), "complete routing index uploads before compute");
 #endif
     std::size_t total_batches = 0;

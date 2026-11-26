@@ -22,7 +22,7 @@ struct Rank {
     uint8_t* send{};
     uint8_t* rdma_receive{};
     std::array<uint8_t*, nodes*gpus> inputs{};
-    std::array<const int32_t*, nodes*gpus> device_indices{};
+    std::array<int32_t*, nodes*gpus> device_indices{};
     std::array<std::array<int32_t, experts_per_gpu+1>, nodes*gpus> offsets{};
     std::array<std::vector<int32_t>, nodes*gpus> indices;
     // Receiver-owned storage. Keep its addresses alive through retirement or
@@ -34,6 +34,13 @@ struct Rank {
     std::array<int32_t, nodes * gpus * combine_row_stride> combine_rows{};
     std::array<int32_t, nodes * (tokens + 2)> inter_rows{};
     std::unique_ptr<Proxy> proxy;
+
+    std::array<uintptr_t, nodes*gpus> index_addresses() const {
+        std::array<uintptr_t, nodes*gpus> addresses{};
+        for (int source = 0; source < nodes*gpus; ++source)
+            addresses[source] = reinterpret_cast<uintptr_t>(device_indices[source]);
+        return addresses;
+    }
 
     void poison_expert_records() {
         for (auto& source : indices) std::fill(source.begin(), source.end(), -1);
@@ -239,7 +246,44 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
             rank.source_r[0] = nodes * gpus * experts_per_gpu;
             reject(host);
             rank.source_r[0] = saved;
-            install(host);
+            if (gpu == 0) {
+                // Simulate the exchange delivering live indices directly into the
+                // allocator's device slots. Poison tails to expose stale rows.
+                for (int s = 0; s < nodes*gpus; ++s) {
+                    std::fill_n(rank.device_indices[s], tokens * experts_per_gpu, -7);
+                    std::copy(indices[s].begin(), indices[s].end(), rank.device_indices[s]);
+                }
+                auto addresses = rank.index_addresses();
+                RdmaProxyBenchmarkDeviceIndices views{sizeof(views), nodes*gpus, tokens*experts_per_gpu, addresses.data()};
+                const auto direct_install = [&](const RdmaProxyBenchmarkDeviceIndices& views) {
+                    rank.proxy->install_borrowed_benchmark_route_views(epoch, extended.current, host, &views);
+                };
+                auto invalid = views;
+                --invalid.struct_size;
+                expect_error([&] { direct_install(invalid); });
+                invalid = views;
+                --invalid.num_sources;
+                expect_error([&] { direct_install(invalid); });
+                invalid = views;
+                --invalid.capacity_per_source;
+                expect_error([&] { direct_install(invalid); });
+                const auto first = addresses[0];
+                addresses[0] = addresses[1];
+                expect_error([&] { direct_install(views); });
+                addresses[0] = first;
+                // A canary in one live device prefix distinguishes direct consumption
+                // from a redundant host copy. Restore it before normal consumers run.
+                const auto live = std::find_if(indices.begin(), indices.end(), [](const auto& list) {
+                    return !list.empty();
+                }) - indices.begin();
+                rank.device_indices.at(live)[0] = -11;
+                direct_install(views);
+                if (rank.device_indices[live][0] != -11)
+                    throw std::runtime_error("direct A_idx installation overwrote a live device index");
+                rank.device_indices[live][0] = indices[live][0];
+            } else {
+                install(host);
+            }
             if (!borrowed_source) rank.poison_source_route();
         } else {
             rank.proxy->install_borrowed_benchmark_routing(epoch, extended.current);
@@ -271,6 +315,9 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
         if (!device || !std::equal(indices[s].begin(), indices[s].end(), device) ||
             !std::all_of(device + indices[s].size(), device + common_indices, [](int32_t n) { return n == 0; }))
             throw std::runtime_error("incorrect valid indices or stale padding in device A_idx");
+        if (gpu == 0 && epoch && !std::all_of(device + common_indices, device + tokens*experts_per_gpu,
+                                               [](int32_t n) { return n == -7; }))
+            throw std::runtime_error("direct A_idx padding wrote beyond the logical extent");
         if (borrowed) {
             const auto decoded = deserialize_router_expert_metadata(
                 serialize_router_expert_metadata(installed), tokens, tokens * experts_per_gpu);
@@ -383,7 +430,7 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
     }
 }
 
-void check_partial_borrowed_install(Rank& rank, uint64_t epoch) {
+void check_partial_borrowed_install(Rank& rank, uint64_t epoch, bool swap_device_sources = false) {
     std::array<RdmaProxyBenchmarkSource, nodes * gpus> sources{};
     for (std::size_t i = 0; i < sources.size(); ++i) {
         rank.offsets[i].fill(0);
@@ -393,25 +440,55 @@ void check_partial_borrowed_install(Rank& rank, uint64_t epoch) {
     // This bad index is found after installing the source view, during
     // validation of incoming expert rows. Keep storage alive through shutdown.
     rank.offsets[0].back() = 1;
-    rank.indices[0].push_back(tokens);
+    rank.indices[0].push_back(swap_device_sources ? 0 : tokens);
     sources[0] = {rank.offsets[0].data(), rank.indices[0].data(), 1};
     rank.source_offsets.fill(0);
     rank.source_r.fill(0);
     RdmaProxyBenchmarkRouting routing{sizeof(routing), nodes * gpus, sources.data()};
     RdmaProxyBenchmarkHostRoute source{sizeof(source), nodes + 1, 0, rank.source_r.size(),
         rank.source_offsets.data(), nullptr, nullptr, rank.source_r.data()};
+    auto addresses = rank.index_addresses();
+    std::swap(addresses[0], addresses[1]);
+    RdmaProxyBenchmarkDeviceIndices views{sizeof(views), nodes*gpus, tokens*experts_per_gpu, addresses.data()};
+    if (swap_device_sources)
+        for (auto* slot : rank.device_indices) std::fill_n(slot, tokens*experts_per_gpu, -9);
     try {
-        rank.proxy->install_borrowed_benchmark_route_views(epoch, routing, source);
+        rank.proxy->install_borrowed_benchmark_route_views(epoch, routing, source, swap_device_sources ? &views : nullptr);
         throw std::logic_error("partial borrowed installation unexpectedly succeeded");
     } catch (const std::runtime_error& error) {
-        if (std::string(error.what()).find("invalid token index") == std::string::npos) throw;
+        const auto expected = swap_device_sources ? "device index slot disagrees" : "invalid token index";
+        if (std::string(error.what()).find(expected) == std::string::npos) throw;
     }
+    if (swap_device_sources)
+        for (const auto* slot : rank.device_indices)
+            if (!std::all_of(slot, slot + tokens*experts_per_gpu, [](int32_t n) { return n == -9; }))
+                throw std::runtime_error("failed installation corrupted a device slot");
     uint64_t count{}, num_tokens{}, top_k{};
     expect_error([&] {
         rank.proxy->copy_original_router_assignments(nullptr, nullptr, 0, count, num_tokens, top_k);
     });
     expect_error([&] { rank.proxy->retire_borrowed_benchmark_routing(epoch); });
     expect_error([&] { rank.proxy->install_borrowed_benchmark_route_views(epoch, routing, source); });
+}
+
+void check_empty_device_indices(Rank& rank, uint64_t epoch) {
+    std::array<RdmaProxyBenchmarkSource, nodes*gpus> sources{};
+    for (int s = 0; s < nodes*gpus; ++s) {
+        rank.offsets[s].fill(0);
+        sources[s] = {rank.offsets[s].data(), nullptr, 0};
+        std::fill_n(rank.device_indices[s], tokens*experts_per_gpu, -5);
+    }
+    rank.source_offsets.fill(0);
+    rank.source_r.fill(0);
+    RdmaProxyBenchmarkRouting routing{sizeof(routing), nodes*gpus, sources.data()};
+    RdmaProxyBenchmarkHostRoute host{sizeof(host), nodes + 1, 0, rank.source_r.size(),
+        rank.source_offsets.data(), nullptr, nullptr, rank.source_r.data()};
+    const auto addresses = rank.index_addresses();
+    RdmaProxyBenchmarkDeviceIndices views{sizeof(views), nodes*gpus, tokens*experts_per_gpu, addresses.data()};
+    rank.proxy->install_borrowed_benchmark_route_views(epoch, routing, host, &views);
+    for (const auto* slot : rank.device_indices)
+        if (slot[0] != 0 || !std::all_of(slot + 1, slot + tokens*experts_per_gpu, [](int32_t n) { return n == -5; }))
+            throw std::runtime_error("empty source lists must expose exactly one zero index");
 }
 
 void run(bool prepared) {
@@ -456,7 +533,7 @@ void run(bool prepared) {
             if (r.kind == DeviceBufferKind::kRdmaReceive) rank.rdma_receive = ptr;
             if (r.kind == DeviceBufferKind::kNvlinkReceive) rank.inputs.at(source) = ptr;
             if (r.kind == DeviceBufferKind::kRouterAIdx)
-                rank.device_indices.at(source) = reinterpret_cast<const int32_t*>(ptr);
+                rank.device_indices.at(source) = reinterpret_cast<int32_t*>(ptr);
             return ptr;
         });
     }
@@ -508,6 +585,8 @@ void run(bool prepared) {
         }
     }
     check_partial_borrowed_install(ranks[1], 3);
+    check_partial_borrowed_install(ranks[2], 3, true);
+    check_empty_device_indices(ranks[3], 3);
     on_all_gpus([&](int gpu) { ranks[gpu].proxy->shutdown(); });
     expect_error([&] { (void)ranks[0].proxy->router_expert_metadata_for_source(0, 0); });
     for (int gpu : {0, 1}) {

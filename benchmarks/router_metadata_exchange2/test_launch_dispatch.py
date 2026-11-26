@@ -55,6 +55,17 @@ class LaunchDispatchTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('requires two-node mode', result.stderr)
 
+    def test_device_indices_opt_in_for_two_nodes(self):
+        for flags, enabled in (([], False), (['--device-indices'], True)):
+            with patch.object(sys, 'argv', ['benchmark.py', *flags]):
+                self.assertEqual(options().device_indices, enabled)
+        program = str(Path(__file__).with_name('benchmark.py'))
+        env = dict(os.environ, WORLD_SIZE='8', RANK='0', LOCAL_RANK='0', LOCAL_WORLD_SIZE='8')
+        result = subprocess.run([sys.executable, program, '--device-indices'],
+                                env=env, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('--device-indices requires two-node mode', result.stderr)
+
     def test_native_never_launches_python_kernels_or_events(self):
         for native, graph_mode, expected in (
             (True, True, ['submit']),

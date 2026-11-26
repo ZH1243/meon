@@ -59,6 +59,8 @@ struct Rme2Proxy {
     Shared* shared = nullptr;
     int32_t* inbox = nullptr;
     int32_t* pinned = nullptr;
+    int32_t* remote_device_indices = nullptr;
+    bool flush_device_indices = false;
     PeerArenas peers{};
     std::array<bool, rme2::gpus> opened{};
     cudaStream_t read_stream = nullptr;
@@ -366,6 +368,7 @@ struct Rme2Proxy {
             const int count = two::check_record(h, capacity, sequence, node * 8 + s, (1 - node) * 8 + rank);
             rdma->post(sequence, s, count);
             stats.rdma_sent_bytes += two::record_bytes(count);
+            if (remote_device_indices) stats.rdma_sent_bytes += size_t(count) * sizeof(int32_t);
             stats.rdma_post_ms += ms(before);
         }
         {
@@ -423,6 +426,8 @@ struct Rme2Proxy {
                                       tokens, sequence, validate, two::epg);
                         stats.received_index_bytes += size_t(installed[slot].count) * 4;
                         stats.peer_received_index_bytes += size_t(installed[slot].count) * 4;
+                        if (remote_device_indices)
+                            stats.rdma_received_bytes += size_t(installed[slot].count) * sizeof(int32_t);
                     }
                     stats.install_ms += ms(before);
                     stats.rdma_received_bytes += completion.byte_len;
@@ -436,6 +441,13 @@ struct Rme2Proxy {
                 stats.rdma_work_complete_ms = ms(rdma_start);
             if (rdma->completions.empty()) std::this_thread::yield();
         }
+        // Each host record's write-with-immediate follows its GPU payload on
+        // the same ordered RC QP. All receives completed above. Establish GPU
+        // owner visibility before wait() releases the views to CUDA consumers.
+        if (flush_device_indices)
+            require(cuFlushGPUDirectRDMAWrites(CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
+                                               CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER) == CUDA_SUCCESS,
+                    "flush GPUDirect metadata writes to the owner GPU");
         stats.native_ms = ms(submitted);
     }
     void process() {
@@ -686,6 +698,7 @@ struct Rme2Proxy {
         if (staging_begin) cudaEventDestroy(staging_begin);
         if (staging_end) cudaEventDestroy(staging_end);
         rdma.reset();
+        if (remote_device_indices) cudaFree(remote_device_indices);
         if (inbox) cudaFree(inbox);
         if (pinned) cudaFreeHost(pinned);
         if (receiver_results) cudaFreeHost(receiver_results);
@@ -696,6 +709,45 @@ struct Rme2Proxy {
 };
 
 extern "C" int rme2_abi_version() { return 15; }
+extern "C" int rme2_enable_device_indices(Rme2Proxy* p) {
+    return api([&] {
+        require(p, "null metadata proxy");
+        std::lock_guard<std::mutex> lock(p->mutex);
+        require(p->nodes == 2 && !p->remote_device_indices && !p->connected && !p->rdma &&
+                !p->stopping.load() && !p->sequence, "enable device indices once before RDMA initialization");
+        check(cudaSetDevice(p->device), "select device index owner");
+        CUdevice device;
+        int ordering = 0;
+        require(cuDeviceGet(&device, p->device) == CUDA_SUCCESS &&
+                cuDeviceGetAttribute(&ordering, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING,
+                                     device) == CUDA_SUCCESS, "query GPUDirect metadata write ordering");
+        p->flush_device_indices = ordering < static_cast<int>(CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER);
+        if (p->flush_device_indices) {
+            int options = 0;
+            require(cuDeviceGetAttribute(&options, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_FLUSH_WRITES_OPTIONS,
+                                         device) == CUDA_SUCCESS &&
+                    (options & CU_FLUSH_GPU_DIRECT_RDMA_WRITES_OPTION_HOST),
+                    "device index receive requires owner ordering or host GPUDirect flush support");
+        }
+        check(cudaMalloc(reinterpret_cast<void**>(&p->remote_device_indices),
+                         rme2::two::remote_indices_bytes(p->capacity)), "allocate remote GPU index records");
+    });
+}
+
+extern "C" int rme2_device_indices(Rme2Proxy* p, int source, void** indices, int* capacity) {
+    return api([&] {
+        require(p && indices && capacity && source >= 0 && source < rme2::two::sources,
+                "invalid device index view arguments");
+        std::lock_guard<std::mutex> lock(p->mutex);
+        require(p->remote_device_indices && p->connected && p->rdma && p->rdma->connected &&
+                !p->pending && !p->done && !p->stopping.load() && p->failure.empty(),
+                "device index views require an idle, connected device-index exchange");
+        *indices = source / rme2::gpus == p->node
+            ? p->inbox + rme2::two::record_offset(source, p->capacity) + rme2::two::header_words
+            : p->remote_device_indices + rme2::two::remote_indices_offset(source % rme2::gpus, p->capacity);
+        *capacity = p->capacity;
+    });
+}
 extern "C" int rme2_set_receiver_overlap_exchange(Rme2Proxy* p, int enabled) {
     return api([&] {
         require(p && (enabled == 0 || enabled == 1), "invalid receiver overlap option");
@@ -843,8 +895,12 @@ extern "C" int rme2_rdma_init(Rme2Proxy* p, const char* device, int port, int gi
         require(cuPointerSetAttribute(&sync, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS,
                                       reinterpret_cast<CUdeviceptr>(p->inbox)) == CUDA_SUCCESS,
                 "enable GPUDirect SYNC_MEMOPS on relay arena");
+        if (p->remote_device_indices)
+            require(cuPointerSetAttribute(&sync, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS,
+                                          reinterpret_cast<CUdeviceptr>(p->remote_device_indices)) == CUDA_SUCCESS,
+                    "enable GPUDirect SYNC_MEMOPS on remote GPU index records");
         p->rdma = std::make_unique<rme2::MetadataRdma>(p->node, p->rank, p->capacity,
-                                                     device, port, gid, p->inbox, p->pinned);
+            device, port, gid, p->inbox, p->pinned, p->remote_device_indices);
         const auto data = p->rdma->descriptor();
         require(data.size() < size_t(descriptor_capacity), "RDMA descriptor exceeds output capacity");
         std::memcpy(descriptor, data.c_str(), data.size() + 1);

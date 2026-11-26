@@ -19,6 +19,19 @@ class Stats(C.Structure):
         return {name: getattr(self, name) for name, _ in self._fields_}
 
 
+class DeviceIndexArray:
+    """A GPU index list owned by the live exchange session."""
+
+    def __init__(self, owner, address, capacity):
+        self.owner = owner
+        self.address = address
+        self.capacity = capacity
+        self.__cuda_array_interface__ = {
+            "version": 3, "shape": (capacity,), "typestr": "<i4",
+            "data": (address, False), "strides": None,
+        }
+
+
 class Proxy:
     def __init__(self, library, rank, device, tokens, shm_name, timeout, validate, core,
                  per_source_readback=False, metadata_barrier=False, batch_payload_copy=False,
@@ -64,6 +77,12 @@ class Proxy:
         for name, (args, result) in signatures.items():
             fn = getattr(self.lib, name)
             fn.argtypes, fn.restype = args, result
+        if self.supports_device_indices():
+            self.lib.rme2_enable_device_indices.argtypes = [C.c_void_p]
+            self.lib.rme2_enable_device_indices.restype = C.c_int
+            self.lib.rme2_device_indices.argtypes = [
+                C.c_void_p, C.c_int, C.POINTER(C.c_void_p), C.POINTER(C.c_int)]
+            self.lib.rme2_device_indices.restype = C.c_int
         if self.lib.rme2_abi_version() != 15:
             raise RuntimeError("native ABI mismatch; rebuild the library")
         self.check(self.lib.rme2_create(rank, device, tokens, shm_name.encode(), timeout,
@@ -90,6 +109,22 @@ class Proxy:
         if not payload.value or payload.value % 4 or size.value != self.tokens * 5:
             raise RuntimeError("invalid native x3/x4 output buffer")
         return payload.value
+
+    def supports_device_indices(self):
+        return (hasattr(self.lib, "rme2_enable_device_indices")
+                and hasattr(self.lib, "rme2_device_indices"))
+
+    def enable_device_indices(self):
+        if not self.supports_device_indices():
+            raise RuntimeError("rebuild the metadata exchange library for direct GPU indices")
+        self.check(self.lib.rme2_enable_device_indices(self.handle))
+
+    def device_index_array(self, source):
+        address, capacity = C.c_void_p(), C.c_int()
+        self.check(self.lib.rme2_device_indices(self.handle, source, C.byref(address), C.byref(capacity)))
+        if not address.value or address.value % 4 or capacity.value != self.tokens * 8:
+            raise RuntimeError(f"invalid native GPU index buffer for source {source}")
+        return DeviceIndexArray(self, address.value, capacity.value)
 
     def export(self):
         handle = C.create_string_buffer(64)

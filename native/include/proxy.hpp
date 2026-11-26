@@ -43,7 +43,8 @@ public:
     void install_borrowed_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing,
                                             const RdmaProxyBenchmarkHostRoute* host_route = nullptr);
     void install_borrowed_benchmark_route_views(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing,
-                                                const RdmaProxyBenchmarkHostRoute& host_route);
+                                                const RdmaProxyBenchmarkHostRoute& host_route,
+                                                const RdmaProxyBenchmarkDeviceIndices* device_indices = nullptr);
     void retire_borrowed_benchmark_routing(uint64_t iteration);
     void run();
     void run_once();
@@ -332,8 +333,10 @@ private:
     bool routing_install_required(uint64_t iteration) const;
     enum class BenchmarkBorrow { None, ExpertLists, RouteViews };
     void install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing,
-                                       BenchmarkBorrow borrow, const RdmaProxyBenchmarkHostRoute* host_route);
-    void install_iteration_routing(uint64_t iteration, IterationRouteData route);
+                                       BenchmarkBorrow borrow, const RdmaProxyBenchmarkHostRoute* host_route,
+                                       const RdmaProxyBenchmarkDeviceIndices* device_indices = nullptr);
+    void install_iteration_routing(uint64_t iteration, IterationRouteData route,
+                                  const RdmaProxyBenchmarkDeviceIndices* device_indices = nullptr);
     std::shared_lock<std::shared_mutex> lock_forwarding_routes() const;
     std::shared_lock<std::shared_mutex> lock_installed_combine_route() const;
     void prepare_forwarding_destinations();

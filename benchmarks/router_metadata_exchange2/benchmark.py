@@ -155,6 +155,8 @@ def options():
                         help="requires --receiver-kernel: permit receiver and local exchange to run concurrently")
     parser.add_argument("--direct-x3-x4-output", action="store_true",
                         help="two-node only: metadata kernel 4 also writes remote x3/x4 directly into the RDMA buffer")
+    parser.add_argument("--device-indices", action="store_true",
+                        help="expose local GPU lists and mirror remote indices into GPU memory via RDMA")
     parser.add_argument("--native-metadata-launch", action="store_true",
                         help="native proxy worker launches captured CuTe graph; requires --mode graph")
     parser.add_argument("--metadata-launch-barrier", action="store_true",
@@ -228,6 +230,8 @@ def verify(args, iteration, rank, plan, proxy, nodes=1, stats=None, staging=None
             expected_bytes["peer_received_index_bytes"] += payload_bytes
         if nodes == 2 and source // 8 != rank // 8:
             expected_bytes["rdma_received_bytes"] += 64 + payload_bytes
+            if args.device_indices:
+                expected_bytes["rdma_received_bytes"] += payload_bytes
         if nodes == 2 and source // 8 == rank // 8:
             if args.receiver_kernel:
                 expected_bytes["receiver_copy_bytes"] += 64 + payload_bytes
@@ -235,6 +239,11 @@ def verify(args, iteration, rank, plan, proxy, nodes=1, stats=None, staging=None
                 expected_bytes["payload_copy_bytes"] += payload_bytes
         if proxy.snapshot(source) != expected:
             raise AssertionError(f"rank={rank} source={source} iteration={iteration}: installed metadata mismatch")
+        if args.device_indices:
+            view = proxy.device_index_array(source)
+            indices = torch.as_tensor(view, device=plan.r.device)
+            if indices.data_ptr() != view.address or indices[:len(expected[1])].cpu().tolist() != expected[1]:
+                raise AssertionError(f"rank={rank} source={source} iteration={iteration}: GPU indices mismatch")
         if nodes == 2 and source == (rank ^ 8):
             node = rank // 8
             first, last = node_offsets[node:node + 2]
@@ -268,7 +277,10 @@ def verify(args, iteration, rank, plan, proxy, nodes=1, stats=None, staging=None
                 raise AssertionError("CuTe input scan scratch mismatch")
         if nodes == 2 and source // 8 == rank // 8:
             remote_experts = destination_slice(offsets, values, rank ^ 8, nodes)
-            expected_bytes["rdma_sent_bytes"] += 64 + len(remote_experts[1]) * 4
+            remote_bytes = len(remote_experts[1]) * 4
+            expected_bytes["rdma_sent_bytes"] += 64 + remote_bytes
+            if args.device_indices:
+                expected_bytes["rdma_sent_bytes"] += remote_bytes
     if stats is not None:
         if args.receiver_kernel:
             for key in ("headers_d2h_ms", "payload_d2h_ms", "payload_submit_ms",
@@ -287,6 +299,8 @@ def main():
         raise ValueError("two-node mode requires default all-senders readback; disable per-source and batch-copy options")
     if args.direct_x3_x4_output and nodes != 2:
         raise ValueError("--direct-x3-x4-output requires two-node mode")
+    if args.device_indices and nodes != 2:
+        raise ValueError("--device-indices requires two-node mode")
     if args.receiver_kernel and nodes != 2:
         raise ValueError("--receiver-kernel requires two-node mode")
     nic = rdma_device(args.rdma_device_map, local) if nodes == 2 else None
@@ -338,6 +352,8 @@ def main():
         if local != 0:
             proxy = create_proxy()
         if nodes == 2:
+            if args.device_indices:
+                proxy.enable_device_indices()
             descriptor = proxy.rdma_init(nic, args.rdma_port, args.rdma_gid_index)
             descriptors = [None] * world
             dist.all_gather_object(descriptors, descriptor)
@@ -412,6 +428,7 @@ def main():
                       f"direct_x3_x4_output={args.direct_x3_x4_output}", flush=True)
                 print(f"receiver_kernel={args.receiver_kernel}; "
                       f"receiver_overlap_exchange={args.receiver_overlap_exchange}; "
+                      f"device_indices={args.device_indices}; "
                       "receiver mode: all local readback uses SM stores; gather follows receiver", flush=True)
             print(f"local_staging={staging is not None}; d2h_after_local_staging={args.d2h_after_local_staging}; "
                   f"local_staging_after_d2h={args.local_staging_after_d2h}; token_dimension={args.token_dimension}; "
@@ -453,8 +470,9 @@ def main():
             critical_metrics = {key: summary([r[key] for r in critical_records]) for key in metrics}
             report = dict(schema_version=16, backend=("cpp-thread-cuda-ipc-gpudirect-rdma" if nodes == 2 else "cpp-thread-cuda-ipc"), topology=dict(
                 nodes=nodes, gpus=world, gpus_per_node=8, experts=128, experts_per_gpu=128 // world, top_k=8),
-                completion_endpoint=("16 source expert tables and remote same-index x3/x4 installed; nine outgoing RDMA sends drained"
+                completion_endpoint=("16 source expert tables and remote same-index x3/x4 installed; nine outgoing RDMA records drained"
                                      if nodes == 2 else "8 source expert tables installed")
+                                    + ("; remote index writes visible to the owning GPU" if args.device_indices else "")
                                     + ("; local token staging complete" if staging is not None else ""),
                 x3_x4_exchange=nodes == 2,
                 receiver_kernel=args.receiver_kernel,

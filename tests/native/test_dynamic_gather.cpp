@@ -1,4 +1,5 @@
 #include "cuda_buffers.hpp"
+#include "benchmark_index_padding.hpp"
 
 #include <algorithm>
 #include <array>
@@ -98,6 +99,34 @@ struct TestRecords {
 static void check_cuda(cudaError_t status) {
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 }
+
+static void check_direct_index_padding_cuda() {
+    // Include a long tail (multiple grid strides), an empty list, a full list,
+    // and one guard word on either side of every view, as in the IPC arena.
+    constexpr uint32_t extent = 18'003;
+    constexpr uint32_t stride = extent + 2;
+    BenchmarkIndexPadding padding;
+    padding.common_count = extent;
+    std::vector<int32_t> host(padding.sources * stride, 17);
+    int32_t* device = nullptr;
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&device), host.size() * sizeof(int32_t)));
+    std::unique_ptr<void, decltype(&cudaFree)> owner(device, cudaFree);
+    check_cuda(cudaMemcpy(device, host.data(), host.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    for (uint32_t s = 0; s < padding.sources; ++s) {
+        padding.indices[s] = device + s * stride + 1;
+        padding.counts[s] = s == 0 ? 0 : extent - s + 1;
+    }
+    clear_benchmark_index_padding(padding, extent);
+    check_cuda(cudaStreamSynchronize(cudaStreamLegacy));
+    check_cuda(cudaMemcpy(host.data(), device, host.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    for (uint32_t s = 0; s < padding.sources; ++s) {
+        for (uint32_t i = 0; i < stride; ++i) {
+            const auto expected = (i > padding.counts[s] && i <= extent) ? 0 : 17;
+            if (host[s * stride + i] != expected)
+                throw std::runtime_error("incorrect direct benchmark index padding or clobbered guard");
+        }
+    }
+}
 #endif
 
 // The source slot contains old rows beyond its new count. A second logical
@@ -150,6 +179,7 @@ int main(int argc, char** argv) try {
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
         config.mock_mode = false;
         check_cuda(cudaSetDevice(config.cuda_device_id));
+        check_direct_index_padding_cuda();
         void* memory = nullptr;
         check_cuda(cudaMallocHost(&memory, sizeof(TestRecords)));
         std::unique_ptr<void, decltype(&cudaFreeHost)> owner(memory, cudaFreeHost);

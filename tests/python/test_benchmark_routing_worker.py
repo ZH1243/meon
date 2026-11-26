@@ -1,5 +1,6 @@
 """Worker handoff from the benchmark's per-epoch metadata to the production proxy."""
 import contextlib
+import ctypes as C
 import io
 import os
 from pathlib import Path
@@ -15,6 +16,33 @@ import rdma_proxy_worker as worker
 
 
 class BenchmarkRoutingWorkerTests(unittest.TestCase):
+    def test_index_allocator_returns_the_exchange_slot_for_each_global_source(self):
+        capacity = 80
+        arrays = [SimpleNamespace(address=2**40 + rank * 4096, capacity=capacity) for rank in range(16)]
+        for array in arrays:
+            array.tensor = SimpleNamespace(
+                data_ptr=lambda array=array: array.address, dtype="int32", device="cuda:3",
+                shape=(capacity,), stride=lambda: (1,), numel=lambda: capacity, element_size=lambda: 4)
+        torch = SimpleNamespace(as_tensor=lambda array: array.tensor, device=lambda typ, idx: f"{typ}:{idx}",
+                                bfloat16="bf16", float16="fp16", float32="fp32", int32="int32")
+        buffers = worker.TorchDeviceBuffers(torch, 3, node_rank=1, local_gpu_index=3, num_gpus_per_node=8)
+        arrays[-1].tensor.device = "cuda:0"
+        with self.assertRaisesRegex(RuntimeError, "source 15"):
+            buffers.bind_benchmark_index_arrays(arrays, 8, capacity)
+        self.assertFalse(buffers.benchmark_index_views)
+        arrays[-1].tensor.device = "cuda:3"
+        buffers.bind_benchmark_index_arrays(arrays, 8, capacity)
+        for rank in reversed(range(16)):
+            node, gpu = divmod(rank, 8)
+            key = worker.DEVICE_BUFFER_ROUTER_A_IDX, -1, node, gpu
+            request = worker.DeviceBufferRequest(
+                C.sizeof(worker.DeviceBufferRequest), 1, worker.DEVICE_BUFFER_ROUTER_A_IDX,
+                worker.DEVICE_BUFFER_INT32, -1, node, gpu, 1, capacity * 4, (C.c_uint64 * 2)(capacity, 0))
+            self.assertEqual(buffers.callback(None, C.pointer(request)), arrays[rank].address)
+            self.assertIs(buffers.tensors[key], arrays[rank].tensor)
+        with self.assertRaisesRegex(RuntimeError, "before the first"):
+            buffers.bind_benchmark_index_arrays(arrays, 8, capacity)
+
     def test_shorthand_and_native_cli(self):
         environment = dict(LOCAL_RANK="0", LOCAL_WORLD_SIZE="1", RANK="0", WORLD_SIZE="1", GROUP_RANK="0")
         base = ["worker", "--dry-run", "--library=unused", "--cuda-device-map=0", "--rdma-device-map=unused"]
@@ -100,7 +128,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                                        exchange_staging_elapsed_ns=2000, install_elapsed_ns=3000,
                                        r_ready_to_install_elapsed_ns=5000, retire_elapsed_ns=100,
                                        reuse_barrier_ns=0, release_barrier_ns=0, source_route="receiver",
-                                       source_route_storage="borrowed")
+                                       source_route_storage="borrowed", a_idx_storage="exchange_device")
                 return ((1, 1 - epoch) if compute_extents else None), 6000
 
             def close(self, *, clean):
@@ -160,6 +188,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
         self.assertIn("phase=steady generation_us=1.000 exchange_staging_us=2.000 install_us=3.000", result)
         self.assertIn("retire_us=0.100", result)
         self.assertIn("source_route=receiver source_route_storage=borrowed", result)
+        self.assertIn("a_idx_storage=exchange_device", result)
         self.assertNotIn("r_ready_to_up_submit_us", result)
 
     def test_up_uses_current_route_and_timing_is_only_for_actual_launches(self):

@@ -80,6 +80,16 @@ int rme2_enable_direct_x3_x4(Rme2Proxy*, void** payload, uint64_t* bytes);
  * only between iterations. The receiver copies it and the submitted local
  * node_offsets/x3/x4 into reusable mapped host storage. */
 int rme2_enable_source_snapshot(Rme2Proxy*, const int32_t* device_r);
+/* Optional two-node device views. Enable before RDMA initialization on both
+ * peers. Local index values alias the completed IPC records. Each remote
+ * record also writes its index payload into separate registered GPU storage.
+ * rdma_sent_bytes / rdma_received_bytes include both writes in this mode. */
+int rme2_enable_device_indices(Rme2Proxy*);
+/* After connection, returns a stable int32 GPU pointer, capacity in elements.
+ * For each source, the valid prefix matches rme2_view after a successful wait.
+ * Caller may zero its private padding after wait. Drain all consumers on all
+ * ranks before another submit or disconnect/destroy; the proxy owns storage. */
+int rme2_device_indices(Rme2Proxy*, int source, void** indices, int* capacity);
 const char* rme2_error(void);
 int rme2_create(int rank, int device, int tokens, const char* shm_name,
                 double timeout_seconds, int validate_indices, int cpu_core,

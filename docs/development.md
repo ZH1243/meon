@@ -289,15 +289,15 @@ bash scripts/run_node0_torchrun.sh "${args[@]}"
 bash scripts/run_node1_torchrun.sh "${args[@]}"
 ```
 
-Each iteration generates fresh affine R using meon's per-rank seed sequence. The backend runs the benchmark's captured metadata graph with its native launch barrier, direct x3/x4 output, overlapping receiver and local staging after the receiver. The gather writes directly into meon's own input slice. After the benchmark worker completes, meon borrows the 16 pinned expert lists for the payload iteration and uploads each list's valid indices directly into its GPU `A_idx` buffer. The GPU buffer has zero padding through the common logical length. Meon also imports the local route and remote x3/x4 and rebuilds the forwarding plan. Python binds the current compute views before up-GEMM submission.
+Each iteration generates fresh affine R using meon's per-rank seed sequence. The backend runs the benchmark's captured metadata graph with its native launch barrier, direct x3/x4 output, overlapping receiver and local staging after the receiver. The gather writes directly into meon's own input slice. With matching exchange and payload libraries, each local `A_idx` points into its source's record in the destination GPU's exchange buffer. The NIC writes the eight remote index prefixes to registered GPU slots in addition to delivering their host records. Each slot keeps the original global source identity. The CPU borrows the 16 pinned lists for validation, scheduling and scatter preparation. After exchange completion, meon clears any padding through the common logical length in one GPU kernel and rebuilds the forwarding plan. Python binds the current compute views before up-GEMM submission. Older library combinations use the per-source H2D upload path.
 
 Before the next exchange, each rank retires the previous route after its payload and assignment-query readers finish, then enters the Gloo reuse barrier. Once all ranks leave that barrier, the receiver may reuse its outgoing buffer and peers may write the next incoming lists. At the end of the run the worker shuts down the payload proxy before freeing the benchmark's storage.
 
-Look for `source_route=receiver source_route_storage=borrowed` on the per-rank timing line. The receiver writes this GPU's outgoing node offsets, x3, x4 and top-8 R into pinned memory before the local staging gather. Meon checks the data there and borrows x3, x4 and R for the iteration. Older payload builds that support only the call-duration host handoff report `source_route=receiver source_route_storage=copied` with the updated worker. If the receiver handoff is unavailable, the worker reports `source_route=device_readback` and reads the arrays from the GPU during installation.
+Look for `a_idx_storage=exchange_device` on the per-rank timing line to confirm that the incoming indices use the direct GPU path. If any rank's libraries lack the required interfaces, the worker selects `a_idx_storage=host_upload` across the group. The separate fields `source_route=receiver source_route_storage=borrowed` describe this GPU's outgoing route. The receiver writes its outgoing node offsets, x3, x4 and top-8 R into pinned memory before the local staging gather. Meon checks the data there and borrows x3, x4 and R for the iteration. Older payload builds that support only the call-duration host handoff report `source_route=receiver source_route_storage=copied` with the updated worker. If the receiver handoff is unavailable, the worker reports `source_route=device_readback` and reads the arrays from the GPU during installation.
 
 | Per-rank field | Host wall interval |
 | --- | --- |
-| `exchange_staging_us` | Aligned submission through benchmark wait completion, including the seven kernels, GPU exchange, RDMA and local gather. With `source_route=receiver`, this interval also includes writing the outgoing snapshot that meon requests. The standalone benchmark uses the same timing boundary. |
+| `exchange_staging_us` | Aligned submission through benchmark wait completion, including the seven kernels, GPU exchange, RDMA and local gather. With `source_route=receiver`, this includes writing the outgoing snapshot. With direct GPU indices, it also includes the remote index mirrors and their GPU visibility. Pass `--device-indices` to the standalone two-node benchmark to include those writes there. |
 | `install_us` | Benchmark wait return through importing the source views and installing meon's dispatch and gather metadata. |
 | `retire_us` | Local time to release the previous iteration's borrowed route data before entering the reuse barrier. Zero for the first iteration and for snapshot installs. |
 | `r_ready_to_up_submit_us` | Fresh R completed through host return from up-GEMM submission, including alignment, installation, rank release and compute setup. Available for compute iterations that submit work. Use a GPU trace to measure the actual kernel start. |
@@ -359,7 +359,25 @@ cmake --build "$RDMA_PROXY_BUILD_DIR/receiver-tests" --target test_receiver_kern
 ctest --test-dir "$RDMA_PROXY_BUILD_DIR/receiver-tests" -R '^receiver_kernel_cuda$' --output-on-failure
 ```
 
-For the two-node H800 profile, rebuild `rdma_cpu_proxy_shared` and run the same arguments on both hosts. Profile 10 already used receiver readback. With `source_route_storage=borrowed`, compare `install_us` and the interval from gather completion to the first of the 16 incoming-index H2D uploads. Run the small two-node projection check above to exercise assignment queries and forwarding across changing iterations.
+For the two-node H800 profile, rebuild `rdma_cpu_proxy_shared` on both hosts and run the same launch arguments as profile 11. First run the small two-node projection check above, then compare steady-state `exchange_staging_us`, `install_us` and the interval from local gather completion to up-GEMM. In the direct path the GPU trace shows at most one `clear_index_tails_kernel` in place of the 16 H2Ds and their padding memsets. Each rank receives one extra RDMA write per nonempty remote list, carrying its live indices. Route validation still precedes padding and compute.
+
+To check the device and host lists independently against generated routes, run this GPU exchange suite concurrently on the two nodes with `NODE_RANK=0` or `1` and `RME2_LIBRARY` pointing at the rebuilt exchange library. Its cycling routes exercise empty lists, skew and changing lengths.
+
+```bash
+bash benchmarks/router_metadata_exchange2/run_two_node_gpu_checks.sh "$NODE_RANK" \
+  --native-metadata-launch --receiver-kernel --receiver-overlap-exchange --device-indices
+```
+
+The direct-index change was checked on macOS 15.6.1 arm64 with Debug native builds, Python 3.9.12 and CPU PyTorch 1.13.1. The host suites above passed 44 native tests, 96 Python tests and all 10 exchange host tests. Five native and eight Python tests skipped. They check both relay directions, source identity, live-prefix preservation, zero padding on empty and shrinking routes, and retirement after a failed install. The CPU exchange suite and CuTe reference tests also passed. The following commands also checked the two native lifecycle tests under UBSan.
+
+```bash
+cmake -S . -B /private/tmp/meon-direct-indices-ubsan -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_FLAGS='-fsanitize=undefined -fno-sanitize-recover=all'
+cmake --build /private/tmp/meon-direct-indices-ubsan --target test_benchmark_routing test_c_api -j4
+ctest --test-dir /private/tmp/meon-direct-indices-ubsan -R '^test_(benchmark_routing|c_api)$' --output-on-failure
+```
+
+The CUDA build, two-node numerical and transport checks, and Nsight timing comparison require the Hopper hosts.
 
 ### Two-node test on Hopper
 

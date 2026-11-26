@@ -1,4 +1,5 @@
 #include "proxy.hpp"
+#include "benchmark_index_padding.hpp"
 #include "forwarding_rounds.hpp"
 #include "iteration_routing_internal.hpp"
 
@@ -589,12 +590,32 @@ void Proxy::install_borrowed_benchmark_routing(uint64_t iteration, const RdmaPro
 }
 
 void Proxy::install_borrowed_benchmark_route_views(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff,
-                                                  const RdmaProxyBenchmarkHostRoute& host_route) {
-    install_benchmark_routing_impl(iteration, handoff, BenchmarkBorrow::RouteViews, &host_route);
+                                                  const RdmaProxyBenchmarkHostRoute& host_route,
+                                                  const RdmaProxyBenchmarkDeviceIndices* device_indices) {
+    if (device_indices) {
+        std::array<uintptr_t, BenchmarkIndexPadding::sources> addresses{};
+        if (device_indices->struct_size < sizeof(*device_indices) ||
+            device_indices->num_sources != addresses.size() || !device_indices->indices ||
+            device_indices->capacity_per_source < config_.num_tokens * config_.router_top_k ||
+            device_indices->capacity_per_source > std::numeric_limits<uintptr_t>::max() / sizeof(int32_t))
+            throw std::runtime_error("invalid benchmark device index descriptor or capacity");
+        const auto bytes = device_indices->capacity_per_source * sizeof(int32_t);
+        std::copy_n(device_indices->indices, addresses.size(), addresses.begin());
+        std::sort(addresses.begin(), addresses.end());
+        for (std::size_t i = 0; i < addresses.size(); ++i) {
+            const auto address = addresses[i];
+            if (!address || address % alignof(int32_t) ||
+                address > std::numeric_limits<uintptr_t>::max() - bytes ||
+                (i && address - addresses[i - 1] < bytes))
+                throw std::runtime_error("invalid or overlapping benchmark device index slots");
+        }
+    }
+    install_benchmark_routing_impl(iteration, handoff, BenchmarkBorrow::RouteViews, &host_route, device_indices);
 }
 
 void Proxy::install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff,
-                                           BenchmarkBorrow borrow, const RdmaProxyBenchmarkHostRoute* host_route) {
+                                           BenchmarkBorrow borrow, const RdmaProxyBenchmarkHostRoute* host_route,
+                                           const RdmaProxyBenchmarkDeviceIndices* device_indices) {
     if (!config_.router_benchmark_metadata_enabled)
         throw std::runtime_error("benchmark metadata handoff is disabled");
     if (!routing_install_required(iteration))
@@ -661,7 +682,7 @@ void Proxy::install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBe
     // From this point a partial install may already have retained source pointers.
     // Shutdown retires these as well if the installation fails.
     benchmark_expert_lists_borrowed_ = borrow != BenchmarkBorrow::None;
-    install_iteration_routing(iteration, std::move(route));
+    install_iteration_routing(iteration, std::move(route), device_indices);
 }
 
 void Proxy::retire_borrowed_benchmark_routing(uint64_t iteration) {
@@ -677,7 +698,8 @@ void Proxy::retire_borrowed_benchmark_routing(uint64_t iteration) {
     benchmark_expert_lists_borrowed_ = false;
 }
 
-void Proxy::install_iteration_routing(uint64_t iteration, IterationRouteData route) {
+void Proxy::install_iteration_routing(uint64_t iteration, IterationRouteData route,
+                                      const RdmaProxyBenchmarkDeviceIndices* device_indices) {
     // The previous completion barrier retired all data WRs, but the ready
     // thread may still be leaving its last scan. Hold the lock through
     // validation and rollback so readers can only see a committed route.
@@ -697,7 +719,7 @@ void Proxy::install_iteration_routing(uint64_t iteration, IterationRouteData rou
         }
         iteration_source_ = std::move(route.source);
         if (config_.nvlink_forwarding_enabled) {
-            cuda_buffers_.install_iteration_expert_metadata(std::move(route.incoming_experts), iteration);
+            cuda_buffers_.install_iteration_expert_metadata(std::move(route.incoming_experts), iteration, device_indices);
             prepare_forwarding_routing_tables();
             prepare_local_forwarding_routing_table();
             for (std::size_t p = 0; p < peers_.size(); ++p) {

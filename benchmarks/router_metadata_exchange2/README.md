@@ -11,6 +11,26 @@ with fresh routes and the real payload buffers, pass `--benchmark-metadata-excha
 to both runtime launchers. The runtime reports exchange/staging and installation
 separately. [Runtime launch and timing guide](../../docs/development.md#benchmark-metadata-backend)
 
+## Device index views for up-GEMM
+
+Pass `--device-indices` on both nodes to expose all 16 source index lists on
+each destination GPU. The eight local lists alias the index values following
+their IPC record headers. The destination allocates a separate GPU receive
+region for the eight remote lists because its IPC arena also holds outgoing
+records that the NIC may still be reading. Each nonempty remote list adds
+one RDMA write of its valid int32 values, ordered on the same QP before the
+host record and its completion notification. The CPU scheduler retains the
+full pinned records. The remote x3/x4 route still goes to pinned memory.
+
+The device pointers stay at fixed addresses across iterations. A successful
+exchange wait covers the local producers, remote completions and GPUDirect
+visibility on the owning GPU. Each valid prefix matches the host view. Drain
+all GPU readers before the next iteration's exchange writes to these slots.
+At 20,480 tokens the additional registered receive allocation is 5 MiB per
+rank. `rdma_sent_bytes` and `rdma_received_bytes` include the extra four
+bytes per remote assignment. Use `--verify all` to compare all live device
+values to the independent route reference.
+
 ## Receiver-kernel D2H (two nodes, opt-in)
 
 Add **`--receiver-kernel` on both nodes** to perform all local metadata readback

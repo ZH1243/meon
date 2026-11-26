@@ -21,6 +21,14 @@ inline size_t words(int capacity) { return x3_x4_offset(capacity) + (x3_x4_bytes
 inline size_t record_offset(int slot, int capacity) {
     return directory_words + size_t(slot) * stride(capacity);
 }
+// The remote half of the IPC allocation stages OUTGOING RDMA. Incoming NIC
+// writes use a separate allocation of eight headerless int32 index lists.
+inline size_t remote_indices_offset(int local_source, int capacity) {
+    return size_t(local_source) * capacity;
+}
+inline size_t remote_indices_bytes(int capacity) {
+    return size_t(gpus) * capacity * sizeof(int32_t);
+}
 inline uint64_t epoch(const int32_t* h) {
     return uint64_t(uint32_t(h[2])) | (uint64_t(uint32_t(h[3])) << 32);
 }

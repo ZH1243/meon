@@ -1,5 +1,7 @@
 #include <cuda_runtime.h>
 
+#include "benchmark_index_padding.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -18,6 +20,15 @@ __global__ void copy_bytes_kernel(std::uint8_t* dst, const std::uint8_t* src, st
     }
 }
 
+__global__ void clear_index_tails_kernel(BenchmarkIndexPadding padding) {
+    const auto source = blockIdx.y;
+    auto* indices = padding.indices[source];
+    if (!indices) return;
+    const auto start = padding.counts[source] + blockIdx.x * blockDim.x + threadIdx.x;
+    for (auto row = start; row < padding.common_count; row += blockDim.x * gridDim.x)
+        indices[row] = 0;
+}
+
 void check_cuda(cudaError_t status, const char* what) {
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
@@ -25,6 +36,14 @@ void check_cuda(cudaError_t status, const char* what) {
 }
 
 }  // namespace
+
+void clear_benchmark_index_padding(const BenchmarkIndexPadding& padding, std::uint32_t max_padding) {
+    if (!max_padding) return;
+    constexpr unsigned threads = 256;
+    const auto blocks = std::min(32u, 1u + (max_padding - 1u) / threads);
+    clear_index_tails_kernel<<<dim3(blocks, BenchmarkIndexPadding::sources), threads, 0, cudaStreamLegacy>>>(padding);
+    check_cuda(cudaGetLastError(), "clear benchmark A_idx padding");
+}
 
 void launch_copy_tokens_kernel(void* dst, const void* src, std::size_t bytes) {
     constexpr int threads = 256;

@@ -42,6 +42,13 @@ class BenchmarkHostRoute(C.Structure):
     ]
 
 
+class BenchmarkDeviceIndices(C.Structure):
+    _fields_ = [
+        ("struct_size", C.c_uint32), ("num_sources", C.c_uint32),
+        ("capacity_per_source", C.c_uint64), ("indices", C.POINTER(C.c_size_t)),
+    ]
+
+
 class BenchmarkConfig(C.Structure):
     _fields_ = [
         ("struct_size", C.c_uint64), ("num_tokens", C.c_uint64),
@@ -91,6 +98,7 @@ class BenchmarkMetadataBackend:
         self.failed = False
         self.next_iteration = 0
         self.source_snapshot_view = None
+        self.device_indices = None
         self.last_stats = {}
         self.config = BenchmarkConfig(struct_size=C.sizeof(BenchmarkConfig))
         self._bind()
@@ -114,6 +122,7 @@ class BenchmarkMetadataBackend:
         self.install_routing = install
         self.retire_routing = retire
         self.install_host_routing = None
+        self.install_device_indices = None
         self.borrow_source_route = False
         if retire is not None:
             retire.argtypes, retire.restype = [C.c_void_p, C.c_uint64], C.c_int
@@ -126,6 +135,14 @@ class BenchmarkMetadataBackend:
                 self.install_host_routing.argtypes = [
                     C.c_void_p, C.c_uint64, C.POINTER(BenchmarkRouting), C.POINTER(BenchmarkHostRoute)]
                 self.install_host_routing.restype = C.c_int
+            if self.borrow_source_route:
+                self.install_device_indices = getattr(
+                    self.library, "rdma_proxy_install_borrowed_benchmark_device_indices", None)
+                if self.install_device_indices is not None:
+                    self.install_device_indices.argtypes = [
+                        C.c_void_p, C.c_uint64, C.POINTER(BenchmarkRouting),
+                        C.POINTER(BenchmarkHostRoute), C.POINTER(BenchmarkDeviceIndices)]
+                    self.install_device_indices.restype = C.c_int
         calls = (
             (self.library.rdma_proxy_get_benchmark_routing_config, [C.c_void_p, C.POINTER(BenchmarkConfig)]),
             (install, [C.c_void_p, C.c_uint64, C.POINTER(BenchmarkRouting)]),
@@ -216,6 +233,7 @@ class BenchmarkMetadataBackend:
 
         self._setup_step("creating node metadata control", lambda: create() if self.local == 0 else None)
         self._setup_step("joining node metadata control", lambda: create() if self.local != 0 else None)
+        direct_indices = self._enable_device_indices()
         descriptor = self._setup_step("registering metadata arenas", lambda: self.session.rdma_init(
             os.fsdecode(c.rdma_device_name), c.rdma_port, c.gid_index))
         peers = self._all(descriptor)
@@ -228,7 +246,28 @@ class BenchmarkMetadataBackend:
                          lambda: self.session.connect(handles[self.node * 8:self.node * 8 + 8]))
         self.connected = True
         self._setup_step("retiring metadata control name", lambda: self.session.unlink() if self.local == 0 else None)
+        if direct_indices:
+            self._setup_step("binding exchange device indices", self._bind_device_indices)
         self._setup_step("capturing CuTe metadata and meon local staging graphs", self._capture)
+
+    def _enable_device_indices(self):
+        # Peers must agree on their RDMA destinations before registering the arenas.
+        capable = (self.install_device_indices is not None and self.session.supports_device_indices()
+                   and hasattr(self.session.lib, "rme2_enable_source_snapshot")
+                   and hasattr(self.session.lib, "rme2_source_snapshot_view"))
+        if not all(self._all(capable)):
+            return False
+        self._setup_step("enabling exchange device indices", self.session.enable_device_indices)
+        return True
+
+    def _bind_device_indices(self):
+        gpus = self.config.num_gpus_per_node
+        sources = self.config.num_nodes * gpus
+        arrays = [self.session.device_index_array(source) for source in range(sources)]
+        capacity = self.config.num_tokens * 8
+        self.device_buffers.bind_benchmark_index_arrays(arrays, gpus, capacity)
+        addresses = (C.c_size_t * sources)(*(array.address for array in arrays))
+        self.device_indices = BenchmarkDeviceIndices(C.sizeof(BenchmarkDeviceIndices), sources, capacity, addresses)
 
     def _enable_source_snapshot(self):
         if self.install_host_routing is None:
@@ -306,7 +345,11 @@ class BenchmarkMetadataBackend:
             nodes = self.config.num_nodes
             host = BenchmarkHostRoute(C.sizeof(BenchmarkHostRoute), nodes + 1, offsets[nodes],
                                       8 * self.config.num_tokens, offsets, source_x3, source_x4, r)
-            status = self.install_host_routing(self.handle, iteration, C.byref(record), C.byref(host))
+            if self.device_indices is not None:
+                status = self.install_device_indices(self.handle, iteration, C.byref(record), C.byref(host),
+                                                     C.byref(self.device_indices))
+            else:
+                status = self.install_host_routing(self.handle, iteration, C.byref(record), C.byref(host))
         else:
             record.device_r, record.device_node_offsets = self.r.data_ptr(), self.plan.node_offsets.data_ptr()
             record.device_x3, record.device_x4 = self.plan.x3.data_ptr(), self.plan.x4.data_ptr()
@@ -352,6 +395,7 @@ class BenchmarkMetadataBackend:
                 "source_route": "receiver" if self.source_snapshot_view is not None else "device_readback",
                 "source_route_storage": ("borrowed" if self.source_snapshot_view is not None
                                          and self.borrow_source_route else "copied"),
+                "a_idx_storage": "exchange_device" if self.device_indices is not None else "host_upload",
                 "rme2_stats": native_stats,
             }
             self.next_iteration += 1

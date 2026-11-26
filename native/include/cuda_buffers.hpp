@@ -350,6 +350,7 @@ private:
     void upload_cpu_scatter_slab();
     void commit_cpu_scatter_prefix_locked();
     void cpu_scatter_worker_loop() noexcept;
+    void quiesce_cpu_scatter_worker();
     void wait_threaded_cpu_scatter_ready(uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms);
     void publish_deferred_cpu_scatter_locked();
     CpuPinnedBuffer cpu_scatter_staging_;
@@ -367,7 +368,7 @@ private:
     std::condition_variable cpu_scatter_ready_cv_;
     // Notification/reset always acquire scheduler then worker state. The worker
     // never acquires scheduler state and releases this lock for ALL packing.
-    bool cpu_scatter_threaded_{false};
+    bool cpu_scatter_threaded_{false};  // Publication policy of the current route.
     std::thread cpu_scatter_worker_thread_;
     std::mutex cpu_scatter_worker_mutex_;
     std::condition_variable cpu_scatter_worker_cv_;

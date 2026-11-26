@@ -1913,10 +1913,12 @@ This needs no gather-table D2H or extra descriptor allocation. Up GEMM can
 continue consuming the published table while the CPU packs the metadata.
 
 To overlap CPU packing with gather construction, select
-`--cpu-scatter-publication=threaded`. One persistent native thread per GPU worker
-consumes committed prefixes of the host gather table. The notification receiver
-exposes each prefix only after submitting the corresponding gather table and
-ready updates. The scatter thread packs complete M batches, using the first
+`--cpu-scatter-publication=threaded`. Each GPU process starts one native helper
+when it first configures a nonempty threaded scatter. The same helper consumes
+committed prefixes of the host gather table across iterations and sleeps
+between them, including when a dynamic route has zero assignments. The
+notification receiver exposes each prefix only after submitting the corresponding
+gather table and ready updates. The scatter thread packs complete M batches, using the first
 descriptor of each repeated N group, outside the gather scheduler lock. It can
 start packing while later notifications are still arriving. It queues the one
 metadata H2D only when **all metadata is packed and the final gather publication
@@ -1959,9 +1961,12 @@ This host wait releases the relevant native mutex and is bounded by
 [CUDA event-wait semantics](https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html).
 Staging is reused only after publication-stream synchronization at the next
 iteration reset, and a previous iteration's event cannot satisfy a new request.
-Threaded mode also cancels and drains active CPU packing before resetting the
-host table or staging. Shutdown stops and joins the thread before borrowed
-Python buffers can be released. Worker failures propagate to the metadata wait.
+When replacing a dynamic route, the runtime prevents the helper from taking
+more batches from the old route, waits for any active packing or upload
+submission to finish, and synchronizes the publication stream. It can then
+replace the lookup tables and bind the new iteration's buffers. Shutdown stops
+and joins the helper before borrowed Python buffers can be released. Worker
+failures propagate to the metadata wait.
 
 To compare with the former incremental behavior, select
 `--cpu-scatter-publication=per-batch`. That mode issues one scatter H2D per M

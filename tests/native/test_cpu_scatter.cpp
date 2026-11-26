@@ -1,6 +1,7 @@
 #include "cuda_buffers.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <iostream>
 #include <chrono>
 #include <cstring>
@@ -580,7 +581,7 @@ static void run(bool per_entry, uint64_t tile, bool cuda, int weight_mode,
     destroy_cuda_stream(compute_stream, config.mock_mode);
 }
 
-static void test_threaded_dynamic_slab_reuse(bool reserve_at_startup, bool cuda) {
+static void test_threaded_dynamic_reuse(bool reserve_at_startup, bool cuda) {
     ProxyConfig c;
     c.mock_mode = !cuda;
     c.router_routing_enabled = c.router_dynamic_routing_enabled = true;
@@ -591,7 +592,7 @@ static void test_threaded_dynamic_slab_reuse(bool reserve_at_startup, bool cuda)
     c.router_top_k = 1;
     c.num_tokens = 4;
     c.token_dimension = c.expert_gemm_dimension = c.expert_gemm_n_tile = 1;
-    c.expert_gemm_m_tile = 16;  // All assignments form a single M batch in source order.
+    c.expert_gemm_m_tile = 4;  // The largest generation covers two M batches.
     c.dtype = DataType::kBF16;
 
     const auto destroy_stream = [&](void* stream) { destroy_cuda_stream(stream, c.mock_mode); };
@@ -610,7 +611,19 @@ static void test_threaded_dynamic_slab_reuse(bool reserve_at_startup, bool cuda)
     }
 #endif
     // Join the publisher and finish all copies before releasing its destination.
+    PackingGate packing_gate;
+    std::atomic<unsigned> packing_threads{0};
     CudaBuffers buffers(c);
+    ReleasePackingGate release_before_buffers_cleanup{packing_gate};
+    CpuScatterTestAccess::set_hook(buffers, [&] {
+        // A newly created std::thread can have the same OS ID as its predecessor.
+        thread_local bool first_pack = true;
+        if (first_pack) {
+            ++packing_threads;
+            first_pack = false;
+        }
+        packing_gate();
+    });
     buffers.initialize();
     constexpr std::size_t reserved_bytes = 8 * (sizeof(int64_t) + sizeof(float));
     void* pinned = nullptr;
@@ -621,10 +634,13 @@ static void test_threaded_dynamic_slab_reuse(bool reserve_at_startup, bool cuda)
         require(pinned && slab.bytes == reserved_bytes);
     }
     const std::vector<std::vector<std::vector<int32_t>>> epochs{
-        {{}, {}}, {{0}, {}}, {{0,1,2,3}, {0,1,2,3}}, {{}, {}}, {{1,2,3}, {}}, {{}, {1}},
+        {{}, {}}, {{0}, {}}, {{0,1,2,3}, {0,1,2,3}}, {{}, {}}, {{1,2,3}, {}}, {{}, {1}}, {{}, {}},
     };
+    // On the mock path also replace a route while the packer holds its old descriptors.
+    const bool cancel_busy_pack = !cuda && !reserve_at_startup;
+    constexpr std::size_t busy_epoch = 2;
     for (std::size_t epoch = 0; epoch < epochs.size(); ++epoch) {
-        const bool per_batch = epoch + 1 == epochs.size();
+        const bool per_batch = epoch == 4;  // Resume threaded publication afterwards.
         const auto& lists = epochs[epoch];
         std::vector<RouterExpertMetadata> metadata;
         std::vector<float> expected_weights;
@@ -644,7 +660,20 @@ static void test_threaded_dynamic_slab_reuse(bool reserve_at_startup, bool cuda)
                 expected_weights.push_back(weight);
             }
         }
-        buffers.install_iteration_expert_metadata(std::move(metadata), epoch);
+        if (cancel_busy_pack && epoch == busy_epoch + 1) {
+            auto installing = std::async(std::launch::async, [&] {
+                buffers.install_iteration_expert_metadata(std::move(metadata), epoch);
+            });
+            ReleasePackingGate release_before_future_cleanup{packing_gate};
+            CpuScatterTestAccess::wait_cancelled(buffers);
+            require(installing.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout);
+            packing_gate.release();
+            installing.get();
+            require(std::all_of(destination, destination + sizeof(mock_destination),
+                                [](unsigned char value) { return value == 0xa5; }));
+        } else {
+            buffers.install_iteration_expert_metadata(std::move(metadata), epoch);
+        }
         const auto& slab = CpuScatterTestAccess::slab(buffers);
         if (pinned) require(slab.ptr == pinned);  // Still owned between route bindings.
         auto& publication = buffers.router_notification_publication_buffers();
@@ -681,8 +710,13 @@ static void test_threaded_dynamic_slab_reuse(bool reserve_at_startup, bool cuda)
 #endif
         std::memset(destination, 0xa5, sizeof(mock_destination));
         buffers.begin_router_notification_iteration(epoch);
+        if (cancel_busy_pack && epoch == busy_epoch) packing_gate.arm();
         for (int source = 0; source < 2; ++source)
             buffers.process_router_notification_completion(0, source, epoch, 0, c.num_tokens);
+        if (cancel_busy_pack && epoch == busy_epoch) {
+            packing_gate.wait_entered();
+            continue;
+        }
         if (per_batch) {
             // A reservation alone must not select the one-copy publication path.
             rejects([&] { buffers.wait_cpu_scatter_ready(epoch, stream_address, 1); });
@@ -709,6 +743,8 @@ static void test_threaded_dynamic_slab_reuse(bool reserve_at_startup, bool cuda)
         require(std::all_of(destination + active_bytes, destination + sizeof(mock_destination),
                             [](unsigned char value) { return value == 0xa5; }));
     }
+    if (packing_threads != 1)
+        throw std::runtime_error("expected one scatter worker to pack all dynamic generations");
 }
 
 int main(int argc, char** argv) {
@@ -729,8 +765,8 @@ int main(int argc, char** argv) {
     // position-specific weights in the SAME packed slots in both iterations.
     run(true, 128, cuda, 1, 0, true, 0, true);
     run(false, 128, cuda, 1, 2, false, 0, true);
-    test_threaded_dynamic_slab_reuse(true, cuda);
-    test_threaded_dynamic_slab_reuse(false, cuda);
+    test_threaded_dynamic_reuse(true, cuda);
+    test_threaded_dynamic_reuse(false, cuda);
     if (!cuda) {
         run(false, 128, false, 1, 2, false, 1); // busy reset and worker failure
         run(false, 128, false, 1, 2, false, 2); // destructor joins a busy worker

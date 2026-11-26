@@ -750,11 +750,15 @@ void CudaBuffers::install_iteration_expert_metadata(
         seen[slot] = true;
     }
 
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
     if (metadata_generations_installed_ && config_.nvlink_forward_completion_notifications_enabled) {
-        stop_cpu_scatter_worker();
+        if (cpu_scatter_threaded_) {
+            quiesce_cpu_scatter_worker();
+            select_cuda_device_for_thread(config_.cuda_device_id, config_.mock_mode);
+        }
+        // Retire descriptor and scatter DMA before replacing the old route.
         synchronize_cuda_stream(router_notification_publication_stream_, config_.mock_mode);
     }
-    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
     if (metadata_generations_installed_) clear_iteration_cpu_scatter();
     for (auto& table : tables) {
         const auto slot = static_cast<std::size_t>(table.source_node_rank) *
@@ -767,12 +771,7 @@ void CudaBuffers::install_iteration_expert_metadata(
 }
 
 void CudaBuffers::clear_iteration_cpu_scatter() {
-    if (cpu_scatter_worker_error_) std::rethrow_exception(cpu_scatter_worker_error_);
     cpu_scatter_threaded_ = false;
-    cpu_scatter_worker_stop_ = false;
-    cpu_scatter_worker_epoch_valid_ = false;
-    cpu_scatter_worker_cancelled_ = false;
-    cpu_scatter_worker_submitted_ = false;
     cpu_scatter_device_ = 0;
     cpu_route_weights_device_ = 0;
     cpu_scatter_active_bytes_ = 0;
@@ -1183,11 +1182,13 @@ void CudaBuffers::configure_cpu_scatter_threaded(std::size_t bytes) {
         !publication.host_table.ptr)
         throw std::runtime_error("threaded CPU scatter requires nonempty complete gather geometry");
     configure_cpu_scatter_slab_locked(bytes, true);
-    try {
-        cpu_scatter_worker_thread_ = std::thread(&CudaBuffers::cpu_scatter_worker_loop, this);
-    } catch (...) {
-        cpu_scatter_active_bytes_ = 0;
-        throw;
+    if (!cpu_scatter_worker_thread_.joinable()) {
+        try {
+            cpu_scatter_worker_thread_ = std::thread(&CudaBuffers::cpu_scatter_worker_loop, this);
+        } catch (...) {
+            cpu_scatter_active_bytes_ = 0;
+            throw;
+        }
     }
     cpu_scatter_threaded_ = true;
 }
@@ -1435,21 +1436,18 @@ void CudaBuffers::cpu_scatter_worker_loop() noexcept {
 #endif
         select_cuda_device_for_thread(config_.cuda_device_id, config_.mock_mode);
         auto& publication = router_notification_publication_buffers_;
-        const auto groups = publication.n_groups_per_m_cluster;
-        if (!groups || publication.table_rows % groups ||
-            publication.table_width != 2 + 2 * cpu_scatter_lookup_.size() ||
-            publication.table_row_bytes != publication.table_width * sizeof(int32_t) ||
-            !publication.host_table.ptr)
-            throw std::runtime_error("invalid host gather geometry for threaded CPU scatter");
         std::unique_lock<std::mutex> lock(cpu_scatter_worker_mutex_);
         for (;;) {
             cpu_scatter_worker_cv_.wait(lock, [&] {
                 return cpu_scatter_worker_stop_ ||
                     (cpu_scatter_worker_epoch_valid_ && !cpu_scatter_worker_cancelled_ &&
                      !cpu_scatter_worker_submitted_ &&
-                     cpu_scatter_worker_consumed_rows_ < cpu_scatter_worker_committed_rows_ / groups * groups);
+                     cpu_scatter_worker_committed_rows_ - cpu_scatter_worker_consumed_rows_ >=
+                         publication.n_groups_per_m_cluster);
             });
             if (cpu_scatter_worker_stop_) return;
+            // Configuration validates the geometry before each threaded epoch is armed.
+            const auto groups = publication.n_groups_per_m_cluster;
             const auto epoch = cpu_scatter_worker_epoch_;
             const auto row = cpu_scatter_worker_consumed_rows_;
             const auto ready_count = cpu_scatter_worker_ready_publication_count_;
@@ -1547,8 +1545,26 @@ void CudaBuffers::wait_threaded_cpu_scatter_ready(
 #endif
 }
 
+void CudaBuffers::quiesce_cpu_scatter_worker() {
+    std::unique_lock<std::mutex> lock(cpu_scatter_worker_mutex_);
+    if (cpu_scatter_worker_epoch_valid_) {
+        // Invalidate the route before waiting so the worker cannot take another
+        // descriptor and old readiness waiters cannot accept the next event.
+        cpu_scatter_worker_epoch_valid_ = false;
+        cpu_scatter_worker_cancelled_ = true;
+        cpu_scatter_worker_cv_.notify_all();
+        cpu_scatter_worker_ready_cv_.notify_all();
+    }
+    if (!cpu_scatter_worker_cv_.wait_for(lock, std::chrono::milliseconds(config_.completion_timeout_ms),
+            [&] { return !cpu_scatter_worker_busy_; }))
+        throw std::runtime_error("timed out quiescing CPU scatter worker");
+    if (cpu_scatter_worker_error_) std::rethrow_exception(cpu_scatter_worker_error_);
+    if (cpu_scatter_worker_stop_) throw std::runtime_error("CPU scatter worker is stopped");
+}
+
 void CudaBuffers::stop_cpu_scatter_worker() {
-    if (!cpu_scatter_threaded_) return;
+    // A parked worker may outlive the most recent threaded route.
+    if (!cpu_scatter_worker_thread_.joinable() && !cpu_scatter_threaded_) return;
     {
         std::lock_guard<std::mutex> lock(cpu_scatter_worker_mutex_);
         cpu_scatter_worker_stop_ = true;
@@ -1580,18 +1596,7 @@ void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) 
         if (cpu_route_weights_device_ && !cpu_route_weights_staging_.ptr)
             allocate_pinned_buffer(cpu_route_weights_staging_, cpu_scatter_routes_ * sizeof(float));
     }
-    if (cpu_scatter_threaded_) {
-        std::unique_lock<std::mutex> lock(cpu_scatter_worker_mutex_);
-        cpu_scatter_worker_cancelled_ = true;
-        cpu_scatter_worker_epoch_valid_ = false;
-        cpu_scatter_worker_cv_.notify_all();
-        cpu_scatter_worker_ready_cv_.notify_all();
-        if (!cpu_scatter_worker_cv_.wait_for(lock, std::chrono::milliseconds(config_.completion_timeout_ms),
-                [&] { return !cpu_scatter_worker_busy_; }))
-            throw std::runtime_error("timed out quiescing CPU scatter worker for iteration reset");
-        if (cpu_scatter_worker_error_) std::rethrow_exception(cpu_scatter_worker_error_);
-        if (cpu_scatter_worker_stop_) throw std::runtime_error("CPU scatter worker is stopped");
-    }
+    if (cpu_scatter_threaded_) quiesce_cpu_scatter_worker();
     const bool reset_existing_iteration = scheduler.iteration_initialized;
     if (reset_existing_iteration) {
         // A new arrival order can reuse every descriptor and packed index

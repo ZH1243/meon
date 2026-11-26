@@ -170,7 +170,18 @@ ctest --test-dir build/mock -R '^test_cpu_scatter$' --output-on-failure
 python -m unittest discover -s tests/python -p test_cpu_scatter_publication.py -v
 ```
 
-On Hopper, run `ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R '^test_cpu_scatter_cuda$' --output-on-failure` after building the CUDA tests. Rebuild the shared library on both hosts and repeat the dynamic numerical check above with `--cpu-scatter-preparation --cpu-scatter-publication=threaded`. In a CUDA API trace of the two-node timing run, look for the pinned scatter allocation during setup and the single scatter metadata H2D per nonempty iteration. Its byte count follows the current route count. The [scatter staging description](runtime.md#optional-cpu-scatter-preparation) gives the expected capacity and upload sizes.
+The dynamic scatter test counts distinct worker threads that pack a batch across routing changes. It covers a growing route, an empty route, switching to per-batch publication and back, and replacing a route while its worker is still packing. On an Apple M1 Max with Apple Clang 14, the Debug host test passed ten consecutive runs under ThreadSanitizer. To repeat it, use a separate build directory.
+
+```bash
+cmake -S . -B build/mock-tsan -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+cmake --build build/mock-tsan --target test_cpu_scatter -j4
+TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build/mock-tsan \
+  -R '^test_cpu_scatter$' --repeat until-fail:10 --output-on-failure
+```
+
+On Hopper, run `ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R '^test_cpu_scatter_cuda$' --output-on-failure` after building the CUDA tests. Rebuild the shared library on both hosts and repeat the dynamic numerical check above with `--cpu-scatter-preparation --cpu-scatter-publication=threaded`. In Nsight Systems, follow the scatter metadata H2D back to its CUDA API call. Each rank should show one `rdma-scatter` thread issuing that upload across all nonempty iterations. Look for the pinned scatter allocation during setup and one upload per nonempty iteration, sized by that iteration's route count. To measure the effect on latency in the benchmark metadata run, compare steady-state `install_us` and the interval from the end of the local staging gather to the start of up-GEMM at the same workload. [Scatter staging and upload sizes](runtime.md#optional-cpu-scatter-preparation)
 
 For the dynamic intra-node combine table, `test_c_api` compares the native output
 with the mask query, and `test_benchmark_routing` covers incoming remote masks

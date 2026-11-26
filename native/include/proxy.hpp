@@ -123,11 +123,13 @@ private:
     friend struct PreparedForwardingTestAccess;
     friend struct ReturnNotificationsTestAccess;
     friend struct QpCalibrationTestAccess;
+    friend struct IterationBarrierTestAccess;
     friend struct RdmaReturnsTestAccess;
     friend struct DualRdmaTestAccess;
     struct PeerState {
         int peer_rank{-1};
         int remote_gpu_index{-1};
+        std::unique_ptr<IterationControlChannel> iteration_control;
         MemoryRegionInfo local_send_mr;
         MemoryRegionInfo local_recv_mr;
         MemoryRegionInfo remote_recv_mr;
@@ -241,7 +243,7 @@ private:
     RouterX3Metadata exchange_router_receive_metadata(
         const PeerAddress& peer_addr);
     void exchange_router_expert_metadata_all_to_all();
-    void synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const;
+    void synchronize_peer_ready(const PeerAddress& peer_addr, PeerState& peer) const;
     void initialize_local_iteration_sync();
     void release_local_iteration_sync();
     std::string local_iteration_sync_shm_name() const;
@@ -301,6 +303,7 @@ private:
     void run_iteration(uint64_t iteration);
     void synchronize_iteration_start(uint64_t iteration) const;
     void synchronize_iteration(uint64_t iteration) const;
+    void synchronize_iteration_phase(const std::string& phase, uint64_t iteration) const;
     bool needs_local_payload_start_barrier() const;
     void synchronize_local_iteration_phase(const std::string& phase, uint64_t iteration) const;
     void fill_iteration_send_buffers(uint64_t iteration);

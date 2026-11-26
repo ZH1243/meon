@@ -173,6 +173,13 @@ if(RDMA_PROXY_BUILD_TESTS)
   add_test(NAME test_dual_rdma COMMAND test_dual_rdma)
   set_tests_properties(test_dual_rdma PROPERTIES TIMEOUT 30)
 
+  add_executable(test_iteration_control
+    tests/native/test_iteration_control.cpp
+    tests/native/test_proxy_iteration_barrier.cpp)
+  target_link_libraries(test_iteration_control PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_iteration_control COMMAND test_iteration_control)
+  set_tests_properties(test_iteration_control PROPERTIES TIMEOUT 30)
+
   add_executable(test_cpu_scatter tests/native/test_cpu_scatter.cpp)
   target_link_libraries(test_cpu_scatter PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_cpu_scatter COMMAND test_cpu_scatter)

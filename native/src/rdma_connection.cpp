@@ -13,11 +13,13 @@
 #include <limits>
 #include <mutex>
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <random>
 #include <sstream>
 #include <stdexcept>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <thread>
 #include <utility>
 #include <unistd.h>
@@ -103,16 +105,16 @@ void recv_all(int fd, void* data, std::size_t bytes) {
     }
 }
 
-// Calibration must also terminate when a peer connects but stops responding.
-// Keep the legacy transport unchanged when calibration is disabled.
-class CalibrationSocket {
+// Own partially constructed sockets until the connected fd is handed off.
+class ControlSocket {
 public:
-    explicit CalibrationSocket(int fd = -1) : fd_(fd) {}
-    ~CalibrationSocket() { if (fd_ >= 0) ::close(fd_); }
+    explicit ControlSocket(int fd = -1) : fd_(fd) {}
+    ~ControlSocket() { reset(); }
     int get() const { return fd_; }
+    int release() { return std::exchange(fd_, -1); }
     void reset(int fd = -1) { if (fd_ >= 0) ::close(fd_); fd_ = fd; }
-    CalibrationSocket(const CalibrationSocket&) = delete;
-    CalibrationSocket& operator=(const CalibrationSocket&) = delete;
+    ControlSocket(const ControlSocket&) = delete;
+    ControlSocket& operator=(const ControlSocket&) = delete;
 private:
     int fd_;
 };
@@ -135,121 +137,172 @@ std::size_t calibration_control_payload_limit(const ProxyConfig& config) {
     return limit;
 }
 
-std::string exchange_calibration_payload(
-    const PeerAddress& peer, uint16_t listen_port, bool client,
-    const std::string& payload, uint64_t timeout_ms, std::size_t maximum_payload_bytes) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    const auto check_deadline = [&] {
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - std::chrono::steady_clock::now()).count();
-        if (ms <= 0) throw std::runtime_error("calibration TCP exchange timed out");
-        return static_cast<int>(std::min<int64_t>(ms, std::numeric_limits<int>::max()));
-    };
-    const auto wait_fd = [&](int fd, short events) {
-        for (;;) {
-            pollfd descriptor{fd, events, 0};
-            const int rc = ::poll(&descriptor, 1, check_deadline());
-            if (rc > 0) return; // recv/send/SO_ERROR diagnoses HUP/ERR.
-            if (rc < 0 && errno == EINTR) continue;
-            throw std::runtime_error("calibration TCP socket wait failed or timed out");
-        }
-    };
-    const auto nonblocking = [](int fd) {
-        const int flags = fcntl(fd, F_GETFL, 0);
-        if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
-            throw std::runtime_error("cannot make calibration socket nonblocking");
+using ControlClock = std::chrono::steady_clock;
+
+ControlClock::time_point control_deadline(uint64_t timeout_ms) {
+    const auto now = ControlClock::now();
+    const auto maximum_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        ControlClock::time_point::max() - now).count();
+    if (timeout_ms >= static_cast<uint64_t>(maximum_ms)) return ControlClock::time_point::max();
+    return now + std::chrono::milliseconds(timeout_ms);
+}
+
+int remaining_ms(ControlClock::time_point deadline) {
+    const auto ms = std::chrono::ceil<std::chrono::milliseconds>(deadline - ControlClock::now()).count();
+    if (ms <= 0) throw std::runtime_error("control TCP exchange timed out");
+    return static_cast<int>(std::min<int64_t>(ms, std::numeric_limits<int>::max()));
+}
+
+void wait_control_fd(int fd, short events, ControlClock::time_point deadline) {
+    for (;;) {
+        pollfd descriptor{fd, events, 0};
+        int rc = ::poll(&descriptor, 1, remaining_ms(deadline));
+        if (rc > 0) return; // recv/send/SO_ERROR diagnoses HUP/ERR.
+        if (rc < 0 && errno != EINTR) throw std::runtime_error("control TCP poll failed");
+    }
+}
+
+void configure_control_fd(int fd) {
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
+        fcntl(fd, F_SETFD, FD_CLOEXEC) < 0)
+        throw std::runtime_error("cannot configure control TCP socket");
 #ifdef SO_NOSIGPIPE
-        int one = 1;
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+    const int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) != 0)
+        throw std::runtime_error("cannot disable SIGPIPE on control TCP socket");
 #endif
-    };
-    CalibrationSocket socket;
+}
+
+int open_control_fd(const PeerAddress& peer, uint16_t listen_port, bool client,
+                    ControlClock::time_point deadline) {
+    ControlSocket socket;
     if (client) {
         addrinfo hints{};
         hints.ai_socktype = SOCK_STREAM;
         hints.ai_family = AF_UNSPEC;
         addrinfo* result = nullptr;
         if (getaddrinfo(peer.host.c_str(), std::to_string(peer.port).c_str(), &hints, &result) != 0)
-            throw std::runtime_error("calibration getaddrinfo failed for " + peer.host);
+            throw std::runtime_error("control TCP getaddrinfo failed for " + peer.host);
         std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> addresses(result, freeaddrinfo);
         bool connected = false;
         while (!connected) {
-            check_deadline();
+            remaining_ms(deadline);
             for (auto* rp = result; rp; rp = rp->ai_next) {
                 socket.reset(::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol));
                 if (socket.get() < 0) continue;
-                nonblocking(socket.get());
+                configure_control_fd(socket.get());
                 int rc = ::connect(socket.get(), rp->ai_addr, rp->ai_addrlen);
                 if (rc < 0 && errno == EINPROGRESS) {
-                    wait_fd(socket.get(), POLLOUT);
+                    wait_control_fd(socket.get(), POLLOUT, deadline);
                     int error = 0;
                     socklen_t size = sizeof(error);
                     if (getsockopt(socket.get(), SOL_SOCKET, SO_ERROR, &error, &size) == 0 && !error) rc = 0;
                 }
                 if (rc == 0) { connected = true; break; }
             }
-            if (!connected) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            if (!connected) {
+                const auto next_attempt = ControlClock::now() + std::chrono::milliseconds(2);
+                std::this_thread::sleep_until(std::min(next_attempt, deadline));
+            }
         }
     } else {
-        CalibrationSocket listener(::socket(AF_INET6, SOCK_STREAM, 0));
-        if (listener.get() < 0) throw std::runtime_error("calibration listener socket failed");
-        int one = 1;
-        setsockopt(listener.get(), SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        ControlSocket listener(::socket(AF_INET6, SOCK_STREAM, 0));
+        if (listener.get() < 0) throw std::runtime_error("control TCP listener socket failed");
+        const int one = 1;
+        if (setsockopt(listener.get(), SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0)
+            throw std::runtime_error("cannot configure control TCP listener address reuse");
         sockaddr_in6 addr{};
         addr.sin6_family = AF_INET6;
         addr.sin6_addr = in6addr_any;
         addr.sin6_port = htons(listen_port);
         if (::bind(listener.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
             ::listen(listener.get(), 1) != 0)
-            throw std::runtime_error("calibration listener bind/listen failed");
-        nonblocking(listener.get());
+            throw std::runtime_error("control TCP listener bind/listen failed");
+        configure_control_fd(listener.get());
         for (;;) {
-            wait_fd(listener.get(), POLLIN);
+            wait_control_fd(listener.get(), POLLIN, deadline);
             socket.reset(::accept(listener.get(), nullptr, nullptr));
             if (socket.get() >= 0) break;
             if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
-                throw std::runtime_error("calibration accept failed");
+                throw std::runtime_error("control TCP accept failed");
         }
-        nonblocking(socket.get());
+        configure_control_fd(socket.get());
     }
-    const auto transfer = [&](void* data, std::size_t bytes, bool sending) {
-        auto* ptr = static_cast<char*>(data);
-        while (bytes) {
-            wait_fd(socket.get(), sending ? POLLOUT : POLLIN);
-            int flags = 0;
+    return socket.release();
+}
+
+void receive_control_bytes(int fd, void* data, std::size_t bytes, ControlClock::time_point deadline) {
+    auto* ptr = static_cast<char*>(data);
+    while (bytes) {
+        remaining_ms(deadline);
+        const auto n = ::recv(fd, ptr, bytes, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            wait_control_fd(fd, POLLIN, deadline);
+            continue;
+        }
+        if (n <= 0) throw std::runtime_error("control TCP peer disconnected or receive failed");
+        ptr += n;
+        bytes -= static_cast<std::size_t>(n);
+    }
+}
+
+void send_control_frame(int fd, const std::string& payload, ControlClock::time_point deadline) {
+    auto length = host_to_be64(payload.size());
+    iovec parts[] = {{&length, sizeof(length)}, {const_cast<char*>(payload.data()), payload.size()}};
+    msghdr message{};
+    message.msg_iov = parts;
+    message.msg_iovlen = payload.empty() ? 1 : 2;
+    int flags = 0;
 #ifdef MSG_NOSIGNAL
-            if (sending) flags = MSG_NOSIGNAL;
+    flags = MSG_NOSIGNAL;
 #endif
-            const auto n = sending ? ::send(socket.get(), ptr, bytes, flags) :
-                                     ::recv(socket.get(), ptr, bytes, 0);
-            if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-            if (n <= 0) throw std::runtime_error("calibration TCP peer disconnected or I/O failed");
-            ptr += n;
-            bytes -= static_cast<std::size_t>(n);
+    // Send the length and payload together; the usual marker takes one syscall.
+    while (message.msg_iovlen) {
+        remaining_ms(deadline);
+        const auto n = ::sendmsg(fd, &message, flags);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            wait_control_fd(fd, POLLOUT, deadline);
+            continue;
         }
-    };
-    const auto send_payload = [&] {
-        auto length = host_to_be64(payload.size());
-        transfer(&length, sizeof(length), true);
-        transfer(const_cast<char*>(payload.data()), payload.size(), true);
-    };
-    const auto receive_payload = [&] {
-        uint64_t length = 0;
-        transfer(&length, sizeof(length), false);
-        length = be64_to_host(length);
-        if (length > maximum_payload_bytes) {
-            throw std::runtime_error("calibration control payload length=" + std::to_string(length) +
-                " exceeds configured limit=" + std::to_string(maximum_payload_bytes) +
-                " bytes from peer_rank=" + std::to_string(peer.node_rank));
+        if (n <= 0) throw std::runtime_error("control TCP peer disconnected or send failed");
+        auto sent = static_cast<std::size_t>(n);
+        while (message.msg_iovlen && sent >= message.msg_iov->iov_len) {
+            sent -= message.msg_iov->iov_len;
+            ++message.msg_iov;
+            --message.msg_iovlen;
         }
-        std::string received(static_cast<std::size_t>(length), '\0');
-        transfer(received.data(), received.size(), false);
-        return received;
-    };
-    if (client) { send_payload(); return receive_payload(); }
-    auto received = receive_payload();
-    send_payload();
+        if (sent) {
+            message.msg_iov->iov_base = static_cast<char*>(message.msg_iov->iov_base) + sent;
+            message.msg_iov->iov_len -= sent;
+        }
+    }
+}
+
+std::string exchange_control_frame(int fd, bool client, int peer_rank, const std::string& payload,
+                                   std::size_t maximum_payload_bytes, ControlClock::time_point deadline) {
+    if (client) send_control_frame(fd, payload, deadline);
+    uint64_t length = 0;
+    receive_control_bytes(fd, &length, sizeof(length), deadline);
+    length = be64_to_host(length);
+    if (length > maximum_payload_bytes)
+        throw std::runtime_error("control payload length=" + std::to_string(length) +
+            " exceeds configured limit=" + std::to_string(maximum_payload_bytes) +
+            " from peer_rank=" + std::to_string(peer_rank));
+    std::string received(static_cast<std::size_t>(length), '\0');
+    receive_control_bytes(fd, received.data(), received.size(), deadline);
+    if (!client) send_control_frame(fd, payload, deadline);
     return received;
+}
+
+std::string exchange_calibration_payload(
+    const PeerAddress& peer, uint16_t listen_port, bool client,
+    const std::string& payload, uint64_t timeout_ms, std::size_t maximum_payload_bytes) {
+    const auto deadline = control_deadline(timeout_ms);
+    ControlSocket socket(open_control_fd(peer, listen_port, client, deadline));
+    return exchange_control_frame(socket.get(), client, peer.node_rank, payload, maximum_payload_bytes, deadline);
 }
 
 std::string exchange_payload_client(const PeerAddress& peer, const std::string& payload, uint64_t timeout_ms) {
@@ -856,6 +909,41 @@ std::string ConnectionManager::exchange_control_message(
         return exchange_payload_client(peer, local_payload, timeout_ms);
     }
     return exchange_payload_server(config_.listen_port, local_payload, timeout_ms);
+}
+
+IterationControlChannel::IterationControlChannel(int fd, bool client, int peer_rank)
+    : fd_(fd), client_(client), peer_rank_(peer_rank) {}
+
+IterationControlChannel::~IterationControlChannel() { close(); }
+
+void IterationControlChannel::close() noexcept {
+    if (fd_ >= 0) ::close(std::exchange(fd_, -1));
+}
+
+std::string IterationControlChannel::exchange(const std::string& local_payload, uint64_t timeout_ms) {
+    constexpr std::size_t maximum_marker_bytes = 4096;
+    if (fd_ < 0) throw std::runtime_error("iteration control channel is closed");
+    try {
+        if (local_payload.size() > maximum_marker_bytes)
+            throw std::runtime_error("iteration control message exceeds size limit");
+        return exchange_control_frame(fd_, client_, peer_rank_, local_payload,
+                                      maximum_marker_bytes, control_deadline(timeout_ms));
+    } catch (...) {
+        close();
+        throw;
+    }
+}
+
+std::unique_ptr<IterationControlChannel> ConnectionManager::open_iteration_control(
+    const PeerAddress& peer, uint64_t timeout_ms) const {
+    if (config_.mock_mode) return nullptr;
+    const bool client = config_.node_rank < peer.node_rank;
+    ControlSocket socket(open_control_fd(peer, config_.listen_port, client, control_deadline(timeout_ms)));
+    const int one = 1;
+    if (setsockopt(socket.get(), IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0)
+        throw std::runtime_error("cannot enable TCP_NODELAY on iteration control channel");
+    return std::unique_ptr<IterationControlChannel>(
+        new IterationControlChannel(socket.release(), client, peer.node_rank));
 }
 
 void ConnectionManager::send_global_control_message(

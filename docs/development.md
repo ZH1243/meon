@@ -313,6 +313,19 @@ To compare with the standalone timing table, discard meon iterations 0–19. For
 
 Use the same Python worker and benchmark backend on all 16 ranks so their Gloo collectives occur in the same order. For comparison with H800 profile 13, update both hosts and repeat the same launch with `--no-benchmark-metadata-validation`. Compare the steady-state intervals from the end of `clear_index_tails_kernel` to the first combine-row fill and from local gather completion to up-GEMM start. Also compare the time to the first gather-table ready-row publication. Ranks arriving early can spend some of their time waiting at native payload startup.
 
+For a comparison with H800 profile 14, rebuild `rdma_cpu_proxy_shared` on both hosts and repeat that launch with the same arguments. Confirm `iteration_control=persistent_tcp` for all eight peer pairs. Use the `phase=iteration_start` logs from both nodes to compare `peer_wait_us` and `local_wait_us` per GPU and iteration. In Nsight Systems, measure up-GEMM start to the first gather-table ready-row publication on the same GPU, excluding warmup. That interval also includes work outside the native barrier.
+
+The Debug native test `test_iteration_control` runs over IPv6 loopback without GPUs or verbs. It exercises repeated start/done markers, arrival skew in both directions, mixed-version peers, interrupted exchanges, mismatched markers and one-shot control traffic on the same port.
+
+Local verification used an Apple M1 Max running macOS 15.6.1 with CUDA and verbs disabled.
+
+```bash
+cmake -S . -B build/mock -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/mock -j4
+ctest --test-dir build/mock --output-on-failure
+ctest --test-dir build/mock -R '^test_iteration_control$' --repeat until-fail:10 --output-on-failure
+```
+
 The two-node launchers enable the QuACK down gather table, expert waves and ready publication. With dynamic routing, the worker builds a fresh down schedule from the current expert counts before submitting up-GEMM. Set `QUACK_ROOT` on both hosts to the checkout containing `run.wave_ready.build_expert_wave_schedule`. It packs the four integers in each descriptor into a CPU tensor and tracks each column group's last wave as it orders the descriptors. This work falls within `r_ready_to_up_submit_us`, after local route installation.
 
 These commands check the schedule on CPU and time construction for node 0, GPU 0 of the 20,480-token H800 run.

@@ -63,6 +63,24 @@ private:
     int qp_index_{-1};
 };
 
+// A single owner serializes exchanges. Any failed exchange closes the stream,
+// since the peer may already have consumed part of that frame.
+class IterationControlChannel {
+public:
+    ~IterationControlChannel();
+    IterationControlChannel(const IterationControlChannel&) = delete;
+    IterationControlChannel& operator=(const IterationControlChannel&) = delete;
+    std::string exchange(const std::string& local_payload, uint64_t timeout_ms);
+    void close() noexcept;
+
+private:
+    friend class ConnectionManager;
+    IterationControlChannel(int fd, bool client, int peer_rank);
+    int fd_;
+    bool client_;
+    int peer_rank_;
+};
+
 class ConnectionManager {
 public:
     explicit ConnectionManager(ProxyConfig config);
@@ -75,6 +93,8 @@ public:
         const PeerAddress& peer,
         const std::string& local_payload,
         uint64_t timeout_ms) const;
+    std::unique_ptr<IterationControlChannel> open_iteration_control(
+        const PeerAddress& peer, uint64_t timeout_ms) const;
     void send_global_control_message(
         const PeerAddress& peer,
         const std::string& local_payload,

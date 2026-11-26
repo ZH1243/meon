@@ -1769,30 +1769,48 @@ void Proxy::exchange_router_expert_metadata_all_to_all() {
     metadata_exchange_reports_.push_back(report.str());
 }
 
-void Proxy::synchronize_peer_ready(const PeerAddress& peer_addr, const PeerState& peer) const {
-    std::ostringstream local;
-    local << "peer_ready"
-          << " rank=" << config_.node_rank
-          << " gpu=" << config_.local_gpu_index
-          << " peer_rank=" << peer.peer_rank
-          << " remote_gpu=" << peer.remote_gpu_index;
-    const auto expected_rank = "rank=" + std::to_string(peer.peer_rank);
-    const auto expected_gpu = "gpu=" + std::to_string(peer.remote_gpu_index);
+void Proxy::synchronize_peer_ready(const PeerAddress& peer_addr, PeerState& peer) const {
+    const auto ready = [](int rank, int gpu, int peer_rank, int remote_gpu) {
+        return "peer_ready rank=" + std::to_string(rank) + " gpu=" + std::to_string(gpu) +
+               " peer_rank=" + std::to_string(peer_rank) + " remote_gpu=" + std::to_string(remote_gpu);
+    };
+    auto local = ready(config_.node_rank, config_.local_gpu_index, peer.peer_rank, peer.remote_gpu_index);
+    const auto expected = ready(peer.peer_rank, peer.remote_gpu_index, config_.node_rank, config_.local_gpu_index);
+    constexpr char capability[] = "iteration_control_v1";
 
     RDMA_PROXY_LOG_INFO("local_rank=", config_.node_rank,
                         " local_gpu=", config_.local_gpu_index,
                         " waiting for peer ready remote_rank=", peer.peer_rank,
                         " remote_gpu=", peer.remote_gpu_index);
-    const auto remote = connection_manager_.exchange_control_message(
-        peer_addr, local.str(), config_.completion_timeout_ms);
-    if (remote.find(expected_rank) == std::string::npos ||
-        remote.find(expected_gpu) == std::string::npos) {
+    // Keep the peer_ready socket only if both endpoints advertise reuse. Older
+    // peers ignore trailing fields and close their end after this same exchange.
+    std::unique_ptr<IterationControlChannel> channel;
+    if (config_.num_nodes == 2 && !config_.mock_mode && !config_.rdma_qp_calibration_enabled) {
+        channel = connection_manager_.open_iteration_control(peer_addr, config_.completion_timeout_ms);
+        local += std::string(" ") + capability;
+    }
+    const auto remote = channel ? channel->exchange(local, config_.completion_timeout_ms) :
+        connection_manager_.exchange_control_message(peer_addr, local, config_.completion_timeout_ms);
+    const bool mock_echo = config_.mock_mode && remote == local;
+    if (!mock_echo && (remote.compare(0, expected.size(), expected) != 0 ||
+        (remote.size() > expected.size() && remote[expected.size()] != ' '))) {
         throw std::runtime_error("peer ready synchronization mismatch: " + remote);
+    }
+    if (channel) {
+        std::istringstream features(remote.substr(expected.size()));
+        for (std::string feature; features >> feature;) {
+            if (feature == capability) {
+                peer.iteration_control = std::move(channel);
+                break;
+            }
+        }
     }
     RDMA_PROXY_LOG_INFO("local_rank=", config_.node_rank,
                         " local_gpu=", config_.local_gpu_index,
                         " peer ready remote_rank=", peer.peer_rank,
-                        " remote_gpu=", peer.remote_gpu_index);
+                        " remote_gpu=", peer.remote_gpu_index,
+                        " iteration_control=", peer.iteration_control ? "persistent_tcp" :
+                                               config_.mock_mode ? "mock" : "per_exchange_tcp");
 }
 
 std::string Proxy::local_iteration_sync_shm_name() const {
@@ -3393,65 +3411,48 @@ void Proxy::fill_iteration_send_buffers(uint64_t iteration) {
 }
 
 void Proxy::synchronize_iteration_start(uint64_t iteration) const {
-    if (!peers_.empty()) {
-        std::ostringstream local;
-        local << "iteration_start"
-              << " rank=" << config_.node_rank
-              << " gpu=" << config_.local_gpu_index
-              << " iteration=" << iteration;
-        const auto expected_phase = "iteration_start";
-        const auto expected_iteration = "iteration=" + std::to_string(iteration);
-
-        RDMA_PROXY_LOG_INFO("iteration=", iteration, " waiting for ", peers_.size(), " peer start barrier(s)");
-        for (const auto& peer : peers_) {
-            const auto it = std::find_if(config_.peers.begin(), config_.peers.end(), [&](const PeerAddress& p) {
-                return p.node_rank == peer.peer_rank;
-            });
-            if (it == config_.peers.end()) {
-                throw std::runtime_error("cannot synchronize unknown peer rank " + std::to_string(peer.peer_rank));
-            }
-
-            const auto remote = connection_manager_.exchange_control_message(
-                *it, local.str(), config_.completion_timeout_ms);
-            if (remote.find(expected_phase) == std::string::npos ||
-                remote.find(expected_iteration) == std::string::npos) {
-                throw std::runtime_error("peer start synchronization mismatch: " + remote);
-            }
-            RDMA_PROXY_LOG_DEBUG("iteration=", iteration, " start synchronized with peer=", peer.peer_rank);
-        }
-        RDMA_PROXY_LOG_INFO("iteration=", iteration, " peer start barrier complete");
-    }
-    synchronize_local_iteration_phase("iteration_start", iteration);
+    synchronize_iteration_phase("iteration_start", iteration);
 }
 
 void Proxy::synchronize_iteration(uint64_t iteration) const {
-    if (!peers_.empty()) {
-        std::ostringstream local;
-        local << "iteration_done"
-              << " rank=" << config_.node_rank
-              << " gpu=" << config_.local_gpu_index
-              << " iteration=" << iteration;
-        const auto expected_iteration = "iteration=" + std::to_string(iteration);
+    synchronize_iteration_phase("iteration_done", iteration);
+}
 
-        RDMA_PROXY_LOG_INFO("iteration=", iteration, " waiting for ", peers_.size(), " peer synchronization barrier(s)");
-        for (const auto& peer : peers_) {
-            const auto it = std::find_if(config_.peers.begin(), config_.peers.end(), [&](const PeerAddress& p) {
+void Proxy::synchronize_iteration_phase(const std::string& phase, uint64_t iteration) const {
+    if (peers_.empty()) {
+        synchronize_local_iteration_phase(phase, iteration);
+        return;
+    }
+    const auto marker = [&](int rank, int gpu) {
+        return phase + " rank=" + std::to_string(rank) + " gpu=" + std::to_string(gpu) +
+               " iteration=" + std::to_string(iteration);
+    };
+    const auto local = marker(config_.node_rank, config_.local_gpu_index);
+    const auto started = std::chrono::steady_clock::now();
+    for (const auto& peer : peers_) {
+        std::string remote;
+        if (peer.iteration_control) {
+            remote = peer.iteration_control->exchange(local, config_.completion_timeout_ms);
+        } else {
+            const auto address = std::find_if(config_.peers.begin(), config_.peers.end(), [&](const PeerAddress& p) {
                 return p.node_rank == peer.peer_rank;
             });
-            if (it == config_.peers.end()) {
+            if (address == config_.peers.end())
                 throw std::runtime_error("cannot synchronize unknown peer rank " + std::to_string(peer.peer_rank));
-            }
-
-            const auto remote = connection_manager_.exchange_control_message(
-                *it, local.str(), config_.completion_timeout_ms);
-            if (remote.find(expected_iteration) == std::string::npos) {
-                throw std::runtime_error("peer synchronization iteration mismatch: " + remote);
-            }
-            RDMA_PROXY_LOG_DEBUG("iteration=", iteration, " synchronized with peer=", peer.peer_rank);
+            remote = connection_manager_.exchange_control_message(*address, local, config_.completion_timeout_ms);
         }
-        RDMA_PROXY_LOG_INFO("iteration=", iteration, " peer synchronization complete");
+        const auto expected = marker(peer.peer_rank, peer.remote_gpu_index);
+        if (remote != expected && !(config_.mock_mode && remote == local)) {
+            if (peer.iteration_control) peer.iteration_control->close();
+            throw std::runtime_error("expected peer marker '" + expected + "', received '" + remote + "'");
+        }
     }
-    synchronize_local_iteration_phase("iteration_done", iteration);
+    const auto peer_ready = std::chrono::steady_clock::now();
+    synchronize_local_iteration_phase(phase, iteration);
+    const auto local_ready = std::chrono::steady_clock::now();
+    RDMA_PROXY_LOG_INFO("iteration=", iteration, " phase=", phase,
+                        " peer_wait_us=", std::chrono::duration_cast<std::chrono::microseconds>(peer_ready - started).count(),
+                        " local_wait_us=", std::chrono::duration_cast<std::chrono::microseconds>(local_ready - peer_ready).count());
 }
 
 bool Proxy::needs_local_payload_start_barrier() const {

@@ -42,6 +42,8 @@ public:
     void install_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing);
     void install_borrowed_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing,
                                             const RdmaProxyBenchmarkHostRoute* host_route = nullptr);
+    void install_borrowed_benchmark_route_views(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing,
+                                                const RdmaProxyBenchmarkHostRoute& host_route);
     void retire_borrowed_benchmark_routing(uint64_t iteration);
     void run();
     void run_once();
@@ -56,8 +58,10 @@ public:
     void configure_cpu_scatter_deferred(std::size_t bytes);
     void configure_cpu_scatter_threaded(std::size_t bytes);
     void wait_cpu_scatter_ready(uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms);
-    const std::vector<int32_t>& original_router_experts() const;
-    const std::vector<float>& original_router_weights() const;
+    void copy_original_router_assignments(int32_t* experts, float* weights, uint64_t capacity,
+                                          uint64_t& count, uint64_t& num_tokens, uint64_t& top_k) const;
+    std::vector<int32_t> original_router_experts() const;
+    std::vector<float> original_router_weights() const;
     void finish_run();
     uintptr_t configure_down_ready_trace(int groups);
     std::vector<std::pair<int32_t, double>> read_down_ready_trace(uint64_t iteration);
@@ -73,7 +77,9 @@ public:
         uint64_t capacity, int32_t* rows, uint64_t row_elements, uint64_t* domain_counts) const;
     void build_inter_node_combine_rows(const int32_t* destination_nodes, uint64_t num_nodes,
         uint64_t num_tokens, int32_t* rows, uint64_t row_elements) const;
-    const std::vector<std::size_t>& outgoing_token_indices(int destination_node) const;
+    std::vector<std::size_t> outgoing_token_indices(int destination_node) const;
+    void copy_outgoing_token_indices(int destination_node, uint64_t* indices, uint64_t capacity,
+                                     uint64_t& count, uint64_t& num_tokens) const;
     std::size_t rdma_return_receive_rows(int peer) const;
     uintptr_t configure_rdma_returns(const RdmaProxyNetworkReturnBuffer* buffers, std::size_t count,
         std::size_t width, std::size_t tile, std::size_t group_tiles, std::size_t element_bytes,
@@ -319,10 +325,14 @@ private:
     void prepare_forwarding_routing_tables();
     void prepare_local_forwarding_routing_table();
     const RouterRouting& active_routing() const;
-    const std::vector<uint8_t>& intra_node_raw_masks(int source_node) const;
+    TokenMaskView intra_node_raw_masks(int source_node) const;
+    TokenIndexView outgoing_token_index_view(int destination_node) const;
+    bool uses_borrowed_local_forwarding_masks() const;
+    TokenMaskView local_forwarding_masks() const;
     bool routing_install_required(uint64_t iteration) const;
+    enum class BenchmarkBorrow { None, ExpertLists, RouteViews };
     void install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing,
-                                        bool borrow_expert_lists, const RdmaProxyBenchmarkHostRoute* host_route);
+                                       BenchmarkBorrow borrow, const RdmaProxyBenchmarkHostRoute* host_route);
     void install_iteration_routing(uint64_t iteration, IterationRouteData route);
     std::shared_lock<std::shared_mutex> lock_forwarding_routes() const;
     std::shared_lock<std::shared_mutex> lock_installed_combine_route() const;

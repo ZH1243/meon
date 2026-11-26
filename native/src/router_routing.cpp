@@ -106,10 +106,20 @@ int RouterRouting::experts_per_gpu() const {
 void RouterRouting::copy_benchmark_node_slice(
     const int32_t* x3, const uint8_t* x4, std::size_t count,
     std::vector<std::size_t>& indices, std::vector<uint8_t>& masks) const {
+    validate_benchmark_node_slice(x3, x4, count);
+    if (count) {
+        indices.assign(x3, x3 + count);
+        masks.assign(x4, x4 + count);
+    } else {
+        indices.clear();
+        masks.clear();
+    }
+}
+
+void RouterRouting::validate_benchmark_node_slice(
+    const int32_t* x3, const uint8_t* x4, std::size_t count) const {
     if (count > config_.num_tokens || (count && (!x3 || !x4)))
         throw std::runtime_error("invalid benchmark x3/x4 slice length or address");
-    indices.resize(count);
-    masks.resize(count);
     if (!count) return;
     std::vector<bool> seen(config_.num_tokens, false);
     for (std::size_t i = 0; i < count; ++i) {
@@ -119,8 +129,6 @@ void RouterRouting::copy_benchmark_node_slice(
             (i && (x4[i] > x4[i - 1] || (x4[i] == x4[i - 1] && token <= x3[i - 1]))))
             throw std::runtime_error("invalid benchmark x3 token, x4 mask or row order");
         seen[token] = true;
-        indices[i] = static_cast<std::size_t>(token);
-        masks[i] = x4[i];
     }
 }
 
@@ -170,6 +178,15 @@ void RouterRouting::initialize_benchmark(uintptr_t device_r, uintptr_t device_no
 
 void RouterRouting::initialize_benchmark_host(const int32_t* r, const int32_t* offsets,
                                               const int32_t* x3, const uint8_t* x4, uint64_t packed_count) {
+    validate_benchmark_host(r, offsets, x3, x4, packed_count);
+    copy_benchmark_nodes(offsets, x3, x4);
+    original_experts_.assign(r, r + config_.num_tokens * config_.router_top_k);
+    finish_benchmark_route();
+}
+
+void RouterRouting::validate_benchmark_host(const int32_t* r, const int32_t* offsets,
+                                           const int32_t* x3, const uint8_t* x4,
+                                           uint64_t packed_count) const {
     require_fresh_benchmark_route();
     if (!r || !offsets || (packed_count && (!x3 || !x4)) ||
         reinterpret_cast<uintptr_t>(r) % alignof(int32_t) ||
@@ -178,9 +195,19 @@ void RouterRouting::initialize_benchmark_host(const int32_t* r, const int32_t* o
         throw std::runtime_error("invalid benchmark outgoing host buffer address");
     if (packed_count != benchmark_packed_rows(offsets))
         throw std::runtime_error("benchmark outgoing host count disagrees with node offsets");
-    copy_benchmark_nodes(offsets, x3, x4);
-    original_experts_.assign(r, r + config_.num_tokens * config_.router_top_k);
-    finish_benchmark_route();
+}
+
+void RouterRouting::borrow_benchmark_host(const int32_t* r, const int32_t* offsets,
+                                         const int32_t* x3, const uint8_t* x4, uint64_t packed_count) {
+    validate_benchmark_host(r, offsets, x3, x4, packed_count);
+    for (int node = 0; node < config_.num_nodes; ++node) {
+        const auto start = offsets[node];
+        validate_benchmark_node_slice(x3 ? x3 + start : nullptr, x4 ? x4 + start : nullptr,
+                                      offsets[node + 1] - start);
+    }
+    validate_benchmark_experts({r, config_.num_tokens * config_.router_top_k});
+    borrowed_ = {r, offsets, x3, x4};
+    initialized_ = true;
 }
 
 std::size_t RouterRouting::benchmark_packed_rows(const int32_t* offsets) const {
@@ -205,10 +232,14 @@ void RouterRouting::copy_benchmark_nodes(const int32_t* offsets, const int32_t* 
     }
 }
 
-void RouterRouting::finish_benchmark_route() {
-    for (auto expert : original_experts_)
+void RouterRouting::validate_benchmark_experts(ExpertIndexView experts) const {
+    for (auto expert : experts)
         if (expert < 0 || expert >= config_.router_num_experts)
             throw std::runtime_error("benchmark R contains an out-of-range expert");
+}
+
+void RouterRouting::finish_benchmark_route() {
+    validate_benchmark_experts({original_experts_.data(), original_experts_.size()});
     generate_source_weights();
     initialized_ = true;
 }
@@ -236,6 +267,7 @@ void RouterRouting::initialize() {
 
 const std::vector<std::size_t>& RouterRouting::token_indices_for_node(int node_rank) const {
     if (!initialized_) throw std::runtime_error("router routing is not initialized");
+    if (has_borrowed_source_route()) throw std::runtime_error("borrowed routing requires a token index view");
     if (node_rank < 0 || node_rank >= config_.num_nodes) {
         throw std::runtime_error("router node rank out of range");
     }
@@ -244,10 +276,36 @@ const std::vector<std::size_t>& RouterRouting::token_indices_for_node(int node_r
 
 const std::vector<uint8_t>& RouterRouting::token_masks_for_node(int node_rank) const {
     if (!initialized_) throw std::runtime_error("router routing is not initialized");
+    if (has_borrowed_source_route()) throw std::runtime_error("borrowed routing requires a token mask view");
     if (node_rank < 0 || node_rank >= config_.num_nodes) {
         throw std::runtime_error("router node rank out of range");
     }
     return token_masks_by_node_[static_cast<std::size_t>(node_rank)];
+}
+
+TokenIndexView RouterRouting::token_indices_view(int node_rank) const {
+    if (!has_borrowed_source_route()) return token_indices_for_node(node_rank);
+    if (node_rank < 0 || node_rank >= config_.num_nodes) throw std::runtime_error("router node rank out of range");
+    const auto start = borrowed_.offsets[node_rank];
+    return {borrowed_.x3 ? borrowed_.x3 + start : nullptr,
+            static_cast<std::size_t>(borrowed_.offsets[node_rank + 1] - start)};
+}
+
+TokenMaskView RouterRouting::token_masks_view(int node_rank) const {
+    if (!has_borrowed_source_route()) {
+        const auto& masks = token_masks_for_node(node_rank);
+        return {masks.data(), masks.size()};
+    }
+    if (node_rank < 0 || node_rank >= config_.num_nodes) throw std::runtime_error("router node rank out of range");
+    const auto start = borrowed_.offsets[node_rank];
+    return {borrowed_.x4 ? borrowed_.x4 + start : nullptr,
+            static_cast<std::size_t>(borrowed_.offsets[node_rank + 1] - start)};
+}
+
+ExpertIndexView RouterRouting::original_experts_view() const {
+    if (has_borrowed_source_route()) return {borrowed_.r, config_.num_tokens * config_.router_top_k};
+    const auto& experts = original_experts();
+    return {experts.data(), experts.size()};
 }
 
 const int32_t* RouterRouting::device_token_indices_for_node(int node_rank) const {
@@ -281,11 +339,13 @@ const RouterExpertMetadata& RouterRouting::expert_metadata_for_gpu(
 
 const std::vector<int32_t>& RouterRouting::original_experts() const {
     if (!initialized_) throw std::runtime_error("router routing is not initialized");
+    if (has_borrowed_source_route()) throw std::runtime_error("borrowed routing requires an expert view");
     return original_experts_;
 }
 
 const std::vector<float>& RouterRouting::original_weights() const {
     if (!initialized_) throw std::runtime_error("router routing is not initialized");
+    if (has_borrowed_source_route()) throw std::runtime_error("borrowed benchmark route has implicit unit weights");
     return original_weights_;
 }
 

@@ -58,18 +58,45 @@ struct RouterX3Metadata {
 };
 
 // A read-only range over either owned or iteration-borrowed routing records.
-struct ExpertIndexView {
-    using value_type = int32_t;
-    const int32_t* entries;
+template <typename T>
+struct RoutingArrayView {
+    using value_type = T;
+    const T* entries;
     std::size_t count;
 
-    const int32_t* data() const { return entries; }
+    const T* data() const { return entries; }
     std::size_t size() const { return count; }
-    const int32_t* begin() const { return entries; }
-    const int32_t* end() const { return count ? entries + count : entries; }
-    int32_t operator[](std::size_t index) const { return entries[index]; }
-    int32_t front() const { return entries[0]; }
-    int32_t back() const { return entries[count - 1]; }
+    const T* begin() const { return entries; }
+    const T* end() const { return count ? entries + count : entries; }
+    T operator[](std::size_t index) const { return entries[index]; }
+    T front() const { return entries[0]; }
+    T back() const { return entries[count - 1]; }
+};
+using ExpertIndexView = RoutingArrayView<int32_t>;
+using TokenMaskView = RoutingArrayView<uint8_t>;
+
+// Native x3 rows are size_t, while the benchmark publishes validated int32 rows.
+// Consumers can read either representation without materializing another table.
+class TokenIndexView {
+public:
+    TokenIndexView(const std::vector<std::size_t>& rows)
+        : wide_(rows.data()), size_(rows.size()) {}
+    TokenIndexView(const int32_t* rows, std::size_t size) : compact_(rows), size_(size) {}
+    std::size_t size() const { return size_; }
+    const int32_t* compact_data() const { return compact_; }
+    std::size_t operator[](std::size_t i) const {
+        return compact_ ? static_cast<std::size_t>(compact_[i]) : wide_[i];
+    }
+    // Chunks and explicit assignment queries own their row indices.
+    std::vector<std::size_t> copy_rows(std::size_t first, std::size_t count) const {
+        if (!count) return {};
+        if (compact_) return {compact_ + first, compact_ + first + count};
+        return {wide_ + first, wide_ + first + count};
+    }
+private:
+    const std::size_t* wide_{};
+    const int32_t* compact_{};
+    std::size_t size_;
 };
 
 // Source-specific expert lookup table for one destination GPU. Offsets are
@@ -142,6 +169,13 @@ std::vector<ChunkDescriptor> compute_chunks_from_token_indices(
     std::size_t tokens_per_chunk,
     int num_qps_per_peer);
 
+std::vector<ChunkDescriptor> compute_chunks_from_token_index_view(
+    TokenIndexView source_token_indices,
+    std::size_t token_dimension,
+    std::size_t dtype_size,
+    std::size_t tokens_per_chunk,
+    int num_qps_per_peer);
+
 std::string serialize_router_x3_metadata(const RouterX3Metadata& metadata);
 RouterX3Metadata deserialize_router_x3_metadata(
     const std::string& payload,
@@ -157,6 +191,8 @@ RouterExpertMetadata deserialize_router_expert_metadata(
 std::vector<uint8_t> normalize_router_x4_for_nvlink(
     const std::vector<uint8_t>& token_masks,
     int num_gpus_per_node);
+std::vector<uint8_t> normalize_router_x4_view_for_nvlink(
+    TokenMaskView token_masks, int num_gpus_per_node);
 
 std::string serialize_peer_info(const PeerConnectionInfo& info);
 PeerConnectionInfo deserialize_peer_info(const std::string& payload);

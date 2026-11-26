@@ -81,6 +81,16 @@ std::vector<ChunkDescriptor> compute_chunks_from_token_indices(
     std::size_t dtype_size,
     std::size_t tokens_per_chunk,
     int num_qps_per_peer) {
+    return compute_chunks_from_token_index_view(source_token_indices, token_dimension, dtype_size,
+                                               tokens_per_chunk, num_qps_per_peer);
+}
+
+std::vector<ChunkDescriptor> compute_chunks_from_token_index_view(
+    TokenIndexView source_token_indices,
+    std::size_t token_dimension,
+    std::size_t dtype_size,
+    std::size_t tokens_per_chunk,
+    int num_qps_per_peer) {
     if (tokens_per_chunk == 0) throw std::runtime_error("tokens_per_chunk must be > 0");
     if (num_qps_per_peer <= 0) throw std::runtime_error("num_qps_per_peer must be > 0");
 
@@ -102,9 +112,7 @@ std::vector<ChunkDescriptor> compute_chunks_from_token_indices(
         desc.length_bytes = count * token_bytes;
         desc.qp_index = -1;
         desc.imm_data = encode_immediate(chunk);
-        desc.source_token_indices.assign(
-            source_token_indices.begin() + static_cast<std::ptrdiff_t>(start),
-            source_token_indices.begin() + static_cast<std::ptrdiff_t>(start + count));
+        desc.source_token_indices = source_token_indices.copy_rows(start, count);
         chunks.push_back(std::move(desc));
     }
     return chunks;
@@ -335,7 +343,13 @@ RouterExpertMetadata deserialize_router_expert_metadata(
 }
 
 std::vector<uint8_t> normalize_router_x4_for_nvlink(
-    const std::vector<uint8_t>& token_masks,
+    const std::vector<uint8_t>& token_masks, int num_gpus_per_node) {
+    return normalize_router_x4_view_for_nvlink({token_masks.data(), token_masks.size()},
+                                              num_gpus_per_node);
+}
+
+std::vector<uint8_t> normalize_router_x4_view_for_nvlink(
+    TokenMaskView token_masks,
     int num_gpus_per_node) {
     if (num_gpus_per_node < 2 || num_gpus_per_node > 8) {
         throw std::runtime_error("router x4 normalization requires num_gpus_per_node in [2, 8]");

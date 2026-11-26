@@ -13,7 +13,7 @@ namespace rdma_proxy {
 class RouterRouting {
 public:
     // Device tables and pinned readback storage can be reused after the previous
-    // generation's device readers retire. Each instance owns its host snapshot.
+    // generation's device readers retire.
     struct Workspace;
     static std::shared_ptr<Workspace> make_workspace(const ProxyConfig& config);
     explicit RouterRouting(ProxyConfig config, std::shared_ptr<Workspace> workspace = {});
@@ -29,6 +29,13 @@ public:
                               uintptr_t device_x3, uintptr_t device_x4);
     void initialize_benchmark_host(const int32_t* r, const int32_t* node_offsets,
                                    const int32_t* x3, const uint8_t* x4, uint64_t packed_count);
+    // The caller keeps these four host arrays immutable for this route's lifetime.
+    void borrow_benchmark_host(const int32_t* r, const int32_t* node_offsets,
+                               const int32_t* x3, const uint8_t* x4, uint64_t packed_count);
+    bool has_borrowed_source_route() const { return borrowed_.r != nullptr; }
+    TokenIndexView token_indices_view(int node_rank) const;
+    TokenMaskView token_masks_view(int node_rank) const;
+    ExpertIndexView original_experts_view() const;
     void copy_benchmark_node_slice(const int32_t* x3, const uint8_t* x4, std::size_t count,
                                    std::vector<std::size_t>& indices,
                                    std::vector<uint8_t>& masks) const;
@@ -52,6 +59,10 @@ public:
 
 private:
     void require_fresh_benchmark_route() const;
+    void validate_benchmark_host(const int32_t* r, const int32_t* offsets, const int32_t* x3,
+                                 const uint8_t* x4, uint64_t packed_count) const;
+    void validate_benchmark_node_slice(const int32_t* x3, const uint8_t* x4, std::size_t count) const;
+    void validate_benchmark_experts(ExpertIndexView experts) const;
     std::size_t benchmark_packed_rows(const int32_t* offsets) const;
     void copy_benchmark_nodes(const int32_t* offsets, const int32_t* x3, const uint8_t* x4);
     void finish_benchmark_route();
@@ -67,6 +78,12 @@ private:
     // Original [token, top_k] assignments retained independently of row packing.
     std::vector<int32_t> original_experts_;
     std::vector<float> original_weights_;
+    struct {
+        const int32_t* r{};
+        const int32_t* offsets{};
+        const int32_t* x3{};
+        const uint8_t* x4{};
+    } borrowed_;
     std::shared_ptr<Workspace> workspace_;
     DeviceTables device_tables_{};
     bool initialized_{false};

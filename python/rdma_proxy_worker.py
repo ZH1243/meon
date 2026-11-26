@@ -1855,7 +1855,7 @@ def print_benchmark_routing(node, gpu, iteration, elapsed_ns, stats, up_submitte
           f"retire_us={stats['retire_elapsed_ns'] / 1000:.3f} "
           f"reuse_barrier_us={stats['reuse_barrier_ns'] / 1000:.3f} "
           f"release_barrier_us={stats['release_barrier_ns'] / 1000:.3f}{submit} "
-          f"source_route={stats['source_route']}",
+          f"source_route={stats['source_route']} source_route_storage={stats['source_route_storage']}",
           flush=True)
 
 

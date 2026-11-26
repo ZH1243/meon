@@ -35,7 +35,8 @@ When embedded in meon, the receiver can also copy this rank's own outgoing route
 Extra blocks in the same launch write the node offsets, the valid x3 and x4
 prefixes for both nodes, and the full top-8 R into a process-local pinned buffer.
 The CPU can read these arrays after a successful wait for the matching epoch.
-The buffer is allocated once and reused on the next submission. At 20,480 tokens
+Meon can retain read-only views of x3, x4 and R through the payload iteration.
+It retires those views before the next submission reuses the buffer. At 20,480 tokens
 it reserves 860,192 bytes per rank. This option adds local GPU-to-host traffic
 within the receiver event and leaves the RDMA message sizes unchanged. The
 standalone benchmark runs with the option disabled.

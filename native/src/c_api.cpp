@@ -213,16 +213,7 @@ extern "C" int rdma_proxy_get_local_router_assignments(
             !num_tokens || !top_k || ((experts == nullptr) != (weights == nullptr)) ||
             (!experts && capacity))
             throw std::runtime_error("invalid original router assignment query");
-        const auto& original_experts = handle->proxy.original_router_experts();
-        const auto& original_weights = handle->proxy.original_router_weights();
-        *count = original_experts.size();
-        *num_tokens = handle->config.num_tokens;
-        *top_k = static_cast<uint64_t>(handle->config.router_top_k);
-        if (!experts) return 0;
-        if (capacity < original_experts.size())
-            throw std::runtime_error("original router assignment capacity too small");
-        std::copy(original_experts.begin(), original_experts.end(), experts);
-        std::copy(original_weights.begin(), original_weights.end(), weights);
+        handle->proxy.copy_original_router_assignments(experts, weights, capacity, *count, *num_tokens, *top_k);
         return 0;
     } catch (...) { return record_current_exception(); }
 }
@@ -449,9 +440,9 @@ extern "C" int rdma_proxy_get_benchmark_routing_config(
     return 0;
 }
 
+template <typename Install>
 static int install_benchmark_routing(RdmaProxyHandle* handle, uint64_t iteration,
-                                     const RdmaProxyBenchmarkRouting* routing, bool borrow_expert_lists,
-                                     const RdmaProxyBenchmarkHostRoute* host_route = nullptr) {
+                                     const RdmaProxyBenchmarkRouting* routing, Install install) {
     clear_error();
     if (!handle || !handle->initialized || handle->shut_down || handle->finished ||
         !handle->config.router_benchmark_metadata_enabled || iteration != handle->next_iteration ||
@@ -461,10 +452,7 @@ static int install_benchmark_routing(RdmaProxyHandle* handle, uint64_t iteration
     }
     try {
         select_proxy_cuda_device(*handle);
-        if (borrow_expert_lists)
-            handle->proxy.install_borrowed_benchmark_routing(iteration, *routing, host_route);
-        else
-            handle->proxy.install_benchmark_routing(iteration, *routing);
+        install(handle->proxy, *routing);
         return 0;
     } catch (...) {
         return record_current_exception();
@@ -473,12 +461,16 @@ static int install_benchmark_routing(RdmaProxyHandle* handle, uint64_t iteration
 
 extern "C" int rdma_proxy_install_benchmark_routing(
     RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing) {
-    return install_benchmark_routing(handle, iteration, routing, false);
+    return install_benchmark_routing(handle, iteration, routing, [iteration](auto& proxy, const auto& route) {
+        proxy.install_benchmark_routing(iteration, route);
+    });
 }
 
 extern "C" int rdma_proxy_install_borrowed_benchmark_routing(
     RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing) {
-    return install_benchmark_routing(handle, iteration, routing, true);
+    return install_benchmark_routing(handle, iteration, routing, [iteration](auto& proxy, const auto& route) {
+        proxy.install_borrowed_benchmark_routing(iteration, route);
+    });
 }
 
 extern "C" int rdma_proxy_install_borrowed_benchmark_host_routing(
@@ -488,7 +480,21 @@ extern "C" int rdma_proxy_install_borrowed_benchmark_host_routing(
         last_error = "benchmark host routing installation requires a host route";
         return -1;
     }
-    return install_benchmark_routing(handle, iteration, routing, true, host_route);
+    return install_benchmark_routing(handle, iteration, routing, [iteration, host_route](auto& proxy, const auto& route) {
+        proxy.install_borrowed_benchmark_routing(iteration, route, host_route);
+    });
+}
+
+extern "C" int rdma_proxy_install_borrowed_benchmark_route_views(
+    RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing,
+    const RdmaProxyBenchmarkHostRoute* host_route) {
+    if (!host_route) {
+        last_error = "benchmark route view installation requires a host route";
+        return -1;
+    }
+    return install_benchmark_routing(handle, iteration, routing, [iteration, host_route](auto& proxy, const auto& route) {
+        proxy.install_borrowed_benchmark_route_views(iteration, route, *host_route);
+    });
 }
 
 extern "C" int rdma_proxy_retire_borrowed_benchmark_routing(RdmaProxyHandle* handle, uint64_t iteration) {
@@ -752,12 +758,7 @@ extern "C" int rdma_proxy_get_outgoing_token_indices(
         if (!handle || !handle->initialized || handle->shut_down || !count ||
             !num_tokens || (!indices && capacity))
             throw std::runtime_error("invalid outgoing token-index query");
-        const auto& values = handle->proxy.outgoing_token_indices(destination_node);
-        *count = values.size();
-        *num_tokens = handle->config.num_tokens;
-        if (!indices) return 0;
-        if (capacity < values.size()) throw std::runtime_error("token-index capacity too small");
-        std::copy(values.begin(), values.end(), indices);
+        handle->proxy.copy_outgoing_token_indices(destination_node, indices, capacity, *count, *num_tokens);
         return 0;
     } catch (...) { return record_current_exception(); }
 }

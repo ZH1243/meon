@@ -250,6 +250,17 @@ RDMA_PROXY_C_API int rdma_proxy_install_borrowed_benchmark_routing(
 RDMA_PROXY_C_API int rdma_proxy_install_borrowed_benchmark_host_routing(
     RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing,
     const RdmaProxyBenchmarkHostRoute* host_route);
+/* Borrow both the incoming expert lists and this rank's outgoing node_offsets,
+ * x3, x4 and r. Keep those arrays readable and immutable until successful
+ * retirement or successful shutdown, including after a partial installation
+ * failure. The descriptors and remote_x3/x4 need only survive this call.
+ * Serialize queries and control calls with retirement, installation and shutdown.
+ * Retiring this installation ends access to the outgoing route and assignments
+ * until the next successful install. The host-route installer above retains
+ * its call-duration lifetime for all four outgoing arrays. */
+RDMA_PROXY_C_API int rdma_proxy_install_borrowed_benchmark_route_views(
+    RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing,
+    const RdmaProxyBenchmarkHostRoute* host_route);
 /* Call after run_iteration and any external consumers of this iteration have
  * completed. Drains the remaining native readers. Retire on every rank before
  * any rank starts the next exchange or otherwise reuses the records. */

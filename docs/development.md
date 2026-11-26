@@ -291,15 +291,15 @@ bash scripts/run_node1_torchrun.sh "${args[@]}"
 
 Each iteration generates fresh affine R using meon's per-rank seed sequence. The backend runs the benchmark's captured metadata graph with its native launch barrier, direct x3/x4 output, overlapping receiver and local staging after the receiver. The gather writes directly into meon's own input slice. After the benchmark worker completes, meon borrows the 16 pinned expert lists for the payload iteration and uploads each list's valid indices directly into its GPU `A_idx` buffer. The GPU buffer has zero padding through the common logical length. Meon also imports the local route and remote x3/x4 and rebuilds the forwarding plan. Python binds the current compute views before up-GEMM submission.
 
-Before the next exchange, each rank retires its readers of the previous expert lists, then enters the existing Gloo reuse barrier. Once all ranks leave that barrier, peer writes may reuse the pinned storage. At the end of the run the worker shuts down the payload proxy before freeing the benchmark's storage. With an older payload library that only supports call-duration borrowing, the worker uses the original snapshot install.
+Before the next exchange, each rank retires the previous route after its payload and assignment-query readers finish, then enters the Gloo reuse barrier. Once all ranks leave that barrier, the receiver may reuse its outgoing buffer and peers may write the next incoming lists. At the end of the run the worker shuts down the payload proxy before freeing the benchmark's storage.
 
-Look for `source_route=receiver` on the per-rank timing line. In that mode the existing receiver kernel writes this GPU's outgoing node offsets, x3, x4 and top-8 R into reusable pinned memory before the local staging gather. The installer consumes the four arrays from host memory. With an older exchange or payload library that lacks this handoff, the worker reports `source_route=device_readback` and reads the arrays from the GPU during installation.
+Look for `source_route=receiver source_route_storage=borrowed` on the per-rank timing line. The receiver writes this GPU's outgoing node offsets, x3, x4 and top-8 R into pinned memory before the local staging gather. Meon checks the data there and borrows x3, x4 and R for the iteration. Older payload builds that support only the call-duration host handoff report `source_route=receiver source_route_storage=copied` with the updated worker. If the receiver handoff is unavailable, the worker reports `source_route=device_readback` and reads the arrays from the GPU during installation.
 
 | Per-rank field | Host wall interval |
 | --- | --- |
 | `exchange_staging_us` | Aligned submission through benchmark wait completion, including the seven kernels, GPU exchange, RDMA and local gather. With `source_route=receiver`, this interval also includes writing the outgoing snapshot that meon requests. The standalone benchmark uses the same timing boundary. |
 | `install_us` | Benchmark wait return through importing the source views and installing meon's dispatch and gather metadata. |
-| `retire_us` | Local time to release the previous iteration's borrowed expert lists before entering the reuse barrier. Zero for the first iteration and for snapshot installs. |
+| `retire_us` | Local time to release the previous iteration's borrowed route data before entering the reuse barrier. Zero for the first iteration and for snapshot installs. |
 | `r_ready_to_up_submit_us` | Fresh R completed through host return from up-GEMM submission, including alignment, installation, rank release and compute setup. Available for compute iterations that submit work. Use a GPU trace to measure the actual kernel start. |
 | `generation_us`, `reuse_barrier_us`, `release_barrier_us` | Route generation, the world alignment before submission, and the world release after installation. |
 
@@ -341,7 +341,16 @@ cmake --build "$RDMA_PROXY_BUILD_DIR" --target rdma_cpu_proxy_shared test_dynami
 ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R '^test_borrowed_routing_upload_cuda$' --output-on-failure
 ```
 
-The outgoing snapshot was checked on macOS 15.6.1 arm64 with the Debug native and CPU Python suites above. The tests cover the pinned layout, empty and changing node slices, original top-8 assignments, input-buffer reuse after installation, and fallback with older libraries. The following CUDA regression runs on one host with eight peer-accessible GPUs. It compares the receiver's mapped output against all four source arrays as soon as the receiver event completes.
+The outgoing route handoff was checked on macOS 15.6.1 arm64 with the Debug native and CPU Python suites above. The eight-rank mock checks that the borrowed arrays alias the receiver's storage, forwarding and return rows follow the current iteration, and the assignment query returns the original top-8 choices and unit weights. It exercises reuse after retirement, rejected queries for a retired route, and shutdown after a partial install. The older host installer still permits immediate reuse after its call. The two lifetime-sensitive native tests also ran under UBSan.
+
+```bash
+cmake -S . -B /private/tmp/meon-iteration-route-views-ubsan -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_FLAGS='-fsanitize=undefined -fno-sanitize-recover=all'
+cmake --build /private/tmp/meon-iteration-route-views-ubsan --target test_benchmark_routing test_c_api -j4
+ctest --test-dir /private/tmp/meon-iteration-route-views-ubsan -R '^test_(benchmark_routing|c_api)$' --output-on-failure
+```
+
+The following CUDA regression runs on one host with eight peer-accessible GPUs. It compares the receiver's mapped output against all four source arrays as soon as the receiver event completes.
 
 ```bash
 cmake -S "$PROXY_ROOT/benchmarks/router_metadata_exchange2" -B "$RDMA_PROXY_BUILD_DIR/receiver-tests" \
@@ -350,7 +359,7 @@ cmake --build "$RDMA_PROXY_BUILD_DIR/receiver-tests" --target test_receiver_kern
 ctest --test-dir "$RDMA_PROXY_BUILD_DIR/receiver-tests" -R '^receiver_kernel_cuda$' --output-on-failure
 ```
 
-For the two-node H800 profile, rebuild `rdma_cpu_proxy_shared` and run the same arguments on both hosts. With `source_route=receiver`, the four source-route D2H calls after the gather should disappear. The gather waits for the receiver, so compare both `exchange_staging_us` and `install_us`. Use `r_ready_to_up_submit_us` and the actual up-GEMM start in Nsight to see whether moving the transfer earlier reduces total latency. CUDA verification and the two-node timing measurement require a hardware run.
+For the two-node H800 profile, rebuild `rdma_cpu_proxy_shared` and run the same arguments on both hosts. Profile 10 already used receiver readback. With `source_route_storage=borrowed`, compare `install_us` and the interval from gather completion to the first of the 16 incoming-index H2D uploads. Run the small two-node projection check above to exercise assignment queries and forwarding across changing iterations.
 
 ### Two-node test on Hopper
 

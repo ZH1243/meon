@@ -8,6 +8,7 @@
 #include <future>
 #include <iterator>
 #include <stdexcept>
+#include <string>
 
 using namespace rdma_proxy;
 
@@ -24,6 +25,12 @@ struct Rank {
     std::array<const int32_t*, nodes*gpus> device_indices{};
     std::array<std::array<int32_t, experts_per_gpu+1>, nodes*gpus> offsets{};
     std::array<std::vector<int32_t>, nodes*gpus> indices;
+    // Receiver-owned storage. Keep its addresses alive through retirement or
+    // shutdown, including when a new install fails after accepting a view.
+    std::array<int32_t, nodes + 1> source_offsets{};
+    std::array<int32_t, tokens> source_x3{};
+    std::array<uint8_t, tokens> source_x4{};
+    std::array<int32_t, tokens * experts_per_gpu> source_r{};
     std::array<int32_t, nodes * gpus * combine_row_stride> combine_rows{};
     std::array<int32_t, nodes * (tokens + 2)> inter_rows{};
     std::unique_ptr<Proxy> proxy;
@@ -31,6 +38,13 @@ struct Rank {
     void poison_expert_records() {
         for (auto& source : indices) std::fill(source.begin(), source.end(), -1);
         for (auto& source : offsets) source.fill(-1);
+    }
+
+    void poison_source_route() {
+        source_offsets.fill(-1);
+        source_x3.fill(-1);
+        source_x4.fill(0);
+        source_r.fill(-1);
     }
 };
 
@@ -44,6 +58,57 @@ template<class F> void on_all_gpus(F work) {
 template<class F> void expect_error(F operation) {
     try { operation(); } catch (const std::runtime_error&) { return; }
     throw std::runtime_error("accepted invalid benchmark routing operation");
+}
+
+bool borrow_source(int epoch, int gpu) {
+    return (epoch == 1 && gpu % 3 == 0) || (epoch == 2 && gpu % 2 == 0);
+}
+
+void check_borrowed_source_views(const ProxyConfig& config) {
+    // Equal token IDs across destination nodes are valid. The two slices have
+    // different lengths, so incorrect offsets or a lost mask are observable.
+    std::array<int32_t, nodes + 1> offsets{0, 2, 3};
+    std::array<int32_t, 3> x3{1, 0, 1};
+    std::array<uint8_t, 3> x4{2, 1, 4};
+    std::array<int32_t, tokens * experts_per_gpu> r{};
+    for (std::size_t i = 0; i < r.size(); ++i) r[i] = static_cast<int32_t>(i);
+    auto reject = [&] {
+        RouterRouting bad(config);
+        expect_error([&] { bad.borrow_benchmark_host(r.data(), offsets.data(), x3.data(), x4.data(), x3.size()); });
+    };
+    offsets[1] = 3;
+    reject();
+    offsets[1] = 2;
+    x3[0] = tokens;
+    reject();
+    x3[0] = 0;
+    reject(); // Duplicate original token in the first node.
+    x3[0] = 1;
+    x4[0] = 0;
+    reject();
+    x4[0] = 1;
+    reject(); // Equal masks require increasing original token IDs.
+    x4[0] = 2;
+    r[0] = config.router_num_experts;
+    reject();
+    r[0] = 0;
+
+    RouterRouting route(config);
+    route.borrow_benchmark_host(r.data(), offsets.data(), x3.data(), x4.data(), x3.size());
+    if (!route.has_borrowed_source_route() || route.original_experts_view().data() != r.data())
+        throw std::runtime_error("borrowed expert IDs do not reference the receiver");
+    for (int node = 0; node < nodes; ++node) {
+        const auto indices = route.token_indices_view(node);
+        const auto masks = route.token_masks_view(node);
+        const auto first = offsets[node];
+        const auto size = static_cast<std::size_t>(offsets[node + 1] - first);
+        if (indices.compact_data() != x3.data() + first || masks.data() != x4.data() + first ||
+            indices.size() != size || masks.size() != size)
+            throw std::runtime_error("borrowed forwarding slice does not reference the receiver");
+        for (std::size_t i = 0; i < size; ++i)
+            if (indices[i] != static_cast<std::size_t>(x3[first + i]) || masks[i] != x4[first + i])
+                throw std::runtime_error("incorrect borrowed row coordinates or mask");
+    }
 }
 
 // Each token chooses all eight experts on one GPU. The mock NIC reflects
@@ -90,7 +155,7 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
     auto remote_rows = rows[1];
     if (epoch == 2) remote_rows = {1};  // This GPU sends token 0 and receives the remote source's token 1.
     std::vector<uint8_t> remote_masks(remote_rows.size(), 1u << ((gpu - remote_dest + gpus) % gpus));
-    int32_t node_offsets[] = {0, static_cast<int32_t>(rows[0].size()), tokens};
+    std::array<int32_t, nodes + 1> node_offsets{0, static_cast<int32_t>(rows[0].size()), tokens};
     auto& offsets = rank.offsets;
     auto& indices = rank.indices;
     std::array<RdmaProxyBenchmarkSource, nodes*gpus> sources;
@@ -106,7 +171,7 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
     }
     RdmaProxyBenchmarkRouting data{sizeof(data), nodes*gpus, sources.data(), remote_rows.data(),
         remote_masks.data(), remote_rows.size(), reinterpret_cast<uintptr_t>(r.data()),
-        reinterpret_cast<uintptr_t>(node_offsets), reinterpret_cast<uintptr_t>(x3.data()),
+        reinterpret_cast<uintptr_t>(node_offsets.data()), reinterpret_cast<uintptr_t>(x3.data()),
         reinterpret_cast<uintptr_t>(x4.data())};
     expect_error([&] { rank.proxy->prepare_routing(epoch); });
     if (!epoch) {
@@ -128,21 +193,32 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
     struct Extended { RdmaProxyBenchmarkRouting current; uint64_t extension; };
     Extended extended{data, 0};
     extended.current.struct_size = sizeof(extended);
+    const bool borrowed_source = borrow_source(epoch, gpu);
     // Keep the original call-scoped contract on epoch zero. The next two
     // generations use the same producer storage with an explicit retirement.
     if (epoch == 0) {
         rank.proxy->install_benchmark_routing(epoch, extended.current);
         expect_error([&] { rank.proxy->retire_borrowed_benchmark_routing(epoch); });
     } else {
-        if (epoch == 2 || gpu % 2 == 0) {
+        if (borrowed_source || epoch == 2 || gpu % 2 == 0) {
             // The new installer consumes only the outgoing host snapshot. The
             // device fields are deliberately unusable, including in mock mode.
             extended.current.device_r = extended.current.device_node_offsets = 0;
             extended.current.device_x3 = extended.current.device_x4 = 0;
-            RdmaProxyBenchmarkHostRoute host{
-                sizeof(host), nodes + 1, x3.size(), r.size(), node_offsets, x3.data(), x4.data(), r.data()};
+            rank.source_offsets = node_offsets;
+            std::copy(x3.begin(), x3.end(), rank.source_x3.begin());
+            std::copy(x4.begin(), x4.end(), rank.source_x4.begin());
+            std::copy(r.begin(), r.end(), rank.source_r.begin());
+            RdmaProxyBenchmarkHostRoute host{sizeof(host), nodes + 1, x3.size(), r.size(),
+                rank.source_offsets.data(), rank.source_x3.data(), rank.source_x4.data(), rank.source_r.data()};
+            auto install = [&](const RdmaProxyBenchmarkHostRoute& source) {
+                if (borrowed_source)
+                    rank.proxy->install_borrowed_benchmark_route_views(epoch, extended.current, source);
+                else
+                    rank.proxy->install_borrowed_benchmark_routing(epoch, extended.current, &source);
+            };
             auto reject = [&](const RdmaProxyBenchmarkHostRoute& bad) {
-                expect_error([&] { rank.proxy->install_borrowed_benchmark_routing(epoch, extended.current, &bad); });
+                expect_error([&] { install(bad); });
             };
             auto bad = host;
             --bad.struct_size;
@@ -159,11 +235,12 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
             bad = host;
             bad.r = nullptr;
             reject(bad);
-            const int32_t saved = r[0];
-            r[0] = nodes * gpus * experts_per_gpu;
+            const int32_t saved = rank.source_r[0];
+            rank.source_r[0] = nodes * gpus * experts_per_gpu;
             reject(host);
-            r[0] = saved;
-            rank.proxy->install_borrowed_benchmark_routing(epoch, extended.current, &host);
+            rank.source_r[0] = saved;
+            install(host);
+            if (!borrowed_source) rank.poison_source_route();
         } else {
             rank.proxy->install_borrowed_benchmark_routing(epoch, extended.current);
         }
@@ -174,7 +251,7 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
     rank.proxy->prepare_routing(epoch);
     const auto expected_r = r;
     // Retain epoch one's descriptor for the attempted unretired reinstall below.
-    // In both install modes, all arrays besides the expert lists are call-scoped.
+    // These arrays are distinct from the leased outgoing source storage above.
     if (epoch != 1) {
         std::fill(std::begin(node_offsets), std::end(node_offsets), -1);
         std::fill(x3.begin(), x3.end(), -1);
@@ -204,12 +281,27 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
         }
     }
     if (epoch == 0) rank.poison_expert_records();
-    const auto& weights = rank.proxy->original_router_weights();
-    if (rank.proxy->original_router_experts() != expected_r || weights != std::vector<float>(r.size(), 1))
+    uint64_t count{}, num_tokens{}, top_k{};
+    auto query = [&](int32_t* ids, float* weights, uint64_t capacity) {
+        rank.proxy->copy_original_router_assignments(ids, weights, capacity, count, num_tokens, top_k);
+    };
+    query(nullptr, nullptr, 0);
+    if (count != expected_r.size() || num_tokens != tokens || top_k != experts_per_gpu)
+        throw std::runtime_error("incorrect source routing assignment dimensions");
+    std::vector<int32_t> actual_r(count, -1);
+    std::vector<float> weights(count, -1);
+    expect_error([&] { query(actual_r.data(), weights.data(), count - 1); });
+    if (count != expected_r.size() || weights.front() != -1 || actual_r.front() != -1)
+        throw std::runtime_error("undersized source assignment query wrote partial results");
+    query(actual_r.data(), weights.data(), count);
+    if (actual_r != expected_r || weights != std::vector<float>(r.size(), 1))
         throw std::runtime_error("incorrect source routing snapshot");
     for (int n = 0; n < nodes; ++n) {
-        const auto& outgoing = rank.proxy->outgoing_token_indices(n);
-        if (!std::equal(outgoing.begin(), outgoing.end(), rows[n].begin(), rows[n].end()) ||
+        std::array<uint64_t, tokens> outgoing{};
+        uint64_t row_count{}, total_tokens{};
+        rank.proxy->copy_outgoing_token_indices(n, outgoing.data(), outgoing.size(), row_count, total_tokens);
+        if (row_count != rows[n].size() || total_tokens != tokens ||
+            !std::equal(rows[n].begin(), rows[n].end(), outgoing.begin()) ||
             rank.proxy->intra_node_source_masks(n) !=
                 std::vector<uint8_t>(rows[n].size(), 1u << destination_gpu(epoch, gpu, n)))
             throw std::runtime_error("incorrect outgoing rows or incoming source masks");
@@ -290,16 +382,45 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
         expect_error([&] { rank.proxy->install_borrowed_benchmark_routing(epoch + 1, data); });
     }
 }
+
+void check_partial_borrowed_install(Rank& rank, uint64_t epoch) {
+    std::array<RdmaProxyBenchmarkSource, nodes * gpus> sources{};
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+        rank.offsets[i].fill(0);
+        rank.indices[i].clear();
+        sources[i] = {rank.offsets[i].data(), nullptr, 0};
+    }
+    // This bad index is found after installing the source view, during
+    // validation of incoming expert rows. Keep storage alive through shutdown.
+    rank.offsets[0].back() = 1;
+    rank.indices[0].push_back(tokens);
+    sources[0] = {rank.offsets[0].data(), rank.indices[0].data(), 1};
+    rank.source_offsets.fill(0);
+    rank.source_r.fill(0);
+    RdmaProxyBenchmarkRouting routing{sizeof(routing), nodes * gpus, sources.data()};
+    RdmaProxyBenchmarkHostRoute source{sizeof(source), nodes + 1, 0, rank.source_r.size(),
+        rank.source_offsets.data(), nullptr, nullptr, rank.source_r.data()};
+    try {
+        rank.proxy->install_borrowed_benchmark_route_views(epoch, routing, source);
+        throw std::logic_error("partial borrowed installation unexpectedly succeeded");
+    } catch (const std::runtime_error& error) {
+        if (std::string(error.what()).find("invalid token index") == std::string::npos) throw;
+    }
+    uint64_t count{}, num_tokens{}, top_k{};
+    expect_error([&] {
+        rank.proxy->copy_original_router_assignments(nullptr, nullptr, 0, count, num_tokens, top_k);
+    });
+    expect_error([&] { rank.proxy->retire_borrowed_benchmark_routing(epoch); });
+    expect_error([&] { rank.proxy->install_borrowed_benchmark_route_views(epoch, routing, source); });
 }
 
-int main() {
-    Logger::instance().set_level(LogLevel::kError);
+void run(bool prepared) {
     ProxyConfig config;
     config.num_nodes = nodes;
     config.num_gpus_per_node = gpus;
     config.num_tokens = tokens;
     config.token_dimension = row_bytes / dtype_size(config.dtype);
-    config.num_iterations = 3;
+    config.num_iterations = 4;
     config.mock_mode = true;
     config.fill_test_data = config.validate_data = false;
     config.router_routing_enabled = config.router_dynamic_routing_enabled = true;
@@ -308,6 +429,10 @@ int main() {
     config.router_top_k = experts_per_gpu;
     config.nvlink_forwarding_enabled = config.nvlink_forward_synchronize_batches = true;
     config.nvlink_forward_completion_notifications_enabled = true;
+    config.nvlink_forward_preparation_enabled = prepared;
+    config.nvlink_forward_local_staging_prepared_enabled = prepared;
+    config.nvlink_forward_submit_epilogue_enabled = prepared;
+    config.nvlink_forward_prepared_batch_chunks = 1;
     config.nvlink_forward_threshold_tokens = config.nvlink_forward_chunk_tokens = 1;
     config.local_iteration_sync_enabled = true;
     config.completion_timeout_ms = 10000;
@@ -315,6 +440,7 @@ int main() {
     const auto id = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     config.local_iteration_sync_run_id = "bench_handoff_" + id;
     config.nvlink_forward_exchange_dir = "/tmp/meon_bench_handoff_" + id;
+    check_borrowed_source_views(config);
     std::array<Rank, gpus> ranks;
     for (int gpu = 0; gpu < gpus; ++gpu) {
         auto& rank = ranks[gpu];
@@ -366,10 +492,36 @@ int main() {
                 expect_error([&] { rank.proxy->retire_borrowed_benchmark_routing(epoch); });
                 expect_error([&] { (void)rank.proxy->router_expert_metadata_for_source(0, 0); });
                 rank.poison_expert_records();
+                rank.poison_source_route();
+                uint64_t count{}, num_tokens{}, top_k{};
+                const auto query_size = [&] {
+                    rank.proxy->copy_original_router_assignments(nullptr, nullptr, 0, count, num_tokens, top_k);
+                };
+                if (borrow_source(epoch, gpu)) {
+                    expect_error(query_size);
+                    expect_error([&] { (void)rank.proxy->outgoing_token_indices(0); });
+                } else {
+                    query_size();
+                    if (count != rank.source_r.size()) throw std::runtime_error("retirement lost an owned route");
+                }
             }
         }
     }
+    check_partial_borrowed_install(ranks[1], 3);
     on_all_gpus([&](int gpu) { ranks[gpu].proxy->shutdown(); });
     expect_error([&] { (void)ranks[0].proxy->router_expert_metadata_for_source(0, 0); });
+    for (int gpu : {0, 1}) {
+        ranks[gpu].poison_source_route();
+        uint64_t count{}, num_tokens{}, top_k{};
+        expect_error([&] {
+            ranks[gpu].proxy->copy_original_router_assignments(nullptr, nullptr, 0, count, num_tokens, top_k);
+        });
+    }
     ranks[0].poison_expert_records();
+}
+}
+
+int main() {
+    Logger::instance().set_level(LogLevel::kError);
+    for (bool prepared : {false, true}) run(prepared);
 }

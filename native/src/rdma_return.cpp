@@ -38,18 +38,36 @@ std::vector<std::vector<ChunkDescriptor>> return_chunks(
 }
 }
 
-const std::vector<std::size_t>& Proxy::outgoing_token_indices(int destination_node) const {
+TokenIndexView Proxy::outgoing_token_index_view(int destination_node) const {
     if (!initialized_ || !config_.router_routing_enabled || destination_node < 0 ||
         destination_node >= config_.num_nodes)
         throw std::runtime_error("invalid outgoing token-index query");
-    return active_routing().token_indices_for_node(destination_node);
+    return active_routing().token_indices_view(destination_node);
+}
+
+std::vector<std::size_t> Proxy::outgoing_token_indices(int destination_node) const {
+    auto lock = lock_forwarding_routes();
+    const auto rows = outgoing_token_index_view(destination_node);
+    return rows.copy_rows(0, rows.size());
+}
+
+void Proxy::copy_outgoing_token_indices(int destination_node, uint64_t* indices, uint64_t capacity,
+                                        uint64_t& count, uint64_t& num_tokens) const {
+    auto lock = lock_forwarding_routes();
+    const auto rows = outgoing_token_index_view(destination_node);
+    count = rows.size();
+    num_tokens = config_.num_tokens;
+    if (!indices) return;
+    if (capacity < rows.size()) throw std::runtime_error("token-index capacity too small");
+    for (std::size_t i = 0; i < rows.size(); ++i) indices[i] = rows[i];
 }
 
 std::size_t Proxy::rdma_return_receive_rows(int peer) const {
     if (!initialized_ || peer == config_.node_rank || peer < 0 || peer >= config_.num_nodes ||
         !config_.router_routing_enabled)
         throw std::runtime_error("invalid RDMA return receive-row query");
-    return active_routing().token_indices_for_node(peer).size();
+    auto lock = lock_forwarding_routes();
+    return active_routing().token_indices_view(peer).size();
 }
 
 uintptr_t Proxy::configure_rdma_returns(

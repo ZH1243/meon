@@ -580,16 +580,21 @@ void Proxy::prepare_routing(uint64_t iteration) {
 }
 
 void Proxy::install_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff) {
-    install_benchmark_routing_impl(iteration, handoff, false, nullptr);
+    install_benchmark_routing_impl(iteration, handoff, BenchmarkBorrow::None, nullptr);
 }
 
 void Proxy::install_borrowed_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff,
                                               const RdmaProxyBenchmarkHostRoute* host_route) {
-    install_benchmark_routing_impl(iteration, handoff, true, host_route);
+    install_benchmark_routing_impl(iteration, handoff, BenchmarkBorrow::ExpertLists, host_route);
+}
+
+void Proxy::install_borrowed_benchmark_route_views(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff,
+                                                  const RdmaProxyBenchmarkHostRoute& host_route) {
+    install_benchmark_routing_impl(iteration, handoff, BenchmarkBorrow::RouteViews, &host_route);
 }
 
 void Proxy::install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff,
-                                           bool borrow_expert_lists, const RdmaProxyBenchmarkHostRoute* host_route) {
+                                           BenchmarkBorrow borrow, const RdmaProxyBenchmarkHostRoute* host_route) {
     if (!config_.router_benchmark_metadata_enabled)
         throw std::runtime_error("benchmark metadata handoff is disabled");
     if (!routing_install_required(iteration))
@@ -636,14 +641,17 @@ void Proxy::install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBe
         table.first_global_expert = (config_.node_rank * config_.num_gpus_per_node + config_.local_gpu_index) * experts;
         table.num_tokens = config_.num_tokens;
         table.top_k = config_.router_top_k;
-        if (borrow_expert_lists) {
+        if (borrow != BenchmarkBorrow::None) {
             table.borrow_expert_lists(view.offsets, view.indices, view.count);
         } else {
             table.expert_offsets.assign(view.offsets, view.offsets + experts + 1);
             if (view.count) table.expert_token_indices.assign(view.indices, view.indices + view.count);
         }
     }
-    if (host_route) {
+    if (borrow == BenchmarkBorrow::RouteViews) {
+        route.source->borrow_benchmark_host(host_route->r, host_route->node_offsets, host_route->x3,
+                                           host_route->x4, host_route->packed_count);
+    } else if (host_route) {
         route.source->initialize_benchmark_host(host_route->r, host_route->node_offsets, host_route->x3,
                                                 host_route->x4, host_route->packed_count);
     } else {
@@ -652,7 +660,7 @@ void Proxy::install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBe
     }
     // From this point a partial install may already have retained source pointers.
     // Shutdown retires these as well if the installation fails.
-    benchmark_expert_lists_borrowed_ = borrow_expert_lists;
+    benchmark_expert_lists_borrowed_ = borrow != BenchmarkBorrow::None;
     install_iteration_routing(iteration, std::move(route));
 }
 
@@ -664,18 +672,19 @@ void Proxy::retire_borrowed_benchmark_routing(uint64_t iteration) {
     // subsequent scans skip this completed generation while the payload is idle.
     std::unique_lock<std::shared_mutex> lock(forwarding_routes_mutex_);
     cuda_buffers_.retire_borrowed_expert_metadata();
+    if (iteration_source_ && iteration_source_->has_borrowed_source_route())
+        iteration_source_.reset();
     benchmark_expert_lists_borrowed_ = false;
 }
 
 void Proxy::install_iteration_routing(uint64_t iteration, IterationRouteData route) {
+    // The previous completion barrier retired all data WRs, but the ready
+    // thread may still be leaving its last scan. Hold the lock through
+    // validation and rollback so readers can only see a committed route.
+    std::unique_lock<std::shared_mutex> lock(forwarding_routes_mutex_);
     try {
         if (!route.source || route.incoming_nodes.size() != peers_.size())
             throw std::runtime_error("iteration route is missing source or peer metadata");
-        // Last iteration's completion barrier retired all data WRs. Its ready
-        // thread may still be exiting the final scan. Wait before changing
-        // lists or clearing per-chunk CQ counts. The next start barrier gates
-        // the peers before they can issue data WRs against the new plan.
-        std::unique_lock<std::shared_mutex> lock(forwarding_routes_mutex_);
         for (auto& peer : peers_) {
             auto& remote = route.incoming_nodes.at(peer.peer_rank);
             if (remote.token_indices.size() != remote.token_masks.size())
@@ -704,6 +713,8 @@ void Proxy::install_iteration_routing(uint64_t iteration, IterationRouteData rou
         // Some peers may already have published the generation. Retrying a
         // partially installed iteration on this handle would reuse its epoch.
         routing_failed_ = true;
+        if (iteration_source_ && iteration_source_->has_borrowed_source_route())
+            iteration_source_.reset();
         throw;
     }
 }
@@ -878,12 +889,40 @@ void Proxy::wait_cpu_scatter_ready(uint64_t iteration, uintptr_t cuda_stream, ui
     cuda_buffers_.wait_cpu_scatter_ready(iteration, cuda_stream, timeout_ms);
 }
 
-const std::vector<int32_t>& Proxy::original_router_experts() const {
-    return active_routing().original_experts();
+void Proxy::copy_original_router_assignments(int32_t* experts, float* weights, uint64_t capacity,
+                                            uint64_t& count, uint64_t& num_tokens, uint64_t& top_k) const {
+    if ((experts == nullptr) != (weights == nullptr) || (!experts && capacity))
+        throw std::runtime_error("invalid original router assignment query");
+    auto lock = lock_forwarding_routes();
+    const auto& route = active_routing();
+    const auto ids = route.original_experts_view();
+    count = ids.size();
+    num_tokens = config_.num_tokens;
+    top_k = static_cast<uint64_t>(config_.router_top_k);
+    if (!experts) return;
+    if (capacity < ids.size()) throw std::runtime_error("original router assignment capacity too small");
+    std::copy(ids.begin(), ids.end(), experts);
+    if (route.has_borrowed_source_route()) {
+        // The benchmark's unweighted route has an implicit unit weight per slot.
+        std::fill_n(weights, ids.size(), 1.0f);
+    } else {
+        const auto& source = route.original_weights();
+        std::copy(source.begin(), source.end(), weights);
+    }
 }
 
-const std::vector<float>& Proxy::original_router_weights() const {
-    return active_routing().original_weights();
+std::vector<int32_t> Proxy::original_router_experts() const {
+    auto lock = lock_forwarding_routes();
+    const auto ids = active_routing().original_experts_view();
+    return {ids.begin(), ids.end()};
+}
+
+std::vector<float> Proxy::original_router_weights() const {
+    auto lock = lock_forwarding_routes();
+    const auto& route = active_routing();
+    if (route.has_borrowed_source_route())
+        return std::vector<float>(route.original_experts_view().size(), 1.0f);
+    return route.original_weights();
 }
 
 uintptr_t Proxy::configure_down_ready_trace(int groups) {
@@ -920,20 +959,21 @@ std::vector<std::pair<int32_t, double>> Proxy::read_down_ready_trace(uint64_t it
     }
 }
 
-const std::vector<uint8_t>& Proxy::intra_node_raw_masks(int source_node) const {
+TokenMaskView Proxy::intra_node_raw_masks(int source_node) const {
     if (!initialized_ || !config_.router_routing_enabled ||
         !config_.router_local_input_staging_enabled ||
         source_node < 0 || source_node >= config_.num_nodes)
         throw std::runtime_error("invalid intra-node source-mask query");
     if (source_node == config_.node_rank)
-        return active_routing().token_masks_for_node(source_node);
+        return active_routing().token_masks_view(source_node);
     for (const auto& peer : peers_)
-        if (peer.peer_rank == source_node) return peer.router_x4;
+        if (peer.peer_rank == source_node) return {peer.router_x4.data(), peer.router_x4.size()};
     throw std::runtime_error("intra-node source peer not found");
 }
 
 std::vector<uint8_t> Proxy::intra_node_source_masks(int source_node) const {
-    const auto& masks = intra_node_raw_masks(source_node);
+    auto lock = lock_forwarding_routes();
+    const auto masks = intra_node_raw_masks(source_node);
     // x4 bit b denotes GPU (source_gpu - b) modulo local world size.
     // Export natural GPU bit positions, in the full staging/RDMA row order.
     std::vector<uint8_t> result(masks.size(), 0);
@@ -969,20 +1009,20 @@ void Proxy::build_intra_node_combine_rows(
         row_elements != peer_rows * stride)
         throw std::runtime_error("combine row table has incorrect element count");
 
-    // Resolve every domain before modifying caller storage. Keep the installed
-    // x4 vectors in place; only their addresses are needed while holding the lock.
-    std::vector<const std::vector<uint8_t>*> domains;
+    // Resolve every domain before modifying caller storage. The route lock
+    // keeps both owned and borrowed domains stable while constructing rows.
+    std::vector<TokenMaskView> domains;
     domains.reserve(num_nodes);
     for (uint64_t d = 0; d < num_nodes; ++d) {
         if (std::find(source_nodes, source_nodes + d, source_nodes[d]) != source_nodes + d)
             throw std::runtime_error("duplicate combine source node");
-        const auto& masks = intra_node_raw_masks(source_nodes[d]);
+        const auto masks = intra_node_raw_masks(source_nodes[d]);
         if (masks.size() > capacity)
             throw std::runtime_error("combine source domain exceeds row capacity");
-        domains.push_back(&masks);
+        domains.push_back(masks);
     }
     for (uint64_t d = 0; d < num_nodes; ++d) {
-        const auto& masks = *domains[d];
+        const auto masks = domains[d];
         domain_counts[d] = masks.size();
         for (int peer = 0; peer < peers; ++peer) {
             auto* row = rows + (d * peers + peer) * stride;
@@ -1015,19 +1055,19 @@ void Proxy::build_inter_node_combine_rows(
         row_elements != num_nodes * stride)
         throw std::runtime_error("inter-node combine row table has incorrect element count");
 
-    std::vector<const std::vector<std::size_t>*> domains;
+    std::vector<TokenIndexView> domains;
     domains.reserve(num_nodes);
     for (uint64_t d = 0; d < num_nodes; ++d) {
         if (std::find(destination_nodes, destination_nodes + d, destination_nodes[d]) !=
             destination_nodes + d)
             throw std::runtime_error("duplicate inter-node combine destination node");
-        const auto& tokens = outgoing_token_indices(destination_nodes[d]);
+        const auto tokens = outgoing_token_index_view(destination_nodes[d]);
         if (tokens.size() > num_tokens)
             throw std::runtime_error("inter-node combine destination exceeds token capacity");
-        domains.push_back(&tokens);
+        domains.push_back(tokens);
     }
     for (uint64_t d = 0; d < num_nodes; ++d) {
-        const auto& tokens = *domains[d];
+        const auto tokens = domains[d];
         auto* row = rows + d * stride;
         std::fill_n(row, num_tokens, -1);
         for (std::size_t ordinal = 0; ordinal < tokens.size(); ++ordinal) {
@@ -1163,8 +1203,11 @@ void Proxy::shutdown() {
         catch (...) { routing_error = std::current_exception(); }
     }
     iteration_routing_.reset();
-    iteration_source_.reset();
-    routing_iteration_.reset();
+    {
+        std::unique_lock<std::shared_mutex> lock(forwarding_routes_mutex_);
+        iteration_source_.reset();
+        routing_iteration_.reset();
+    }
     completed_routing_iterations_ = 0;
     dynamic_payload_active_.store(false);
     routing_failed_ = false;
@@ -3864,8 +3907,8 @@ std::vector<ChunkDescriptor> Proxy::make_chunks(int peer_rank) const {
         if (peer_rank < 0) {
             throw std::runtime_error("router chunk construction requires a peer node rank");
         }
-        return compute_chunks_from_token_indices(
-            active_routing().token_indices_for_node(peer_rank),
+        return compute_chunks_from_token_index_view(
+            active_routing().token_indices_view(peer_rank),
             config_.token_dimension,
             dtype_size(config_.dtype),
             config_.tokens_per_chunk,
@@ -4276,27 +4319,39 @@ void Proxy::stop_forwarding_thread() {
     forwarding_stream_ = nullptr;
 }
 
+bool Proxy::uses_borrowed_local_forwarding_masks() const {
+    // Raw x4 already has forwarding's bit order when all eight positions are in use.
+    return config_.num_gpus_per_node == 8 && iteration_source_ &&
+        iteration_source_->has_borrowed_source_route();
+}
+
+TokenMaskView Proxy::local_forwarding_masks() const {
+    if (uses_borrowed_local_forwarding_masks()) return iteration_source_->token_masks_view(config_.node_rank);
+    return {local_router_forwarding_routing_table_.data(), local_router_forwarding_routing_table_.size()};
+}
+
 void Proxy::prepare_local_forwarding_routing_table() {
     local_router_forwarding_chunks_.clear();
     local_router_forwarding_routing_table_.clear();
     local_router_next_destination_token_.clear();
     local_router_staging_buffer_ = nullptr;
     if (config_.router_local_input_staging_enabled) {
-        const auto& local_x3 =
-            active_routing().token_indices_for_node(config_.node_rank);
-        const auto& local_x4 =
-            active_routing().token_masks_for_node(config_.node_rank);
+        const auto local_x3 = active_routing().token_indices_view(config_.node_rank);
+        const auto local_x4 = active_routing().token_masks_view(config_.node_rank);
         if (local_x3.size() != local_x4.size()) {
             throw std::runtime_error("local router x3/x4 lengths do not match");
         }
-        local_router_forwarding_chunks_ = compute_chunks_from_token_indices(
-            local_x3,
-            config_.token_dimension,
-            dtype_size(config_.dtype),
-            config_.tokens_per_chunk,
-            config_.num_qps_per_peer);
-        local_router_forwarding_routing_table_ = normalize_router_x4_for_nvlink(
-            local_x4, config_.num_gpus_per_node);
+        if (uses_borrowed_local_forwarding_masks()) {
+            // The benchmark has already packed the staging buffer in x3 order.
+            // Its forwarding chunks index contiguous staged rows.
+            local_router_forwarding_chunks_ = compute_chunks(local_x3.size(), config_.token_dimension,
+                dtype_size(config_.dtype), config_.tokens_per_chunk, config_.num_qps_per_peer);
+        } else {
+            local_router_forwarding_chunks_ = compute_chunks_from_token_index_view(local_x3,
+                config_.token_dimension, dtype_size(config_.dtype), config_.tokens_per_chunk, config_.num_qps_per_peer);
+            local_router_forwarding_routing_table_ = normalize_router_x4_view_for_nvlink(
+                local_x4, config_.num_gpus_per_node);
+        }
         local_router_staging_buffer_ = &cuda_buffers_.nvlink_receive_buffer_for_source(
             config_.node_rank, config_.local_gpu_index).recv;
         local_router_next_destination_token_.assign(
@@ -5089,7 +5144,8 @@ void Proxy::issue_local_router_forwarding_batch(
     if (!local_router_staging_buffer_ || !local_router_staging_buffer_->ptr) {
         throw std::runtime_error("local router staging buffer is not initialized");
     }
-    const auto forwarding_tokens = local_router_forwarding_routing_table_.size();
+    const auto routes = local_forwarding_masks();
+    const auto forwarding_tokens = routes.size();
     if (batch_start_token > forwarding_tokens ||
         batch_tokens > forwarding_tokens - batch_start_token) {
         throw std::runtime_error("local router forwarding batch exceeds token range");
@@ -5165,7 +5221,7 @@ void Proxy::issue_local_router_forwarding_batch(
 
         for (std::size_t token = 0; token < batch_tokens; ++token) {
             const auto token_index = batch_start_token + token;
-            if ((local_router_forwarding_routing_table_[token_index] &
+            if ((routes[token_index] &
                  routing_column_mask(route_column)) == 0) {
                 flush_run();
                 continue;
@@ -5250,10 +5306,10 @@ void Proxy::request_local_router_input_ready(uint64_t iteration) {
     if (marker == requested) return;
     if (local_router_input_early_ready_completed_.load(std::memory_order_acquire) != requested)
         throw std::runtime_error("previous early local input readiness request is still pending");
-    const auto& local_x3 = active_routing().token_indices_for_node(config_.node_rank);
+    const auto local_x3 = active_routing().token_indices_view(config_.node_rank);
     const auto token_bytes = config_.token_dimension * dtype_size(config_.dtype);
     if (!token_bytes || local_x3.size() > config_.num_tokens ||
-        local_x3.size() != local_router_forwarding_routing_table_.size() ||
+        local_x3.size() != local_forwarding_masks().size() ||
         local_x3.size() > local_router_staging_buffer_->bytes / token_bytes) {
         throw std::runtime_error("early local input readiness exceeds the staged x3 range");
     }
@@ -5318,7 +5374,7 @@ void Proxy::process_local_router_forwarding_iteration(uint64_t iteration) {
         local_router_next_destination_token_.begin(),
         local_router_next_destination_token_.end(),
         std::size_t{0});
-    const auto forwarding_tokens = local_router_forwarding_routing_table_.size();
+    const auto forwarding_tokens = local_forwarding_masks().size();
     const bool dynamic_threshold = nvlink_forward_dynamic_threshold_enabled(config_);
     if (dynamic_threshold || config_.nvlink_forward_preparation_enabled) {
         std::size_t next_chunk = 0;
@@ -5395,7 +5451,7 @@ void Proxy::initialize_prepared_forwarding() {
         max_tokens = std::max(max_tokens, forwarding_tokens_for_peer(peer));
     }
     if (config_.nvlink_forward_local_staging_prepared_enabled)
-        max_tokens = std::max(max_tokens, local_router_forwarding_routing_table_.size());
+        max_tokens = std::max(max_tokens, local_forwarding_masks().size());
     max_tokens = std::min(max_tokens,
         config_.nvlink_forward_prepared_batch_chunks * config_.tokens_per_chunk);
     // A selected/unselected alternating sequence maximizes consecutive runs.
@@ -5432,7 +5488,9 @@ void Proxy::prepare_forwarding_batch(
     const auto start = chunks[first_chunk].start_token;
     const auto& last = chunks[first_chunk + chunk_count - 1];
     const auto end = last.start_token + last.num_tokens;
-    const auto& routes = local ? local_router_forwarding_routing_table_ : peers_.at(peer_index).forwarding_routing_table;
+    const auto routes = local ? local_forwarding_masks() :
+        TokenMaskView{peers_[peer_index].forwarding_routing_table.data(),
+                      peers_[peer_index].forwarding_routing_table.size()};
     if (end > routes.size() || start >= end) {
         throw std::runtime_error("invalid prepared forwarding routing range");
     }

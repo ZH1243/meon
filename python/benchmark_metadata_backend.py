@@ -114,9 +114,14 @@ class BenchmarkMetadataBackend:
         self.install_routing = install
         self.retire_routing = retire
         self.install_host_routing = None
+        self.borrow_source_route = False
         if retire is not None:
             retire.argtypes, retire.restype = [C.c_void_p, C.c_uint64], C.c_int
-            self.install_host_routing = getattr(self.library, "rdma_proxy_install_borrowed_benchmark_host_routing", None)
+            self.install_host_routing = getattr(self.library, "rdma_proxy_install_borrowed_benchmark_route_views", None)
+            self.borrow_source_route = self.install_host_routing is not None
+            if not self.borrow_source_route:
+                self.install_host_routing = getattr(
+                    self.library, "rdma_proxy_install_borrowed_benchmark_host_routing", None)
             if self.install_host_routing is not None:
                 self.install_host_routing.argtypes = [
                     C.c_void_p, C.c_uint64, C.POINTER(BenchmarkRouting), C.POINTER(BenchmarkHostRoute)]
@@ -316,12 +321,12 @@ class BenchmarkMetadataBackend:
             self._generate(iteration)
             self.stream.synchronize()
             r_ready = time.perf_counter_ns()
-            # A peer can RDMA-write our pinned records as soon as it submits.
-            # Drain local readers before any rank can leave the reuse barrier.
+            # Drain readers of both the peer records and our outgoing snapshot
+            # before this rank or its peers can overwrite either for the next epoch.
             reuse_start = r_ready
             if iteration and self.retire_routing is not None:
                 self._check(self.retire_routing(self.handle, iteration - 1),
-                            "retiring the previous benchmark expert lists")
+                            "retiring the previous benchmark routing")
                 reuse_start = time.perf_counter_ns()
             self._barrier()
             exchange_start = time.perf_counter_ns()
@@ -345,6 +350,8 @@ class BenchmarkMetadataBackend:
                 "retire_elapsed_ns": reuse_start - r_ready, "reuse_barrier_ns": exchange_start - reuse_start,
                 "release_barrier_ns": released - installed,
                 "source_route": "receiver" if self.source_snapshot_view is not None else "device_readback",
+                "source_route_storage": ("borrowed" if self.source_snapshot_view is not None
+                                         and self.borrow_source_route else "copied"),
                 "rme2_stats": native_stats,
             }
             self.next_iteration += 1
@@ -354,7 +361,7 @@ class BenchmarkMetadataBackend:
             raise
 
     def close(self, clean=True):
-        """A clean close requires confirmed payload shutdown, including its final expert-list readers."""
+        """A clean close requires confirmed shutdown of the payload and its readers of pinned routing data."""
         if self.closed:
             return
         self.closed = True

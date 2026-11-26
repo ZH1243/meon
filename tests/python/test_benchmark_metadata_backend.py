@@ -18,6 +18,7 @@ class ProviderTests(unittest.TestCase):
         p.next_iteration = 0
         p.retire_routing = None
         p.install_host_routing = p.source_snapshot_view = None
+        p.borrow_source_route = False
         p.last_stats = {}
         p.group = None
         p.session = None
@@ -177,6 +178,27 @@ class ProviderTests(unittest.TestCase):
                         self.assertIsNone(p.retire_routing)
                         self.assertIsNone(p.install_host_routing)
 
+    def test_outgoing_route_views_require_retirement_and_take_precedence_over_host_copy(self):
+        p = self.provider()
+        lib = p.library = SimpleNamespace(
+            rdma_proxy_get_benchmark_routing_config=MagicMock(), rdma_proxy_get_routing_extents=MagicMock(),
+            rdma_proxy_install_benchmark_routing=MagicMock(), rdma_proxy_install_borrowed_benchmark_routing=MagicMock(),
+            rdma_proxy_install_borrowed_benchmark_route_views=MagicMock(),
+            rdma_proxy_install_borrowed_benchmark_host_routing=MagicMock())
+        p._bind()
+        self.assertIsNone(p.install_host_routing)
+        self.assertFalse(p.borrow_source_route)
+        lib.rdma_proxy_retire_borrowed_benchmark_routing = MagicMock()
+        p._bind()
+        self.assertIs(p.install_host_routing, lib.rdma_proxy_install_borrowed_benchmark_route_views)
+        self.assertTrue(p.borrow_source_route)
+        self.assertEqual(p.install_host_routing.argtypes, [
+            C.c_void_p, C.c_uint64, C.POINTER(backend.BenchmarkRouting), C.POINTER(backend.BenchmarkHostRoute)])
+        del lib.rdma_proxy_install_borrowed_benchmark_route_views
+        p._bind()
+        self.assertIs(p.install_host_routing, lib.rdma_proxy_install_borrowed_benchmark_host_routing)
+        self.assertFalse(p.borrow_source_route)
+
     def test_timed_windows_fork_after_r_ready_and_join_before_release(self):
         p = self.provider()
         events = []
@@ -210,15 +232,19 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(p.last_stats["retire_elapsed_ns"], 0)
         self.assertEqual(p.last_stats["release_barrier_ns"], 4)
         self.assertEqual(p.last_stats["rme2_stats"]["metadata_gpu_ms"], 0.125)
+        self.assertEqual(p.last_stats["source_route_storage"], "copied")
         with self.assertRaisesRegex(RuntimeError, "consecutive"):
             p.prepare(0)
         events.clear()
+        p.borrow_source_route = True
+        p.source_snapshot_view = MagicMock()
         with patch.object(backend.time, "perf_counter_ns", side_effect=[220, 235, 240, 250, 272, 292, 300]):
             self.assertEqual(p.prepare(1), ((18, 4), 80))
         self.assertEqual(events, [("R", 1), "R complete", ("retire", 3, 0), "world", ("rme2", 2),
                                   "rme2 complete", ("install", 1), "world"])
         self.assertEqual(p.last_stats["retire_elapsed_ns"], 5)
         self.assertEqual(p.last_stats["reuse_barrier_ns"], 10)
+        self.assertEqual(p.last_stats["source_route_storage"], "borrowed")
 
     def test_failed_retirement_prevents_reuse(self):
         p = self.provider()

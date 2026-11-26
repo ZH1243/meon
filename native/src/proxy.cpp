@@ -580,15 +580,16 @@ void Proxy::prepare_routing(uint64_t iteration) {
 }
 
 void Proxy::install_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff) {
-    install_benchmark_routing_impl(iteration, handoff, false);
+    install_benchmark_routing_impl(iteration, handoff, false, nullptr);
 }
 
-void Proxy::install_borrowed_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff) {
-    install_benchmark_routing_impl(iteration, handoff, true);
+void Proxy::install_borrowed_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff,
+                                              const RdmaProxyBenchmarkHostRoute* host_route) {
+    install_benchmark_routing_impl(iteration, handoff, true, host_route);
 }
 
 void Proxy::install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff,
-                                           bool borrow_expert_lists) {
+                                           bool borrow_expert_lists, const RdmaProxyBenchmarkHostRoute* host_route) {
     if (!config_.router_benchmark_metadata_enabled)
         throw std::runtime_error("benchmark metadata handoff is disabled");
     if (!routing_install_required(iteration))
@@ -598,6 +599,10 @@ void Proxy::install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBe
     const int world = config_.num_nodes * config_.num_gpus_per_node;
     if (handoff.struct_size < sizeof(handoff) || handoff.num_sources != world || !handoff.sources)
         throw std::runtime_error("invalid benchmark routing descriptor or source count");
+    if (host_route && (host_route->struct_size < sizeof(*host_route) ||
+                       host_route->node_offset_count != static_cast<uint64_t>(config_.num_nodes) + 1 ||
+                       host_route->assignment_count != config_.num_tokens * config_.router_top_k))
+        throw std::runtime_error("invalid benchmark outgoing host route dimensions");
     const int experts = config_.router_num_experts / world;
     IterationRouteData route;
     route.source = std::make_unique<RouterRouting>(config_);
@@ -638,8 +643,13 @@ void Proxy::install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBe
             if (view.count) table.expert_token_indices.assign(view.indices, view.indices + view.count);
         }
     }
-    route.source->initialize_benchmark(handoff.device_r, handoff.device_node_offsets, handoff.device_x3,
-                                       handoff.device_x4);
+    if (host_route) {
+        route.source->initialize_benchmark_host(host_route->r, host_route->node_offsets, host_route->x3,
+                                                host_route->x4, host_route->packed_count);
+    } else {
+        route.source->initialize_benchmark(handoff.device_r, handoff.device_node_offsets, handoff.device_x3,
+                                           handoff.device_x4);
+    }
     // From this point a partial install may already have retained source pointers.
     // Shutdown retires these as well if the installation fails.
     benchmark_expert_lists_borrowed_ = borrow_expert_lists;

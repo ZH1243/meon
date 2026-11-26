@@ -27,6 +27,8 @@ public:
     // pointer is retained after this call.
     void initialize_benchmark(uintptr_t device_r, uintptr_t device_node_offsets,
                               uintptr_t device_x3, uintptr_t device_x4);
+    void initialize_benchmark_host(const int32_t* r, const int32_t* node_offsets,
+                                   const int32_t* x3, const uint8_t* x4, uint64_t packed_count);
     void copy_benchmark_node_slice(const int32_t* x3, const uint8_t* x4, std::size_t count,
                                    std::vector<std::size_t>& indices,
                                    std::vector<uint8_t>& masks) const;
@@ -49,6 +51,10 @@ public:
     DeviceTables device_tables() const { return device_tables_; }
 
 private:
+    void require_fresh_benchmark_route() const;
+    std::size_t benchmark_packed_rows(const int32_t* offsets) const;
+    void copy_benchmark_nodes(const int32_t* offsets, const int32_t* x3, const uint8_t* x4);
+    void finish_benchmark_route();
     void initialize_mock();
     void generate_source_weights();
     void align_expert_weights();

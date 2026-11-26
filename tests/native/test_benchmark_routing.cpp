@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 #include <future>
+#include <iterator>
 #include <stdexcept>
 
 using namespace rdma_proxy;
@@ -89,7 +90,7 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
     auto remote_rows = rows[1];
     if (epoch == 2) remote_rows = {1};  // This GPU sends token 0 and receives the remote source's token 1.
     std::vector<uint8_t> remote_masks(remote_rows.size(), 1u << ((gpu - remote_dest + gpus) % gpus));
-    const int32_t node_offsets[] = {0, static_cast<int32_t>(rows[0].size()), tokens};
+    int32_t node_offsets[] = {0, static_cast<int32_t>(rows[0].size()), tokens};
     auto& offsets = rank.offsets;
     auto& indices = rank.indices;
     std::array<RdmaProxyBenchmarkSource, nodes*gpus> sources;
@@ -133,7 +134,39 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
         rank.proxy->install_benchmark_routing(epoch, extended.current);
         expect_error([&] { rank.proxy->retire_borrowed_benchmark_routing(epoch); });
     } else {
-        rank.proxy->install_borrowed_benchmark_routing(epoch, extended.current);
+        if (epoch == 2 || gpu % 2 == 0) {
+            // The new installer consumes only the outgoing host snapshot. The
+            // device fields are deliberately unusable, including in mock mode.
+            extended.current.device_r = extended.current.device_node_offsets = 0;
+            extended.current.device_x3 = extended.current.device_x4 = 0;
+            RdmaProxyBenchmarkHostRoute host{
+                sizeof(host), nodes + 1, x3.size(), r.size(), node_offsets, x3.data(), x4.data(), r.data()};
+            auto reject = [&](const RdmaProxyBenchmarkHostRoute& bad) {
+                expect_error([&] { rank.proxy->install_borrowed_benchmark_routing(epoch, extended.current, &bad); });
+            };
+            auto bad = host;
+            --bad.struct_size;
+            reject(bad);
+            bad = host;
+            --bad.node_offset_count;
+            reject(bad);
+            bad = host;
+            --bad.packed_count;
+            reject(bad);
+            bad = host;
+            --bad.assignment_count;
+            reject(bad);
+            bad = host;
+            bad.r = nullptr;
+            reject(bad);
+            const int32_t saved = r[0];
+            r[0] = nodes * gpus * experts_per_gpu;
+            reject(host);
+            r[0] = saved;
+            rank.proxy->install_borrowed_benchmark_routing(epoch, extended.current, &host);
+        } else {
+            rank.proxy->install_borrowed_benchmark_routing(epoch, extended.current);
+        }
         expect_error([&] { rank.proxy->retire_borrowed_benchmark_routing(epoch); });
         expect_error([&] { rank.proxy->install_borrowed_benchmark_routing(epoch, data); });
     }
@@ -143,6 +176,7 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
     // Retain epoch one's descriptor for the attempted unretired reinstall below.
     // In both install modes, all arrays besides the expert lists are call-scoped.
     if (epoch != 1) {
+        std::fill(std::begin(node_offsets), std::end(node_offsets), -1);
         std::fill(x3.begin(), x3.end(), -1);
         std::fill(x4.begin(), x4.end(), 0);
         std::fill(remote_masks.begin(), remote_masks.end(), 0);

@@ -17,11 +17,12 @@ class ProviderTests(unittest.TestCase):
         p.closed = p.failed = p.owns_group = p.exposed = p.connected = False
         p.next_iteration = 0
         p.retire_routing = None
+        p.install_host_routing = p.source_snapshot_view = None
         p.last_stats = {}
         p.group = None
         p.session = None
         p.config = backend.BenchmarkConfig(struct_size=C.sizeof(backend.BenchmarkConfig),
-                                           num_tokens=20, completion_timeout_ms=20_000)
+                                           num_tokens=20, num_nodes=2, completion_timeout_ms=20_000)
         return p
 
     def test_uint64_generation_seed_and_epoch(self):
@@ -33,6 +34,8 @@ class ProviderTests(unittest.TestCase):
         p = self.provider()
         p.node, p.local, p.rank = 1, 3, 11
         p.torch, p.session, p.device_buffers = MagicMock(), MagicMock(), MagicMock()
+        p.install_host_routing = MagicMock()
+        p.session.lib.rme2_enable_source_snapshot.return_value = 0
         source, destination = object(), object()
         p.device_buffers.benchmark_staging_buffers.return_value = source, destination
         p.session.enable_direct_x3_x4.return_value = 2**40
@@ -47,8 +50,32 @@ class ProviderTests(unittest.TestCase):
         cute_metadata.LocalStagingPlan.assert_called_once_with(
             p.plan, source, destination, node_rank=1)
         p.session.capture_metadata.assert_called_once_with(p.plan, p.stream, launch_barrier=True)
+        p.session.lib.rme2_enable_source_snapshot.assert_called_once_with(p.session.handle, p.r.data_ptr())
         p.session.capture_staging.assert_called_once_with(p.staging, p.stream)
         p.generator.assert_called_once_with(p.r_argument, backend._generation_seed(0, 11, 0), p.cu_stream)
+
+    def test_source_snapshot_requires_support_in_both_libraries(self):
+        enable, view = MagicMock(return_value=0), MagicMock()
+        for use_payload, use_enable, use_view in ((True, True, True), (True, True, False),
+                                                  (True, False, True), (False, True, True)):
+            with self.subTest(payload=use_payload, enable=use_enable, view=use_view):
+                enable.reset_mock()
+                p = self.provider()
+                p.install_host_routing = MagicMock() if use_payload else None
+                p.r = SimpleNamespace(data_ptr=lambda: 2**40)
+                lib = SimpleNamespace()
+                p.session = SimpleNamespace(handle=9, lib=lib, check=lambda s: self.assertEqual(s, 0))
+                if use_enable:
+                    lib.rme2_enable_source_snapshot = enable
+                if use_view:
+                    lib.rme2_source_snapshot_view = view
+                p._enable_source_snapshot()
+                if use_payload and use_enable and use_view:
+                    enable.assert_called_once_with(9, 2**40)
+                    self.assertIs(p.source_snapshot_view, view)
+                else:
+                    enable.assert_not_called()
+                    self.assertIsNone(p.source_snapshot_view)
 
     def test_borrowed_views_keep_all_source_identities_without_python_row_lists(self):
         p = self.provider()
@@ -90,6 +117,43 @@ class ProviderTests(unittest.TestCase):
         p.plan = SimpleNamespace(node_offsets=device(1), x3=device(2), x4=device(3))
         p._install(7)
 
+        local_offsets = (C.c_int32 * 3)(0, 3, 4)
+        local_x3 = (C.c_int32 * 4)(1, 3, 7, 12)
+        local_x4 = (C.c_uint8 * 4)(1, 2, 4, 8)
+        local_r = (C.c_int32 * (8 * p.config.num_tokens))()
+        def source_view(handle, sequence, o, x, m, r):
+            self.assertEqual((handle, sequence), (p.session.handle, 8))
+            for output, value, typ in ((o, local_offsets, backend._I32P), (x, local_x3, backend._I32P),
+                                       (m, local_x4, backend._U8P), (r, local_r, backend._I32P)):
+                C.cast(output, C.POINTER(typ))[0] = C.cast(value, typ)
+            return 0
+        def install_host(handle, epoch, ptr, local):
+            record = C.cast(ptr, C.POINTER(backend.BenchmarkRouting)).contents
+            self.assertEqual((handle, epoch, record.num_sources), (3, 7, 16))
+            self.assertEqual((record.device_r, record.device_node_offsets, record.device_x3, record.device_x4),
+                             (0, 0, 0, 0))
+            host = C.cast(local, C.POINTER(backend.BenchmarkHostRoute)).contents
+            self.assertEqual((host.struct_size, host.node_offset_count, host.packed_count, host.assignment_count),
+                             (C.sizeof(backend.BenchmarkHostRoute), 3, 4, 8 * p.config.num_tokens))
+            for pointer, storage in ((host.node_offsets, local_offsets), (host.x3, local_x3),
+                                     (host.x4, local_x4), (host.r, local_r), (record.remote_x3, remote_x3),
+                                     (record.remote_x4, remote_x4)):
+                self.assertEqual(C.addressof(pointer.contents), C.addressof(storage))
+            return 0
+        p.install_routing = MagicMock(side_effect=AssertionError("unexpected device readback"))
+        p.source_snapshot_view, p.install_host_routing = source_view, MagicMock(side_effect=install_host)
+        p.r, p.plan = None, None  # A host install gets every pointer from the receiver.
+        p._install(7)
+        p.install_host_routing.assert_called_once()
+        p.source_snapshot_view = MagicMock(return_value=-1)
+        def check(status):
+            if status:
+                raise RuntimeError("failed receiver view")
+        p.session.check = check
+        with self.assertRaisesRegex(RuntimeError, "failed receiver view"):
+            p._install(8)
+        p.install_host_routing.assert_called_once()
+
     def test_borrowed_install_requires_both_native_entry_points(self):
         for has_install in (False, True):
             for has_retire in (False, True):
@@ -97,6 +161,7 @@ class ProviderTests(unittest.TestCase):
                     p = self.provider()
                     lib = p.library = SimpleNamespace(rdma_proxy_get_benchmark_routing_config=MagicMock(),
                                                       rdma_proxy_get_routing_extents=MagicMock(),
+                                                      rdma_proxy_install_borrowed_benchmark_host_routing=MagicMock(),
                                                       rdma_proxy_install_benchmark_routing=MagicMock())
                     if has_install:
                         lib.rdma_proxy_install_borrowed_benchmark_routing = MagicMock()
@@ -106,9 +171,11 @@ class ProviderTests(unittest.TestCase):
                     if has_install and has_retire:
                         self.assertIs(p.install_routing, lib.rdma_proxy_install_borrowed_benchmark_routing)
                         self.assertIs(p.retire_routing, lib.rdma_proxy_retire_borrowed_benchmark_routing)
+                        self.assertIs(p.install_host_routing, lib.rdma_proxy_install_borrowed_benchmark_host_routing)
                     else:
                         self.assertIs(p.install_routing, lib.rdma_proxy_install_benchmark_routing)
                         self.assertIsNone(p.retire_routing)
+                        self.assertIsNone(p.install_host_routing)
 
     def test_timed_windows_fork_after_r_ready_and_join_before_release(self):
         p = self.provider()

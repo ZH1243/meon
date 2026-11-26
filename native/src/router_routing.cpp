@@ -124,11 +124,15 @@ void RouterRouting::copy_benchmark_node_slice(
     }
 }
 
-void RouterRouting::initialize_benchmark(uintptr_t device_r, uintptr_t device_node_offsets,
-                                         uintptr_t device_x3, uintptr_t device_x4) {
+void RouterRouting::require_fresh_benchmark_route() const {
     if (initialized_ || !config_.router_benchmark_metadata_enabled ||
         config_.router_weighted_contributions_enabled)
         throw std::runtime_error("benchmark source snapshot requires fresh unweighted routing");
+}
+
+void RouterRouting::initialize_benchmark(uintptr_t device_r, uintptr_t device_node_offsets,
+                                         uintptr_t device_x3, uintptr_t device_x4) {
+    require_fresh_benchmark_route();
     if (!device_r || !device_node_offsets || !device_x3 || !device_x4 ||
         device_r % alignof(int32_t) || device_node_offsets % alignof(int32_t) ||
         device_x3 % alignof(int32_t))
@@ -154,27 +158,54 @@ void RouterRouting::initialize_benchmark(uintptr_t device_r, uintptr_t device_no
     };
     std::vector<int32_t> offsets(config_.num_nodes + 1);
     read(offsets, device_node_offsets);
-    if (offsets.front() != 0)
+    std::vector<int32_t> x3(benchmark_packed_rows(offsets.data()));
+    std::vector<uint8_t> x4(x3.size());
+    read(x3, device_x3);
+    read(x4, device_x4);
+    copy_benchmark_nodes(offsets.data(), x3.data(), x4.data());
+    original_experts_.resize(config_.num_tokens * config_.router_top_k);
+    read(original_experts_, device_r);
+    finish_benchmark_route();
+}
+
+void RouterRouting::initialize_benchmark_host(const int32_t* r, const int32_t* offsets,
+                                              const int32_t* x3, const uint8_t* x4, uint64_t packed_count) {
+    require_fresh_benchmark_route();
+    if (!r || !offsets || (packed_count && (!x3 || !x4)) ||
+        reinterpret_cast<uintptr_t>(r) % alignof(int32_t) ||
+        reinterpret_cast<uintptr_t>(offsets) % alignof(int32_t) ||
+        reinterpret_cast<uintptr_t>(x3) % alignof(int32_t))
+        throw std::runtime_error("invalid benchmark outgoing host buffer address");
+    if (packed_count != benchmark_packed_rows(offsets))
+        throw std::runtime_error("benchmark outgoing host count disagrees with node offsets");
+    copy_benchmark_nodes(offsets, x3, x4);
+    original_experts_.assign(r, r + config_.num_tokens * config_.router_top_k);
+    finish_benchmark_route();
+}
+
+std::size_t RouterRouting::benchmark_packed_rows(const int32_t* offsets) const {
+    if (offsets[0] != 0)
         throw std::runtime_error("benchmark node offsets must start at zero");
     for (int node = 0; node < config_.num_nodes; ++node) {
         if (offsets[node + 1] < offsets[node] ||
             static_cast<std::size_t>(offsets[node + 1] - offsets[node]) > config_.num_tokens)
             throw std::runtime_error("invalid benchmark node offsets");
     }
-    std::vector<int32_t> x3(offsets.back());
-    std::vector<uint8_t> x4(x3.size());
-    read(x3, device_x3);
-    read(x4, device_x4);
+    return static_cast<std::size_t>(offsets[config_.num_nodes]);
+}
+
+void RouterRouting::copy_benchmark_nodes(const int32_t* offsets, const int32_t* x3, const uint8_t* x4) {
     token_indices_by_node_.resize(config_.num_nodes);
     token_masks_by_node_.resize(config_.num_nodes);
     for (int node = 0; node < config_.num_nodes; ++node) {
         const auto count = offsets[node + 1] - offsets[node];
-        copy_benchmark_node_slice(count ? x3.data() + offsets[node] : nullptr,
-                                  count ? x4.data() + offsets[node] : nullptr, count,
+        copy_benchmark_node_slice(count ? x3 + offsets[node] : nullptr,
+                                  count ? x4 + offsets[node] : nullptr, count,
                                   token_indices_by_node_[node], token_masks_by_node_[node]);
     }
-    original_experts_.resize(config_.num_tokens * config_.router_top_k);
-    read(original_experts_, device_r);
+}
+
+void RouterRouting::finish_benchmark_route() {
     for (auto expert : original_experts_)
         if (expert < 0 || expert >= config_.router_num_experts)
             throw std::runtime_error("benchmark R contains an out-of-range expert");

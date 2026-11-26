@@ -2,6 +2,7 @@
 #include "metadata_view.hpp"
 #include "two_node_layout.hpp"
 #include <cuda/atomic>
+#include <algorithm>
 
 // One CTA per destination; no intermediate packing allocation. Self only
 // writes its small header: its D2H payload is read directly from CuTe output.
@@ -126,9 +127,28 @@ void launch_exchange_two(PeerArenas peers, int source, int node, int capacity,
 
 __global__ void receiver_kernel(int32_t* inbox, int32_t* host, int rank, int node,
                                 int capacity, uint64_t iteration, uint64_t timeout_cycles,
-                                size_t flags_offset, rme2::receiver::Result* results) {
+                                size_t flags_offset, rme2::receiver::Result* results,
+                                ReceiverSourceCopy source) {
     namespace two = rme2::two;
     const int slot = int(blockIdx.x);
+    if (slot >= rme2::receiver::records) {
+        // The receiver stream already waits on this iteration's local metadata
+        // graph. These blocks can copy while the directory blocks poll peers.
+        const int first = (slot - rme2::receiver::records) * blockDim.x + threadIdx.x;
+        const int stride = (gridDim.x - rme2::receiver::records) * blockDim.x;
+        const int end = source.node_offsets[2];
+        if (first < 3) source.output.node_offsets[first] = source.node_offsets[first];
+        if (rme2::receiver::valid_source_offsets(source.node_offsets[0], source.node_offsets[1],
+                                                 end, capacity / 8)) {
+            for (int i = first; i < end; i += stride) {
+                source.output.x3[i] = source.x3[i];
+                source.output.x4[i] = source.x4[i];
+            }
+            for (int i = first; i < capacity; i += stride) source.output.r[i] = source.r[i];
+        }
+        __threadfence_system();
+        return;
+    }
     const bool route_header = slot == two::sources;
     const bool local_record = !route_header && slot / 8 == node;
     auto* flags = reinterpret_cast<rme2::receiver::Flag*>(
@@ -193,7 +213,11 @@ __global__ void receiver_kernel(int32_t* inbox, int32_t* host, int rank, int nod
 
 void launch_receiver(int32_t* inbox, int32_t* mapped_host, int rank, int node,
                      int capacity, uint64_t iteration, uint64_t timeout_cycles,
-                     rme2::receiver::Result* results, cudaStream_t stream) {
-    receiver_kernel<<<rme2::receiver::records, 256, 0, stream>>>(inbox, mapped_host, rank, node, capacity,
-        iteration, timeout_cycles, rme2::receiver::flags_offset(capacity), results);
+                     rme2::receiver::Result* results, cudaStream_t stream, ReceiverSourceCopy source) {
+    constexpr int threads = 256;
+    // Bound concurrent copy work so a large R cannot consume the full grid
+    // while local peers and the outbound exchange are publishing records.
+    const int copy_blocks = source.output.r ? std::min(32, (capacity + threads - 1) / threads) : 0;
+    receiver_kernel<<<rme2::receiver::records + copy_blocks, threads, 0, stream>>>(inbox, mapped_host,
+        rank, node, capacity, iteration, timeout_cycles, rme2::receiver::flags_offset(capacity), results, source);
 }

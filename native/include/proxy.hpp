@@ -40,7 +40,8 @@ public:
     void initialize();
     void prepare_routing(uint64_t iteration);
     void install_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing);
-    void install_borrowed_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing);
+    void install_borrowed_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing,
+                                            const RdmaProxyBenchmarkHostRoute* host_route = nullptr);
     void retire_borrowed_benchmark_routing(uint64_t iteration);
     void run();
     void run_once();
@@ -321,7 +322,7 @@ private:
     const std::vector<uint8_t>& intra_node_raw_masks(int source_node) const;
     bool routing_install_required(uint64_t iteration) const;
     void install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing,
-                                        bool borrow_expert_lists);
+                                        bool borrow_expert_lists, const RdmaProxyBenchmarkHostRoute* host_route);
     void install_iteration_routing(uint64_t iteration, IterationRouteData route);
     std::shared_lock<std::shared_mutex> lock_forwarding_routes() const;
     std::shared_lock<std::shared_mutex> lock_installed_combine_route() const;

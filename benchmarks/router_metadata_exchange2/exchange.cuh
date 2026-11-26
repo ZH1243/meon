@@ -12,8 +12,16 @@ void launch_exchange_two(PeerArenas peers, int source, int node, int capacity,
                          const int32_t* x3, const uint8_t* x4, bool direct_x3_x4_output,
                          bool receiver_kernel,
                          cudaStream_t stream);
-// Seven independent CTAs consume only this node's peer-source expert records.
-// Pinned output/results must be GPU-mapped. CPU consumption requires completion.
+struct ReceiverSourceCopy {
+    const int32_t* node_offsets;
+    const int32_t* x3;
+    const uint8_t* x4;
+    const int32_t* r;
+    rme2::receiver::SourceSnapshot output;
+};
+// One CTA per directory entry. Optional additional CTAs copy this rank's
+// outgoing route. All host outputs are GPU-mapped and event-gated.
 void launch_receiver(int32_t* inbox, int32_t* mapped_host, int rank, int node,
                      int capacity, uint64_t iteration, uint64_t timeout_cycles,
-                     rme2::receiver::Result* results, cudaStream_t stream);
+                     rme2::receiver::Result* results, cudaStream_t stream,
+                     ReceiverSourceCopy source = {});

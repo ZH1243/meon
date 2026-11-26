@@ -293,9 +293,11 @@ Each iteration generates fresh affine R using meon's per-rank seed sequence. The
 
 Before the next exchange, each rank retires its readers of the previous expert lists, then enters the existing Gloo reuse barrier. Once all ranks leave that barrier, peer writes may reuse the pinned storage. At the end of the run the worker shuts down the payload proxy before freeing the benchmark's storage. With an older payload library that only supports call-duration borrowing, the worker uses the original snapshot install.
 
+Look for `source_route=receiver` on the per-rank timing line. In that mode the existing receiver kernel writes this GPU's outgoing node offsets, x3, x4 and top-8 R into reusable pinned memory before the local staging gather. The installer consumes the four arrays from host memory. With an older exchange or payload library that lacks this handoff, the worker reports `source_route=device_readback` and reads the arrays from the GPU during installation.
+
 | Per-rank field | Host wall interval |
 | --- | --- |
-| `exchange_staging_us` | Aligned submission through benchmark wait completion, including the seven kernels, GPU exchange, RDMA and local gather. This matches the standalone benchmark's end-to-end timing boundary. |
+| `exchange_staging_us` | Aligned submission through benchmark wait completion, including the seven kernels, GPU exchange, RDMA and local gather. With `source_route=receiver`, this interval also includes writing the outgoing snapshot that meon requests. The standalone benchmark uses the same timing boundary. |
 | `install_us` | Benchmark wait return through importing the source views and installing meon's dispatch and gather metadata. |
 | `retire_us` | Local time to release the previous iteration's borrowed expert lists before entering the reuse barrier. Zero for the first iteration and for snapshot installs. |
 | `r_ready_to_up_submit_us` | Fresh R completed through host return from up-GEMM submission, including alignment, installation, rank release and compute setup. Available for compute iterations that submit work. Use a GPU trace to measure the actual kernel start. |
@@ -338,6 +340,17 @@ The single-GPU check below exercises pinned-memory uploads and reads the result 
 cmake --build "$RDMA_PROXY_BUILD_DIR" --target rdma_cpu_proxy_shared test_dynamic_gather -j4
 ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R '^test_borrowed_routing_upload_cuda$' --output-on-failure
 ```
+
+The outgoing snapshot was checked on macOS 15.6.1 arm64 with the Debug native and CPU Python suites above. The tests cover the pinned layout, empty and changing node slices, original top-8 assignments, input-buffer reuse after installation, and fallback with older libraries. The following CUDA regression runs on one host with eight peer-accessible GPUs. It compares the receiver's mapped output against all four source arrays as soon as the receiver event completes.
+
+```bash
+cmake -S "$PROXY_ROOT/benchmarks/router_metadata_exchange2" -B "$RDMA_PROXY_BUILD_DIR/receiver-tests" \
+  -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" -DCMAKE_CUDA_ARCHITECTURES=90
+cmake --build "$RDMA_PROXY_BUILD_DIR/receiver-tests" --target test_receiver_kernel -j4
+ctest --test-dir "$RDMA_PROXY_BUILD_DIR/receiver-tests" -R '^receiver_kernel_cuda$' --output-on-failure
+```
+
+For the two-node H800 profile, rebuild `rdma_cpu_proxy_shared` and run the same arguments on both hosts. With `source_route=receiver`, the four source-route D2H calls after the gather should disappear. The gather waits for the receiver, so compare both `exchange_staging_us` and `install_us`. Use `r_ready_to_up_submit_us` and the actual up-GEMM start in Nsight to see whether moving the transfer earlier reduces total latency. CUDA verification and the two-node timing measurement require a hardware run.
 
 ### Two-node test on Hopper
 

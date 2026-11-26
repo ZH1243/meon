@@ -45,7 +45,7 @@ typedef struct {
     /* x3/x4 payload only (5 bytes/token); RDMA totals above include its header. */
     uint64_t x3_x4_sent_bytes;
     uint64_t x3_x4_received_bytes;
-    uint64_t receiver_copy_bytes; /* Directory + all eight local records written by SMs. */
+    uint64_t receiver_copy_bytes; /* Exchange directory + eight local records; excludes optional source snapshot. */
     uint64_t payload_copy_bytes;  /* Two-node indices submitted through CUDA D2H APIs. */
 } Rme2Stats;
 int rme2_abi_version(void);
@@ -74,6 +74,12 @@ int rme2_set_local_staging_after_d2h(Rme2Proxy*, int enabled);
  * N = remote node slice length, and system-fence stores before completion.
  * Never overwrite until all consumers/sends from the prior iteration finish. */
 int rme2_enable_direct_x3_x4(Rme2Proxy*, void** payload, uint64_t* bytes);
+/* Optional two-node receiver integration, after connect and before capture or
+ * the first submission. device_r points to this GPU's contiguous int32[T,8]
+ * route table; retain its address until disconnect/destroy and regenerate it
+ * only between iterations. The receiver copies it and the submitted local
+ * node_offsets/x3/x4 into reusable mapped host storage. */
+int rme2_enable_source_snapshot(Rme2Proxy*, const int32_t* device_r);
 const char* rme2_error(void);
 int rme2_create(int rank, int device, int tokens, const char* shm_name,
                 double timeout_seconds, int validate_indices, int cpu_core,
@@ -123,6 +129,12 @@ int rme2_view(Rme2Proxy*, int source, const int32_t** offsets,
 /* Two-node only: remote same-index source's slice for this node, borrowed
  * through the next submit/destroy, available only after successful wait. */
 int rme2_x3_x4_view(Rme2Proxy*, const int32_t** x3, const uint8_t** x4, int* count);
+/* This local source's outgoing route after successful wait for the given
+ * 1-based iteration. node_offsets has 3 entries. x3/x4 each have
+ * node_offsets[2] valid entries and R has T*8. All four are read-only and
+ * borrowed through the next submit or destroy. */
+int rme2_source_snapshot_view(Rme2Proxy*, uint64_t iteration, const int32_t** node_offsets,
+                              const int32_t** x3, const uint8_t** x4, const int32_t** r);
 void rme2_destroy(Rme2Proxy*);
 #ifdef __cplusplus
 }

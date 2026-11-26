@@ -31,6 +31,15 @@ CTAs copy only directory headers: outgoing payloads remain in the registered GPU
 arena for GPUDirect RDMA. The pinned incoming RDMA bank, x3/x4 receive record and
 unused payload tails are untouched.
 
+When embedded in meon, the receiver can also copy this rank's own outgoing route.
+Extra blocks in the same launch write the node offsets, the valid x3 and x4
+prefixes for both nodes, and the full top-8 R into a process-local pinned buffer.
+The CPU can read these arrays after a successful wait for the matching epoch.
+The buffer is allocated once and reused on the next submission. At 20,480 tokens
+it reserves 860,192 bytes per rank. This option adds local GPU-to-host traffic
+within the receiver event and leaves the RDMA message sizes unchanged. The
+standalone benchmark runs with the option disabled.
+
 Flags live beyond the registered wire arena, use separate 64-byte slots and are
 never reset between iterations. The existing all-rank consumption barrier protects
 reuse. Setup checks mapped-host access and native P2P atomic support for every
@@ -74,7 +83,8 @@ Timing and volume fields:
   gate, before RDMA posting. Replaces the old `receiver_tail_ms` (after self DMA),
   which no longer applies.
 - `receiver_copy_bytes`: 1,088 directory bytes plus all eight valid local record
-  sizes, including each 64-byte record header.
+  sizes, including each 64-byte record header. This counter covers exchange
+  records and excludes the optional process-local outgoing route.
 - `header_bytes`, `payload_copy_bytes`, `headers_d2h_ms`, `payload_d2h_ms`,
   `payload_submit_ms`, `payload_event_record_ms`, `payload_completion_ms` and
   `payload_other_ms`: zero in receiver mode. `payload_checks_ms` still measures

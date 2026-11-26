@@ -195,6 +195,7 @@ int main(int argc, char** argv) {
         rdma_proxy_get_benchmark_routing_config(handle, &benchmark_config) == 0 ||
         rdma_proxy_install_benchmark_routing(handle, 0, nullptr) == 0 ||
         rdma_proxy_install_borrowed_benchmark_routing(handle, 0, nullptr) == 0 ||
+        rdma_proxy_install_borrowed_benchmark_host_routing(handle, 0, nullptr, nullptr) == 0 ||
         rdma_proxy_retire_borrowed_benchmark_routing(nullptr, 0) == 0 ||
         rdma_proxy_retire_borrowed_benchmark_routing(handle, 0) == 0) {
         std::cerr << "invalid benchmark metadata query, install or retirement accepted\n";

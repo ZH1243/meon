@@ -450,7 +450,8 @@ extern "C" int rdma_proxy_get_benchmark_routing_config(
 }
 
 static int install_benchmark_routing(RdmaProxyHandle* handle, uint64_t iteration,
-                                     const RdmaProxyBenchmarkRouting* routing, bool borrow_expert_lists) {
+                                     const RdmaProxyBenchmarkRouting* routing, bool borrow_expert_lists,
+                                     const RdmaProxyBenchmarkHostRoute* host_route = nullptr) {
     clear_error();
     if (!handle || !handle->initialized || handle->shut_down || handle->finished ||
         !handle->config.router_benchmark_metadata_enabled || iteration != handle->next_iteration ||
@@ -461,7 +462,7 @@ static int install_benchmark_routing(RdmaProxyHandle* handle, uint64_t iteration
     try {
         select_proxy_cuda_device(*handle);
         if (borrow_expert_lists)
-            handle->proxy.install_borrowed_benchmark_routing(iteration, *routing);
+            handle->proxy.install_borrowed_benchmark_routing(iteration, *routing, host_route);
         else
             handle->proxy.install_benchmark_routing(iteration, *routing);
         return 0;
@@ -478,6 +479,16 @@ extern "C" int rdma_proxy_install_benchmark_routing(
 extern "C" int rdma_proxy_install_borrowed_benchmark_routing(
     RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing) {
     return install_benchmark_routing(handle, iteration, routing, true);
+}
+
+extern "C" int rdma_proxy_install_borrowed_benchmark_host_routing(
+    RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing,
+    const RdmaProxyBenchmarkHostRoute* host_route) {
+    if (!host_route) {
+        last_error = "benchmark host routing installation requires a host route";
+        return -1;
+    }
+    return install_benchmark_routing(handle, iteration, routing, true, host_route);
 }
 
 extern "C" int rdma_proxy_retire_borrowed_benchmark_routing(RdmaProxyHandle* handle, uint64_t iteration) {

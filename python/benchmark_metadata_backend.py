@@ -34,6 +34,14 @@ class BenchmarkRouting(C.Structure):
     ]
 
 
+class BenchmarkHostRoute(C.Structure):
+    _fields_ = [
+        ("struct_size", C.c_uint64), ("node_offset_count", C.c_uint64),
+        ("packed_count", C.c_uint64), ("assignment_count", C.c_uint64),
+        ("node_offsets", _I32P), ("x3", _I32P), ("x4", _U8P), ("r", _I32P),
+    ]
+
+
 class BenchmarkConfig(C.Structure):
     _fields_ = [
         ("struct_size", C.c_uint64), ("num_tokens", C.c_uint64),
@@ -82,6 +90,7 @@ class BenchmarkMetadataBackend:
         self.closed = False
         self.failed = False
         self.next_iteration = 0
+        self.source_snapshot_view = None
         self.last_stats = {}
         self.config = BenchmarkConfig(struct_size=C.sizeof(BenchmarkConfig))
         self._bind()
@@ -104,8 +113,14 @@ class BenchmarkMetadataBackend:
             retire = None
         self.install_routing = install
         self.retire_routing = retire
+        self.install_host_routing = None
         if retire is not None:
             retire.argtypes, retire.restype = [C.c_void_p, C.c_uint64], C.c_int
+            self.install_host_routing = getattr(self.library, "rdma_proxy_install_borrowed_benchmark_host_routing", None)
+            if self.install_host_routing is not None:
+                self.install_host_routing.argtypes = [
+                    C.c_void_p, C.c_uint64, C.POINTER(BenchmarkRouting), C.POINTER(BenchmarkHostRoute)]
+                self.install_host_routing.restype = C.c_int
         calls = (
             (self.library.rdma_proxy_get_benchmark_routing_config, [C.c_void_p, C.POINTER(BenchmarkConfig)]),
             (install, [C.c_void_p, C.c_uint64, C.POINTER(BenchmarkRouting)]),
@@ -210,6 +225,21 @@ class BenchmarkMetadataBackend:
         self._setup_step("retiring metadata control name", lambda: self.session.unlink() if self.local == 0 else None)
         self._setup_step("capturing CuTe metadata and meon local staging graphs", self._capture)
 
+    def _enable_source_snapshot(self):
+        if self.install_host_routing is None:
+            return
+        enable = getattr(self.session.lib, "rme2_enable_source_snapshot", None)
+        view = getattr(self.session.lib, "rme2_source_snapshot_view", None)
+        if enable is None or view is None:
+            return  # Older exchange libraries leave the outgoing route on the device.
+        enable.argtypes, enable.restype = [C.c_void_p, C.c_void_p], C.c_int
+        view.argtypes = [C.c_void_p, C.c_uint64, C.POINTER(_I32P), C.POINTER(_I32P),
+                         C.POINTER(_U8P), C.POINTER(_I32P)]
+        view.restype = C.c_int
+        # self.r is updated in place and stays alive through benchmark shutdown.
+        self.session.check(enable(self.session.handle, self.r.data_ptr()))
+        self.source_snapshot_view = view
+
     def _capture(self):
         import cuda.bindings.driver as cuda
         import cutlass
@@ -226,6 +256,7 @@ class BenchmarkMetadataBackend:
             self.plan = module.MetadataPlan(self.r, self.local,
                                             rdma_x3_x4_payload=self.session.enable_direct_x3_x4(),
                                             remote_output_node=1 - self.node)
+            self._enable_source_snapshot()
             self.staging = module.LocalStagingPlan(self.plan, *self.device_buffers.benchmark_staging_buffers(),
                                                   node_rank=self.node)
             self.r_argument = from_dlpack(self.r)
@@ -259,11 +290,23 @@ class BenchmarkMetadataBackend:
         session.check(session.lib.rme2_x3_x4_view(session.handle, C.byref(x3), C.byref(x4), C.byref(count)))
         if count.value < 0 or (count.value and (not x3 or not x4)):
             raise RuntimeError("invalid borrowed remote x3/x4 record")
-        record = BenchmarkRouting(C.sizeof(BenchmarkRouting), 16, sources, x3, x4, count.value,
-                                  self.r.data_ptr(), self.plan.node_offsets.data_ptr(),
-                                  self.plan.x3.data_ptr(), self.plan.x4.data_ptr())
-        self._check(self.install_routing(self.handle, iteration, C.byref(record)),
-                    "installing benchmark routing in the payload proxy")
+        record = BenchmarkRouting(C.sizeof(BenchmarkRouting), 16, sources, x3, x4, count.value)
+        if self.source_snapshot_view is not None:
+            offsets, source_x3, source_x4, r = _I32P(), _I32P(), _U8P(), _I32P()
+            # Benchmark sequences start at one; payload iterations start at zero.
+            session.check(self.source_snapshot_view(session.handle, iteration + 1, C.byref(offsets),
+                                                    C.byref(source_x3), C.byref(source_x4), C.byref(r)))
+            if not offsets:
+                raise RuntimeError("benchmark source snapshot is missing its node offsets")
+            nodes = self.config.num_nodes
+            host = BenchmarkHostRoute(C.sizeof(BenchmarkHostRoute), nodes + 1, offsets[nodes],
+                                      8 * self.config.num_tokens, offsets, source_x3, source_x4, r)
+            status = self.install_host_routing(self.handle, iteration, C.byref(record), C.byref(host))
+        else:
+            record.device_r, record.device_node_offsets = self.r.data_ptr(), self.plan.node_offsets.data_ptr()
+            record.device_x3, record.device_x4 = self.plan.x3.data_ptr(), self.plan.x4.data_ptr()
+            status = self.install_routing(self.handle, iteration, C.byref(record))
+        self._check(status, "installing benchmark routing in the payload proxy")
 
     def prepare(self, iteration, *, compute_extents=True):
         if self.closed or self.failed or iteration != self.next_iteration:
@@ -301,6 +344,7 @@ class BenchmarkMetadataBackend:
                 "r_ready_to_install_elapsed_ns": installed - r_ready,
                 "retire_elapsed_ns": reuse_start - r_ready, "reuse_barrier_ns": exchange_start - reuse_start,
                 "release_barrier_ns": released - installed,
+                "source_route": "receiver" if self.source_snapshot_view is not None else "device_readback",
                 "rme2_stats": native_stats,
             }
             self.next_iteration += 1

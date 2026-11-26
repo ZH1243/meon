@@ -15,4 +15,29 @@ inline size_t flags_offset(int capacity) {
 inline size_t allocation_bytes(int capacity) {
     return flags_offset(capacity) + records * sizeof(Flag);
 }
+
+// Private mapped host memory, separate from the two-node RDMA wire arena.
+// Leave a 32-byte header so R and x3 start on coalesced-store boundaries.
+struct SourceSnapshot {
+    int32_t* node_offsets;
+    int32_t* x3;
+    uint8_t* x4;
+    int32_t* r;
+};
+constexpr int snapshot_header_words = 8;
+inline size_t source_snapshot_bytes(int tokens) {
+    return (snapshot_header_words + size_t(tokens) * (8 + two::nodes)) * sizeof(int32_t)
+        + size_t(tokens) * two::nodes * sizeof(uint8_t);
+}
+inline SourceSnapshot source_snapshot(int32_t* base, int tokens) {
+    auto* r = base + snapshot_header_words;
+    auto* x3 = r + size_t(tokens) * 8;
+    return {base, x3, reinterpret_cast<uint8_t*>(x3 + size_t(tokens) * two::nodes), r};
+}
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline bool valid_source_offsets(int start, int split, int end, int tokens) {
+    return start == 0 && split >= 0 && split <= tokens && end >= split && end - split <= tokens;
+}
 } // namespace rme2::receiver

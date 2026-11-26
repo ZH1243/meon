@@ -99,7 +99,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                 self.last_stats = dict(r_ready_ns=time.perf_counter_ns(), generation_elapsed_ns=1000,
                                        exchange_staging_elapsed_ns=2000, install_elapsed_ns=3000,
                                        r_ready_to_install_elapsed_ns=5000, retire_elapsed_ns=100,
-                                       reuse_barrier_ns=0, release_barrier_ns=0)
+                                       reuse_barrier_ns=0, release_barrier_ns=0, source_route="receiver")
                 return ((1, 1 - epoch) if compute_extents else None), 6000
 
             def close(self, *, clean):
@@ -158,6 +158,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                                   ("shutdown",), ("close", True), ("destroy",)])
         self.assertIn("phase=steady generation_us=1.000 exchange_staging_us=2.000 install_us=3.000", result)
         self.assertIn("retire_us=0.100", result)
+        self.assertIn("source_route=receiver", result)
         self.assertNotIn("r_ready_to_up_submit_us", result)
 
     def test_up_uses_current_route_and_timing_is_only_for_actual_launches(self):

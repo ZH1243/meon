@@ -92,6 +92,9 @@ struct Rme2Proxy {
     bool receiver_kernel = false;
     bool receiver_overlap_exchange = false;
     int32_t* mapped_pinned = nullptr;
+    rme2::receiver::SourceSnapshot source_host{}, source_mapped{};
+    const int32_t* source_r = nullptr;
+    uint64_t source_waited_epoch = 0;
     rme2::receiver::Result* receiver_results = nullptr;
     rme2::receiver::Result* mapped_receiver_results = nullptr;
     cudaStream_t receiver_stream = nullptr;
@@ -305,6 +308,11 @@ struct Rme2Proxy {
                 require(receiver_results[slot].error != rme2::receiver::timeout_error,
                         "receiver kernel timed out waiting for a record");
                 require(receiver_results[slot].error == 0, "receiver kernel rejected a record");
+            }
+            if (source_r) {
+                const auto* offsets = source_host.node_offsets;
+                require(rme2::receiver::valid_source_offsets(offsets[0], offsets[1], offsets[2], tokens),
+                        "receiver rejected outgoing source node offsets");
             }
             check(cudaEventElapsedTime(&elapsed, receiver_begin, receiver_end), "receiver timing");
             stats.receiver_gpu_ms = elapsed;
@@ -564,7 +572,8 @@ struct Rme2Proxy {
                   "order receiver at selected exchange boundary");
             check(cudaEventRecord(receiver_begin, receiver_stream), "record receiver start");
             launch_receiver(inbox, mapped_pinned, rank, node, capacity, sequence,
-                            receiver_timeout_cycles, mapped_receiver_results, receiver_stream);
+                            receiver_timeout_cycles, mapped_receiver_results, receiver_stream,
+                            {local_node_offsets, local_x3, local_x4, source_r, source_mapped});
             check(cudaGetLastError(), "launch metadata receiver");
             check(cudaEventRecord(receiver_end, receiver_stream), "record receiver completion");
             // Device-side dependency: gather cannot contend with host stores,
@@ -680,6 +689,7 @@ struct Rme2Proxy {
         if (inbox) cudaFree(inbox);
         if (pinned) cudaFreeHost(pinned);
         if (receiver_results) cudaFreeHost(receiver_results);
+        if (source_host.node_offsets) cudaFreeHost(source_host.node_offsets);
         if (shared) munmap(shared, sizeof(Shared));
         if (owner) shm_unlink(name.c_str());
     }
@@ -743,6 +753,28 @@ extern "C" int rme2_enable_direct_x3_x4(Rme2Proxy* p, void** payload, uint64_t* 
         *payload = p->inbox + rme2::two::x3_x4_offset(p->capacity) + rme2::two::header_words;
         *bytes = uint64_t(p->tokens) * 5;
         p->direct_x3_x4_output = true;
+    });
+}
+extern "C" int rme2_enable_source_snapshot(Rme2Proxy* p, const int32_t* device_r) {
+    return api([&] {
+        require(p && device_r && reinterpret_cast<uintptr_t>(device_r) % alignof(int32_t) == 0,
+                "invalid source snapshot route pointer");
+        std::lock_guard<std::mutex> lock(p->mutex);
+        require(p->connected && p->receiver_kernel && !p->source_r && !p->stopping.load() &&
+                p->sequence == 0 && !p->capturing && !p->metadata_graph && !p->staging_graph,
+                "enable source snapshot once on a connected receiver before capture or submit");
+        check(cudaSetDevice(p->device), "select source snapshot GPU");
+        int32_t *host = nullptr, *mapped = nullptr;
+        check(cudaHostAlloc(reinterpret_cast<void**>(&host), rme2::receiver::source_snapshot_bytes(p->tokens),
+                            cudaHostAllocMapped), "allocate mapped source snapshot");
+        const auto status = cudaHostGetDevicePointer(reinterpret_cast<void**>(&mapped), host, 0);
+        if (status != cudaSuccess) {
+            cudaFreeHost(host);
+            check(status, "map source snapshot");
+        }
+        p->source_host = rme2::receiver::source_snapshot(host, p->tokens);
+        p->source_mapped = rme2::receiver::source_snapshot(mapped, p->tokens);
+        p->source_r = device_r;
     });
 }
 extern "C" int rme2_set_local_staging_after_d2h(Rme2Proxy* p, int enabled) {
@@ -986,6 +1018,7 @@ extern "C" int rme2_wait(Rme2Proxy* p, Rme2Stats* stats) {
         p->changed.wait(lock, [&] { return p->done; });
         require(p->failure.empty(), p->failure.c_str());
         *stats = p->stats; p->done = false;
+        if (p->source_r) p->source_waited_epoch = p->sequence;
     });
 }
 extern "C" int rme2_view(Rme2Proxy* p, int source, const int32_t** offsets,
@@ -1006,6 +1039,20 @@ extern "C" int rme2_x3_x4_view(Rme2Proxy* p, const int32_t** x3, const uint8_t**
         require(!p->pending && !p->done && p->failure.empty() && p->sequence > 0 &&
                 p->installed_x3_x4.iteration == p->sequence, "x3/x4 view requires successful wait");
         *x3 = p->installed_x3_x4.x3; *x4 = p->installed_x3_x4.x4; *count = p->installed_x3_x4.count;
+    });
+}
+extern "C" int rme2_source_snapshot_view(Rme2Proxy* p, uint64_t iteration, const int32_t** node_offsets,
+                                         const int32_t** x3, const uint8_t** x4, const int32_t** r) {
+    return api([&] {
+        require(p && node_offsets && x3 && x4 && r, "invalid source snapshot view arguments");
+        std::lock_guard<std::mutex> lock(p->mutex);
+        require(p->source_r && !p->stopping.load() && p->failure.empty() && iteration &&
+                p->sequence == iteration && p->source_waited_epoch == iteration,
+                "source snapshot view requires successful wait for this iteration");
+        *node_offsets = p->source_host.node_offsets;
+        *x3 = p->source_host.x3;
+        *x4 = p->source_host.x4;
+        *r = p->source_host.r;
     });
 }
 extern "C" void rme2_destroy(Rme2Proxy* p) { delete p; }

@@ -212,6 +212,17 @@ typedef struct RdmaProxyBenchmarkRouting {
     uintptr_t device_r, device_node_offsets, device_x3, device_x4;
 } RdmaProxyBenchmarkRouting;
 
+/* Current source GPU's outgoing route, in host memory. Counts are in elements.
+ * node_offsets has num_nodes + 1 entries and ends at packed_count. x3 and x4
+ * each contain packed_count entries. r contains num_tokens * top_k expert IDs. */
+typedef struct RdmaProxyBenchmarkHostRoute {
+    uint64_t struct_size, node_offset_count, packed_count, assignment_count;
+    const int32_t* node_offsets;
+    const int32_t* x3;
+    const uint8_t* x4;
+    const int32_t* r;
+} RdmaProxyBenchmarkHostRoute;
+
 typedef struct RdmaProxyBenchmarkConfig {
     uint64_t struct_size, num_tokens, router_seed, completion_timeout_ms;
     int32_t cuda_device_id, node_rank, local_gpu_index, num_gpus_per_node, num_nodes;
@@ -233,6 +244,12 @@ RDMA_PROXY_C_API int rdma_proxy_install_benchmark_routing(
  * Serialize benchmark routing control calls on each handle. */
 RDMA_PROXY_C_API int rdma_proxy_install_borrowed_benchmark_routing(
     RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing);
+/* Same borrow and retirement contract for the incoming expert lists. The
+ * outgoing host route is read only during this synchronous call. Set both
+ * descriptors' struct_size fields. routing's four device addresses are ignored. */
+RDMA_PROXY_C_API int rdma_proxy_install_borrowed_benchmark_host_routing(
+    RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing,
+    const RdmaProxyBenchmarkHostRoute* host_route);
 /* Call after run_iteration and any external consumers of this iteration have
  * completed. Drains the remaining native readers. Retire on every rank before
  * any rank starts the next exchange or otherwise reuses the records. */

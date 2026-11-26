@@ -1,7 +1,9 @@
 // Remote-only, eight peer-accessible GPUs; exercises the actual exchange and
 // receiver kernels without Python, CuTe, IPC setup, or an RDMA fabric.
 #include "exchange.cuh"
+#include <algorithm>
 #include <array>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -44,15 +46,62 @@ __global__ void consume_host(const int32_t* arena, const int32_t* host, int node
     if (threadIdx.x == 0) *status = bad;
 }
 struct Device {
-    int32_t *arena{}, *host{}, *mapped{}, *offsets{}, *values{}, *nodes{};
+    int32_t *arena{}, *host{}, *mapped{}, *offsets{}, *values{};
+    int32_t *source_device{}, *source_host{}, *source_mapped{};
     int32_t *consumer_status{}, *mapped_consumer_status{};
     rme2::receiver::Result *results{}, *mapped_results{};
     cudaStream_t send{}, receive{};
     cudaEvent_t exchange_start{}, sent{}, received{}, consumed{};
     uint64_t cycles_per_ms{};
-    std::vector<int32_t> offsets_cpu, values_cpu;
+    std::vector<int32_t> offsets_cpu, values_cpu, source_cpu;
 };
 constexpr int sentinel = -777777;
+constexpr size_t source_guard_bytes = 16;
+constexpr uint8_t source_guard = 0x5a;
+
+ReceiverSourceCopy source_copy(Device& d, int tokens) {
+    const auto input = rme2::receiver::source_snapshot(d.source_device, tokens);
+    return {input.node_offsets, input.x3, input.x4, input.r,
+            rme2::receiver::source_snapshot(d.source_mapped, tokens)};
+}
+
+void prepare_source(Device& d, int tokens, int source, int pattern, uint64_t epoch) {
+    const auto bytes = rme2::receiver::source_snapshot_bytes(tokens);
+    // Give input tails a different value from the output guard to catch over-copies.
+    d.source_cpu.assign((bytes + 3) / 4, -1);
+    const auto input = rme2::receiver::source_snapshot(d.source_cpu.data(), tokens);
+    const int lengths[][2] = {{0, 0}, {tokens, tokens}, {tokens, 0}, {0, tokens},
+                              {tokens / 2, (tokens + 1) / 2}};
+    input.node_offsets[0] = 0;
+    for (int node = 0; node < 2; ++node) {
+        const int count = lengths[pattern][node];
+        const int first = input.node_offsets[node];
+        input.node_offsets[node + 1] = first + count;
+        for (int i = 0; i < count; ++i) {
+            input.x3[first + i] = tokens - count + i;
+            input.x4[first + i] = uint8_t(1u << ((source + node + pattern) % 8));
+        }
+    }
+    for (int i = 0; i < 8 * tokens; ++i) input.r[i] = int((epoch + i + 8 * source) % 128);
+    check(cudaMemcpyAsync(d.source_device, d.source_cpu.data(), bytes, cudaMemcpyHostToDevice, d.send));
+    std::memset(d.source_host, source_guard, bytes + source_guard_bytes);
+}
+
+void check_source(Device& d, int tokens, bool enabled) {
+    const auto bytes = rme2::receiver::source_snapshot_bytes(tokens);
+    std::vector<int32_t> expected((bytes + source_guard_bytes + 3) / 4);
+    std::memset(expected.data(), source_guard, expected.size() * sizeof(int32_t));
+    if (enabled) {
+        const auto input = rme2::receiver::source_snapshot(d.source_cpu.data(), tokens);
+        const auto out = rme2::receiver::source_snapshot(expected.data(), tokens);
+        std::copy_n(input.node_offsets, 3, out.node_offsets);
+        std::copy_n(input.x3, input.node_offsets[2], out.x3);
+        std::copy_n(input.x4, input.node_offsets[2], out.x4);
+        std::copy_n(input.r, 8 * tokens, out.r);
+    }
+    require(std::memcmp(expected.data(), d.source_host, bytes + source_guard_bytes) == 0,
+            "outgoing source snapshot, unused tail or end guard differs");
+}
 
 void run(int tokens, bool overlap_exchange) {
     using namespace rme2;
@@ -78,8 +127,10 @@ void run(int tokens, bool overlap_exchange) {
         check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&d.mapped_consumer_status), d.consumer_status, 0));
         check(cudaMalloc(reinterpret_cast<void**>(&d.offsets), 129 * 4));
         check(cudaMalloc(reinterpret_cast<void**>(&d.values), capacity * 4));
-        check(cudaMalloc(reinterpret_cast<void**>(&d.nodes), 3 * 4));
-        check(cudaMemset(d.nodes, 0, 3 * 4)); // x3/x4 slices empty in this transport test
+        const auto bytes = receiver::source_snapshot_bytes(tokens);
+        check(cudaMalloc(reinterpret_cast<void**>(&d.source_device), bytes));
+        check(cudaHostAlloc(reinterpret_cast<void**>(&d.source_host), bytes + source_guard_bytes, cudaHostAllocMapped));
+        check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&d.source_mapped), d.source_host, 0));
         check(cudaStreamCreateWithFlags(&d.send, cudaStreamNonBlocking));
         check(cudaStreamCreateWithFlags(&d.receive, cudaStreamNonBlocking));
         check(cudaEventCreateWithFlags(&d.exchange_start, cudaEventDisableTiming));
@@ -111,8 +162,10 @@ void run(int tokens, bool overlap_exchange) {
                 for (int e = 0; e < 128; ++e) d.offsets_cpu[e + 1] += d.offsets_cpu[e];
                 for (int i = 0; i < capacity; ++i)
                     d.values_cpu[i] = int(epoch & 0xffff) * 10000000 + source * 1000000 + i;
-                check(cudaMemcpy(d.offsets, d.offsets_cpu.data(), 129 * 4, cudaMemcpyHostToDevice));
-                check(cudaMemcpy(d.values, d.values_cpu.data(), capacity * 4, cudaMemcpyHostToDevice));
+                // exchange_start orders all three fixture uploads before either receiver gate.
+                check(cudaMemcpyAsync(d.offsets, d.offsets_cpu.data(), 129 * 4, cudaMemcpyHostToDevice, d.send));
+                check(cudaMemcpyAsync(d.values, d.values_cpu.data(), capacity * 4, cudaMemcpyHostToDevice, d.send));
+                prepare_source(d, tokens, source, pattern, epoch);
             }
             // Delay one producer. Early receivers must wait for its current
             // epoch rather than reading last iteration's payload or header.
@@ -124,13 +177,15 @@ void run(int tokens, bool overlap_exchange) {
                 // this iteration's peer publications. No global start barrier.
                 check(cudaEventRecord(d.exchange_start, d.send));
                 if (source == 7) delay<<<1, 1, 0, d.send>>>(d.cycles_per_ms * 5);
+                const auto local = source_copy(d, tokens);
                 launch_exchange_two(peers, source, node, capacity, epoch, d.offsets, d.values,
-                                    d.nodes, nullptr, nullptr, false, true, d.send);
+                                    local.node_offsets, local.x3, local.x4, false, true, d.send);
                 check(cudaGetLastError());
                 check(cudaEventRecord(d.sent, d.send));
                 check(cudaStreamWaitEvent(d.receive, overlap_exchange ? d.exchange_start : d.sent, 0));
                 launch_receiver(d.arena, d.mapped, source, node, capacity, epoch,
-                                d.cycles_per_ms * 10000, d.mapped_results, d.receive);
+                                d.cycles_per_ms * 10000, d.mapped_results, d.receive,
+                                source % 2 == 0 ? local : ReceiverSourceCopy{});
                 check(cudaGetLastError());
                 check(cudaEventRecord(d.received, d.receive));
                 check(cudaStreamWaitEvent(d.send, d.received, 0));
@@ -143,6 +198,7 @@ void run(int tokens, bool overlap_exchange) {
                 check(cudaSetDevice(dest));
                 auto& d = gpu[dest];
                 check(cudaEventSynchronize(d.received));
+                check_source(d, tokens, dest % 2 == 0);
                 // A receiver can now finish before its local exchange. Both
                 // streams must drain before inputs/arenas are reused or freed.
                 check(cudaEventSynchronize(d.sent));
@@ -175,6 +231,8 @@ void run(int tokens, bool overlap_exchange) {
                 route_header[0] = two::x3_x4_magic; route_header[1] = two::version;
                 route_header[2] = int32_t(uint32_t(epoch)); route_header[3] = int32_t(uint32_t(epoch >> 32));
                 route_header[4] = node * 8 + dest; route_header[5] = (1 - node) * 8 + dest;
+                const auto* offsets = receiver::source_snapshot(d.source_cpu.data(), tokens).node_offsets;
+                route_header[6] = offsets[2 - node] - offsets[1 - node];
                 // Includes self, the entire directory, untouched incoming RDMA
                 // bank/x3/x4 receive record, and every unused capacity tail.
                 require(std::equal(expected.begin(), expected.end(), d.host), "payload/guard mismatch");
@@ -185,13 +243,35 @@ void run(int tokens, bool overlap_exchange) {
     auto& d = gpu[0];
     const auto bad_slot = two::record_offset(8 + 1, capacity);
     const int32_t invalid_count = capacity + 1;
-    check(cudaMemcpy(d.arena + bad_slot + 15, &invalid_count, 4, cudaMemcpyHostToDevice));
+    check(cudaMemcpyAsync(d.arena + bad_slot + 15, &invalid_count, sizeof(invalid_count),
+                          cudaMemcpyHostToDevice, d.receive));
     std::fill(d.host, d.host + words, sentinel);
     launch_receiver(d.arena, d.mapped, 0, 1, capacity, epoch, d.cycles_per_ms * 1000,
                     d.mapped_results, d.receive);
     check(cudaStreamSynchronize(d.receive));
     require(d.results[9].error == receiver::record_error, "invalid count was not rejected");
     require(d.host[bad_slot] == sentinel && d.host[9 * two::header_words] == sentinel, "invalid record overwrote host memory");
+    // Reuse the same published inbox and replace only the source offsets.
+    // Rejecting this length must happen before reading x3/x4 beyond capacity.
+    const auto local = source_copy(d, tokens);
+    const int32_t too_long[] = {0, tokens, 2 * tokens + 1};
+    const auto device_source = receiver::source_snapshot(d.source_device, tokens);
+    check(cudaMemcpyAsync(device_source.node_offsets, too_long, sizeof(too_long),
+                          cudaMemcpyHostToDevice, d.receive));
+    std::memset(d.source_host, source_guard, receiver::source_snapshot_bytes(tokens) + source_guard_bytes);
+    launch_receiver(d.arena, d.mapped, 0, 1, capacity, epoch, d.cycles_per_ms * 1000,
+                    d.mapped_results, d.receive, local);
+    check(cudaStreamSynchronize(d.receive));
+    const auto snapshot = receiver::source_snapshot(d.source_host, tokens);
+    require(std::equal(too_long, too_long + 3, snapshot.node_offsets) &&
+            !receiver::valid_source_offsets(snapshot.node_offsets[0], snapshot.node_offsets[1],
+                                            snapshot.node_offsets[2], tokens),
+            "invalid source node offsets were not exposed for rejection");
+    const auto* x3_bytes = reinterpret_cast<const uint8_t*>(snapshot.x3);
+    const auto guard_intact = [](uint8_t b) { return b == source_guard; };
+    require(std::all_of(x3_bytes, x3_bytes + 2 * tokens * sizeof(int32_t), guard_intact) &&
+            std::all_of(snapshot.x4, snapshot.x4 + 2 * tokens, guard_intact),
+            "invalid source offsets overwrote pinned x3/x4");
     std::fill(d.host, d.host + words, sentinel);
     launch_receiver(d.arena, d.mapped, 0, 1, capacity, epoch + 1, d.cycles_per_ms * 5,
                     d.mapped_results, d.receive);
@@ -208,7 +288,8 @@ void run(int tokens, bool overlap_exchange) {
         check(cudaEventDestroy(item.sent)); check(cudaEventDestroy(item.received));
         check(cudaEventDestroy(item.exchange_start)); check(cudaEventDestroy(item.consumed));
         check(cudaFree(item.arena)); check(cudaFree(item.offsets));
-        check(cudaFree(item.values)); check(cudaFree(item.nodes));
+        check(cudaFree(item.values)); check(cudaFree(item.source_device));
+        check(cudaFreeHost(item.source_host));
         check(cudaFreeHost(item.host)); check(cudaFreeHost(item.results));
         check(cudaFreeHost(item.consumer_status));
     }

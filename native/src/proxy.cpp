@@ -550,7 +550,7 @@ bool Proxy::routing_install_required(uint64_t iteration) const {
     if (!initialized_) throw std::runtime_error("proxy is not initialized");
     if (!config_.router_dynamic_routing_enabled) return false;
     if (routing_failed_) throw std::runtime_error("iteration routing previously failed");
-    if (iteration != completed_routing_iterations_ ||
+    if (iteration != completed_routing_iterations_.load() ||
         (config_.num_iterations && iteration >= config_.num_iterations))
         throw std::runtime_error("iteration routing requires the next consecutive iteration");
     if (routing_iteration_ == iteration) return false;
@@ -580,10 +580,21 @@ void Proxy::prepare_routing(uint64_t iteration) {
 }
 
 void Proxy::install_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff) {
+    install_benchmark_routing_impl(iteration, handoff, false);
+}
+
+void Proxy::install_borrowed_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff) {
+    install_benchmark_routing_impl(iteration, handoff, true);
+}
+
+void Proxy::install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff,
+                                           bool borrow_expert_lists) {
     if (!config_.router_benchmark_metadata_enabled)
         throw std::runtime_error("benchmark metadata handoff is disabled");
     if (!routing_install_required(iteration))
         throw std::runtime_error("benchmark routing already installed for this iteration");
+    if (benchmark_expert_lists_borrowed_)
+        throw std::runtime_error("retire the previous borrowed benchmark routing before installing its successor");
     const int world = config_.num_nodes * config_.num_gpus_per_node;
     if (handoff.struct_size < sizeof(handoff) || handoff.num_sources != world || !handoff.sources)
         throw std::runtime_error("invalid benchmark routing descriptor or source count");
@@ -620,14 +631,30 @@ void Proxy::install_benchmark_routing(uint64_t iteration, const RdmaProxyBenchma
         table.first_global_expert = (config_.node_rank * config_.num_gpus_per_node + config_.local_gpu_index) * experts;
         table.num_tokens = config_.num_tokens;
         table.top_k = config_.router_top_k;
-        table.expert_offsets.assign(view.offsets, view.offsets + experts + 1);
-        if (view.count) table.expert_token_indices.assign(view.indices, view.indices + view.count);
+        if (borrow_expert_lists) {
+            table.borrow_expert_lists(view.offsets, view.indices, view.count);
+        } else {
+            table.expert_offsets.assign(view.offsets, view.offsets + experts + 1);
+            if (view.count) table.expert_token_indices.assign(view.indices, view.indices + view.count);
+        }
     }
     route.source->initialize_benchmark(handoff.device_r, handoff.device_node_offsets, handoff.device_x3,
                                        handoff.device_x4);
-    // The benchmark has retired both its metadata worker and the local staging
-    // gather before handing out these views. Only owned host snapshots survive.
+    // From this point a partial install may already have retained source pointers.
+    // Shutdown retires these as well if the installation fails.
+    benchmark_expert_lists_borrowed_ = borrow_expert_lists;
     install_iteration_routing(iteration, std::move(route));
+}
+
+void Proxy::retire_borrowed_benchmark_routing(uint64_t iteration) {
+    if (!initialized_ || routing_failed_ || !benchmark_expert_lists_borrowed_ ||
+        routing_iteration_ != iteration || completed_routing_iterations_.load() <= iteration)
+        throw std::runtime_error("retirement requires the completed iteration's active borrowed benchmark routing");
+    // The last forwarding scan may already hold a shared lock. Once it exits,
+    // subsequent scans skip this completed generation while the payload is idle.
+    std::unique_lock<std::shared_mutex> lock(forwarding_routes_mutex_);
+    cuda_buffers_.retire_borrowed_expert_metadata();
+    benchmark_expert_lists_borrowed_ = false;
 }
 
 void Proxy::install_iteration_routing(uint64_t iteration, IterationRouteData route) {
@@ -779,11 +806,11 @@ void Proxy::run_iteration_step(uint64_t iteration) {
     run_iteration(iteration);
     finish_rdma_returns();
     synchronize_iteration(iteration);
+    iteration_prepared_ = false;
     if (config_.router_dynamic_routing_enabled) {
         dynamic_payload_active_.store(false);
         ++completed_routing_iterations_;
     }
-    iteration_prepared_ = false;
 }
 
 void Proxy::record_router_computation_end(
@@ -912,7 +939,7 @@ std::vector<uint8_t> Proxy::intra_node_source_masks(int source_node) const {
 std::shared_lock<std::shared_mutex> Proxy::lock_installed_combine_route() const {
     auto routes_lock = lock_forwarding_routes();
     if (!initialized_ || !config_.router_dynamic_routing_enabled || iteration_prepared_ ||
-        routing_failed_ || routing_iteration_ != completed_routing_iterations_)
+        routing_failed_ || routing_iteration_ != completed_routing_iterations_.load())
         throw std::runtime_error("combine rows require a freshly installed, idle dynamic route");
     return routes_lock;
 }
@@ -1101,6 +1128,10 @@ void Proxy::shutdown() {
         throw;
     }
     cuda_buffers_.stop_cpu_scatter_worker();
+    if (benchmark_expert_lists_borrowed_) {
+        cuda_buffers_.retire_borrowed_expert_metadata();
+        benchmark_expert_lists_borrowed_ = false;
+    }
     return_group_progress_.shutdown_publication();
     down_ready_trace_.drain_returns();
     for (auto& peer : peers_) {

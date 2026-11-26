@@ -193,9 +193,9 @@ RDMA_PROXY_C_API int rdma_proxy_prepare_routing(RdmaProxyHandle* handle, uint64_
  * entries, and count is the compact index count. remote_x3/x4 describes the
  * same-local-GPU peer's incoming payload (one destination mask per token).
  * The four device arrays belong to this rank's completed metadata graph.
- * Complete exchange and local input staging before install. Pointers are
- * borrowed only for the synchronous call. Install once per retired epoch's
- * successor, including epoch zero, before preparing or launching compute. */
+ * Complete exchange and local input staging before install. Install once per
+ * retired epoch's successor, including epoch zero, before preparing or
+ * launching compute. The install functions below specify pointer lifetimes. */
 typedef struct RdmaProxyBenchmarkSource {
     const int32_t* offsets;
     const int32_t* indices;
@@ -222,8 +222,21 @@ typedef struct RdmaProxyBenchmarkConfig {
 RDMA_PROXY_C_API int rdma_proxy_benchmark_metadata_enabled(RdmaProxyHandle* handle, int32_t* enabled);
 RDMA_PROXY_C_API int rdma_proxy_get_benchmark_routing_config(
     RdmaProxyHandle* handle, RdmaProxyBenchmarkConfig* config);
+/* All input pointers are borrowed only for this synchronous call. */
 RDMA_PROXY_C_API int rdma_proxy_install_benchmark_routing(
     RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing);
+/* Supply pinned host indices for direct GPU uploads on CUDA backends.
+ * Keep the source offsets and indices readable and immutable until successful
+ * retirement or successful payload proxy shutdown, including after a partial
+ * installation failure. All other inputs, including the sources descriptor
+ * array, are borrowed only during this call.
+ * Serialize benchmark routing control calls on each handle. */
+RDMA_PROXY_C_API int rdma_proxy_install_borrowed_benchmark_routing(
+    RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing);
+/* Call after run_iteration and any external consumers of this iteration have
+ * completed. Drains the remaining native readers. Retire on every rank before
+ * any rank starts the next exchange or otherwise reuses the records. */
+RDMA_PROXY_C_API int rdma_proxy_retire_borrowed_benchmark_routing(RdmaProxyHandle* handle, uint64_t iteration);
 RDMA_PROXY_C_API int rdma_proxy_get_routing_extents(
     RdmaProxyHandle* handle, uint64_t* indices_per_source, uint64_t* table_rows);
 

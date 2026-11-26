@@ -16,6 +16,7 @@ class ProviderTests(unittest.TestCase):
         p.handle = 3
         p.closed = p.failed = p.owns_group = p.exposed = p.connected = False
         p.next_iteration = 0
+        p.retire_routing = None
         p.last_stats = {}
         p.group = None
         p.session = None
@@ -82,12 +83,32 @@ class ProviderTests(unittest.TestCase):
             return 0
         p.session = SimpleNamespace(handle=4, check=lambda s: self.assertEqual(s, 0),
                                     lib=SimpleNamespace(rme2_view=view, rme2_x3_x4_view=x3_view))
-        p.library = SimpleNamespace(rdma_proxy_install_benchmark_routing=install)
+        p.install_routing = install
         def device(i):
             return SimpleNamespace(data_ptr=lambda: 2**40 + i)
         p.r = device(0)
         p.plan = SimpleNamespace(node_offsets=device(1), x3=device(2), x4=device(3))
         p._install(7)
+
+    def test_borrowed_install_requires_both_native_entry_points(self):
+        for has_install in (False, True):
+            for has_retire in (False, True):
+                with self.subTest(has_install=has_install, has_retire=has_retire):
+                    p = self.provider()
+                    lib = p.library = SimpleNamespace(rdma_proxy_get_benchmark_routing_config=MagicMock(),
+                                                      rdma_proxy_get_routing_extents=MagicMock(),
+                                                      rdma_proxy_install_benchmark_routing=MagicMock())
+                    if has_install:
+                        lib.rdma_proxy_install_borrowed_benchmark_routing = MagicMock()
+                    if has_retire:
+                        lib.rdma_proxy_retire_borrowed_benchmark_routing = MagicMock()
+                    p._bind()
+                    if has_install and has_retire:
+                        self.assertIs(p.install_routing, lib.rdma_proxy_install_borrowed_benchmark_routing)
+                        self.assertIs(p.retire_routing, lib.rdma_proxy_retire_borrowed_benchmark_routing)
+                    else:
+                        self.assertIs(p.install_routing, lib.rdma_proxy_install_benchmark_routing)
+                        self.assertIsNone(p.retire_routing)
 
     def test_timed_windows_fork_after_r_ready_and_join_before_release(self):
         p = self.provider()
@@ -106,6 +127,10 @@ class ProviderTests(unittest.TestCase):
             C.cast(r, C.POINTER(C.c_uint64))[0] = 4
             return 0
         p.library = SimpleNamespace(rdma_proxy_get_routing_extents=extents)
+        def retire(handle, iteration):
+            events.append(("retire", handle, iteration))
+            return 0
+        p.retire_routing = retire
         with patch.object(backend.time, "perf_counter_ns", side_effect=[100, 130, 145, 190, 215, 219]):
             self.assertEqual(p.prepare(0), ((18, 4), 119))
         self.assertEqual(events, [("R", 0), "R complete", "world", ("rme2", 1),
@@ -115,10 +140,31 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(p.last_stats["install_elapsed_ns"], 25)
         self.assertEqual(p.last_stats["r_ready_to_install_elapsed_ns"], 85)
         self.assertEqual(p.last_stats["reuse_barrier_ns"], 15)
+        self.assertEqual(p.last_stats["retire_elapsed_ns"], 0)
         self.assertEqual(p.last_stats["release_barrier_ns"], 4)
         self.assertEqual(p.last_stats["rme2_stats"]["metadata_gpu_ms"], 0.125)
         with self.assertRaisesRegex(RuntimeError, "consecutive"):
             p.prepare(0)
+        events.clear()
+        with patch.object(backend.time, "perf_counter_ns", side_effect=[220, 235, 240, 250, 272, 292, 300]):
+            self.assertEqual(p.prepare(1), ((18, 4), 80))
+        self.assertEqual(events, [("R", 1), "R complete", ("retire", 3, 0), "world", ("rme2", 2),
+                                  "rme2 complete", ("install", 1), "world"])
+        self.assertEqual(p.last_stats["retire_elapsed_ns"], 5)
+        self.assertEqual(p.last_stats["reuse_barrier_ns"], 10)
+
+    def test_failed_retirement_prevents_reuse(self):
+        p = self.provider()
+        p.next_iteration = 1
+        p._generate, p.stream, p._barrier, p.session = MagicMock(), MagicMock(), MagicMock(), MagicMock()
+        p.retire_routing = MagicMock(return_value=-1)
+        p.library = SimpleNamespace(rdma_proxy_last_error=lambda: b"payload still active")
+        with self.assertRaisesRegex(RuntimeError, "payload still active"):
+            p.prepare(1)
+        p.retire_routing.assert_called_once_with(p.handle, 0)
+        p._barrier.assert_not_called()
+        p.session.submit.assert_not_called()
+        self.assertTrue(p.failed)
 
     def test_borrowed_default_group_survives_clean_disconnect(self):
         p = self.provider()

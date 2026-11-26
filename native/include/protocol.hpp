@@ -57,8 +57,23 @@ struct RouterX3Metadata {
     std::vector<uint8_t> token_masks;
 };
 
+// A read-only range over either owned or iteration-borrowed routing records.
+struct ExpertIndexView {
+    using value_type = int32_t;
+    const int32_t* entries;
+    std::size_t count;
+
+    const int32_t* data() const { return entries; }
+    std::size_t size() const { return count; }
+    const int32_t* begin() const { return entries; }
+    const int32_t* end() const { return count ? entries + count : entries; }
+    int32_t operator[](std::size_t index) const { return entries[index]; }
+    int32_t front() const { return entries[0]; }
+    int32_t back() const { return entries[count - 1]; }
+};
+
 // Source-specific expert lookup table for one destination GPU. Offsets are
-// normalized to the packed expert_token_indices vector and describe exactly
+// normalized to the packed token indices and describe exactly
 // experts_per_gpu consecutive experts starting at first_global_expert.
 struct RouterExpertMetadata {
     int source_node_rank{-1};
@@ -77,6 +92,26 @@ struct RouterExpertMetadata {
     bool weighted_contributions{false};
     // Immutable FP32 weights aligned with A_idx list positions, not token IDs.
     std::vector<float> expert_route_weights;
+
+    void borrow_expert_lists(const int32_t* offsets, const int32_t* indices, std::size_t count) {
+        borrowed_offsets_ = offsets;
+        borrowed_indices_ = {indices, count};
+    }
+    bool has_borrowed_expert_lists() const { return borrowed_offsets_ != nullptr; }
+    ExpertIndexView offsets_view() const {
+        if (has_borrowed_expert_lists())
+            return {borrowed_offsets_, static_cast<std::size_t>(experts_per_gpu) + 1};
+        return {expert_offsets.data(), expert_offsets.size()};
+    }
+    ExpertIndexView indices_view() const {
+        if (has_borrowed_expert_lists()) return borrowed_indices_;
+        return {expert_token_indices.data(), expert_token_indices.size()};
+    }
+
+private:
+    // The caller keeps both spans immutable through generation retirement.
+    const int32_t* borrowed_offsets_{nullptr};
+    ExpertIndexView borrowed_indices_{nullptr, 0};
 };
 
 // Return traffic has its own immediate namespace; forward marker remains UINT32_MAX.

@@ -193,8 +193,11 @@ int main(int argc, char** argv) {
     if (rdma_proxy_benchmark_metadata_enabled(handle, &benchmark_enabled) || benchmark_enabled ||
         rdma_proxy_benchmark_metadata_enabled(nullptr, &benchmark_enabled) == 0 ||
         rdma_proxy_get_benchmark_routing_config(handle, &benchmark_config) == 0 ||
-        rdma_proxy_install_benchmark_routing(handle, 0, nullptr) == 0) {
-        std::cerr << "invalid benchmark metadata query or install accepted\n";
+        rdma_proxy_install_benchmark_routing(handle, 0, nullptr) == 0 ||
+        rdma_proxy_install_borrowed_benchmark_routing(handle, 0, nullptr) == 0 ||
+        rdma_proxy_retire_borrowed_benchmark_routing(nullptr, 0) == 0 ||
+        rdma_proxy_retire_borrowed_benchmark_routing(handle, 0) == 0) {
+        std::cerr << "invalid benchmark metadata query, install or retirement accepted\n";
         return 1;
     }
     {

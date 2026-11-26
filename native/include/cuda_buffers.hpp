@@ -241,6 +241,8 @@ public:
     void install_expert_metadata(RouterExpertMetadata metadata);
     // Called between generations, after all consumers and forward workers retire.
     void install_iteration_expert_metadata(std::vector<RouterExpertMetadata> tables, uint64_t iteration);
+    // Called with forwarding readers excluded, before exchange slots can be overwritten.
+    void retire_borrowed_expert_metadata();
     RouterExpertTokenHeadState expert_token_head_state_for_source(
         int source_node_rank,
         int source_gpu_index) const;
@@ -314,6 +316,8 @@ private:
     void clear_iteration_cpu_scatter();
     void initialize_router_computation_scheduler_locked();
     uint64_t metadata_generations_installed_{0};
+    void finish_borrowed_index_uploads();
+    bool borrowed_index_uploads_pending_{false};
     bool is_router_computation_input(const NvlinkReceiveBuffer& buffer) const;
     void reset_router_computation_iteration_locked(uint64_t iteration);
     void update_expert_token_heads_locked(

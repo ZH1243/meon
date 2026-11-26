@@ -97,13 +97,21 @@ class BenchmarkMetadataBackend:
             raise
 
     def _bind(self):
+        install = getattr(self.library, "rdma_proxy_install_borrowed_benchmark_routing", None)
+        retire = getattr(self.library, "rdma_proxy_retire_borrowed_benchmark_routing", None)
+        if install is None or retire is None:
+            install = self.library.rdma_proxy_install_benchmark_routing
+            retire = None
+        self.install_routing = install
+        self.retire_routing = retire
+        if retire is not None:
+            retire.argtypes, retire.restype = [C.c_void_p, C.c_uint64], C.c_int
         calls = (
-            ("rdma_proxy_get_benchmark_routing_config", [C.c_void_p, C.POINTER(BenchmarkConfig)]),
-            ("rdma_proxy_install_benchmark_routing", [C.c_void_p, C.c_uint64, C.POINTER(BenchmarkRouting)]),
-            ("rdma_proxy_get_routing_extents", [C.c_void_p, C.POINTER(C.c_uint64), C.POINTER(C.c_uint64)]),
+            (self.library.rdma_proxy_get_benchmark_routing_config, [C.c_void_p, C.POINTER(BenchmarkConfig)]),
+            (install, [C.c_void_p, C.c_uint64, C.POINTER(BenchmarkRouting)]),
+            (self.library.rdma_proxy_get_routing_extents, [C.c_void_p, C.POINTER(C.c_uint64), C.POINTER(C.c_uint64)]),
         )
-        for name, args in calls:
-            fn = getattr(self.library, name)
+        for fn, args in calls:
             fn.argtypes, fn.restype = args, C.c_int
 
     def _check(self, status, operation):
@@ -254,7 +262,7 @@ class BenchmarkMetadataBackend:
         record = BenchmarkRouting(C.sizeof(BenchmarkRouting), 16, sources, x3, x4, count.value,
                                   self.r.data_ptr(), self.plan.node_offsets.data_ptr(),
                                   self.plan.x3.data_ptr(), self.plan.x4.data_ptr())
-        self._check(self.library.rdma_proxy_install_benchmark_routing(self.handle, iteration, C.byref(record)),
+        self._check(self.install_routing(self.handle, iteration, C.byref(record)),
                     "installing benchmark routing in the payload proxy")
 
     def prepare(self, iteration, *, compute_extents=True):
@@ -265,9 +273,13 @@ class BenchmarkMetadataBackend:
             self._generate(iteration)
             self.stream.synchronize()
             r_ready = time.perf_counter_ns()
-            # Only rank-local R changed above. Align as in the benchmark, and
-            # prove every previous payload reader retired before reusing its
-            # IPC arenas, pinned records, and actual local staging destination.
+            # A peer can RDMA-write our pinned records as soon as it submits.
+            # Drain local readers before any rank can leave the reuse barrier.
+            reuse_start = r_ready
+            if iteration and self.retire_routing is not None:
+                self._check(self.retire_routing(self.handle, iteration - 1),
+                            "retiring the previous benchmark expert lists")
+                reuse_start = time.perf_counter_ns()
             self._barrier()
             exchange_start = time.perf_counter_ns()
             self.session.submit(iteration + 1, self.plan, self.stream)
@@ -287,7 +299,8 @@ class BenchmarkMetadataBackend:
                 "r_ready_ns": r_ready, "generation_elapsed_ns": r_ready - started,
                 "exchange_staging_elapsed_ns": exchanged - exchange_start, "install_elapsed_ns": installed - exchanged,
                 "r_ready_to_install_elapsed_ns": installed - r_ready,
-                "reuse_barrier_ns": exchange_start - r_ready, "release_barrier_ns": released - installed,
+                "retire_elapsed_ns": reuse_start - r_ready, "reuse_barrier_ns": exchange_start - reuse_start,
+                "release_barrier_ns": released - installed,
                 "rme2_stats": native_stats,
             }
             self.next_iteration += 1
@@ -297,6 +310,7 @@ class BenchmarkMetadataBackend:
             raise
 
     def close(self, clean=True):
+        """A clean close requires confirmed payload shutdown, including its final expert-list readers."""
         if self.closed:
             return
         self.closed = True

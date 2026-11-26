@@ -151,6 +151,8 @@ if(RDMA_PROXY_BUILD_TESTS)
   add_executable(test_dynamic_gather tests/native/test_dynamic_gather.cpp)
   target_link_libraries(test_dynamic_gather PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_dynamic_gather COMMAND test_dynamic_gather)
+  add_test(NAME test_borrowed_routing_upload_cuda COMMAND test_dynamic_gather --cuda)
+  set_tests_properties(test_borrowed_routing_upload_cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 
   add_executable(test_forwarding_rounds tests/native/test_forwarding_rounds.cpp)
   target_include_directories(test_forwarding_rounds PRIVATE native/include)

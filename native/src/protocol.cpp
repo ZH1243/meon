@@ -196,19 +196,18 @@ RouterX3Metadata deserialize_router_x3_metadata(
 
 std::string serialize_router_expert_metadata(
     const RouterExpertMetadata& metadata) {
-    if (metadata.experts_per_gpu <= 0 ||
-        metadata.expert_offsets.size() !=
-            static_cast<std::size_t>(metadata.experts_per_gpu + 1)) {
+    const auto offsets = metadata.offsets_view();
+    const auto indices = metadata.indices_view();
+    if (metadata.experts_per_gpu <= 0 || offsets.size() !=
+            static_cast<std::size_t>(metadata.experts_per_gpu) + 1) {
         throw std::runtime_error("router expert metadata offset count is invalid");
     }
-    if (metadata.expert_offsets.front() != 0 ||
-        metadata.expert_offsets.back() < 0 ||
-        static_cast<std::size_t>(metadata.expert_offsets.back()) !=
-            metadata.expert_token_indices.size()) {
+    if (offsets.front() != 0 || offsets.back() < 0 ||
+        static_cast<std::size_t>(offsets.back()) != indices.size()) {
         throw std::runtime_error("router expert metadata offset endpoints are invalid");
     }
-    for (std::size_t i = 1; i < metadata.expert_offsets.size(); ++i) {
-        if (metadata.expert_offsets[i] < metadata.expert_offsets[i - 1]) {
+    for (std::size_t i = 1; i < offsets.size(); ++i) {
+        if (offsets[i] < offsets[i - 1]) {
             throw std::runtime_error("router expert metadata offsets are not monotonic");
         }
     }
@@ -216,7 +215,7 @@ std::string serialize_router_expert_metadata(
     if (metadata.top_k <= 0 || metadata.top_k > metadata.num_experts)
         throw std::runtime_error("router expert metadata top_k is invalid");
     if (metadata.expert_route_weights.size() !=
-        (metadata.weighted_contributions ? metadata.expert_token_indices.size() : 0))
+        (metadata.weighted_contributions ? indices.size() : 0))
         throw std::runtime_error("router expert weight count does not match routing mode");
     for (float weight : metadata.expert_route_weights)
         if (!std::isfinite(weight) || weight < 0.0f)
@@ -233,11 +232,11 @@ std::string serialize_router_expert_metadata(
         << metadata.experts_per_gpu << ' '
         << metadata.first_global_expert << ' '
         << metadata.num_tokens << ' '
-        << metadata.expert_token_indices.size() << ' '
+        << indices.size() << ' '
         << (metadata.weighted_contributions ? 1 : 0) << ' '
         << metadata.expert_route_weights.size() << ' ' << metadata.top_k;
-    for (const auto offset : metadata.expert_offsets) out << ' ' << offset;
-    for (const auto index : metadata.expert_token_indices) out << ' ' << index;
+    for (const auto offset : offsets) out << ' ' << offset;
+    for (const auto index : indices) out << ' ' << index;
     // Decimal uint32 bit patterns preserve every FP32 bit without text rounding.
     static_assert(sizeof(float) == sizeof(uint32_t) && std::numeric_limits<float>::is_iec559,
                   "router protocol requires IEEE binary32");

@@ -8,7 +8,7 @@ import tempfile
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 import rdma_proxy_worker as worker
@@ -98,7 +98,8 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                     raise RuntimeError("injected exchange failure")
                 self.last_stats = dict(r_ready_ns=time.perf_counter_ns(), generation_elapsed_ns=1000,
                                        exchange_staging_elapsed_ns=2000, install_elapsed_ns=3000,
-                                       r_ready_to_install_elapsed_ns=5000, reuse_barrier_ns=0, release_barrier_ns=0)
+                                       r_ready_to_install_elapsed_ns=5000, retire_elapsed_ns=100,
+                                       reuse_barrier_ns=0, release_barrier_ns=0)
                 return ((1, 1 - epoch) if compute_extents else None), 6000
 
             def close(self, *, clean):
@@ -156,6 +157,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                                   ("install", 1), ("prepare", 1), ("payload", 1), ("finish",),
                                   ("shutdown",), ("close", True), ("destroy",)])
         self.assertIn("phase=steady generation_us=1.000 exchange_staging_us=2.000 install_us=3.000", result)
+        self.assertIn("retire_us=0.100", result)
         self.assertNotIn("r_ready_to_up_submit_us", result)
 
     def test_up_uses_current_route_and_timing_is_only_for_actual_launches(self):
@@ -177,6 +179,14 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
         events, _ = self.run_worker(fail_epoch=1)
         self.assertEqual(events[-4:], [("install", 1), ("shutdown",), ("close", False), ("destroy",)])
         self.assertNotIn(("prepare", 1), events)
+
+    def test_interrupted_payload_shutdown_keeps_borrowed_storage_alive(self):
+        library, provider = Mock(), Mock()
+        library.rdma_proxy_shutdown.side_effect = KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            worker.shutdown_embedded_proxy(library, 1, None, True, True, benchmark_metadata=provider)
+        provider.close.assert_called_once_with(clean=False)
+        library.rdma_proxy_destroy.assert_called_once_with(1)
 
     def test_threaded_scatter_reserves_before_first_route_counts_are_available(self):
         for mode, tiled, has_api, expected in (

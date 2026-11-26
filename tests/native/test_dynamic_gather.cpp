@@ -1,9 +1,13 @@
 #include "cuda_buffers.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
-#include <numeric>
+#include <iostream>
+#include <memory>
+#include <new>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace rdma_proxy;
@@ -26,7 +30,7 @@ static RouterExpertMetadata table(int source, const std::vector<int32_t>& rows) 
     return m;
 }
 
-int main() {
+static ProxyConfig gather_config() {
     ProxyConfig c;
     c.mock_mode = c.router_routing_enabled = c.router_dynamic_routing_enabled = true;
     c.router_local_input_staging_enabled = c.nvlink_forwarding_enabled = true;
@@ -39,6 +43,10 @@ int main() {
     c.num_tokens = 7;
     c.token_dimension = c.expert_gemm_dimension = c.expert_gemm_n_tile = 1;
     c.expert_gemm_m_tile = 2;
+    return c;
+}
+
+static void check_mock_gather(const ProxyConfig& c) {
     CudaBuffers buffers(c);
     buffers.initialize();
     // Include an initially empty GPU, growth, same-size rerouting, then shrink.
@@ -78,4 +86,87 @@ int main() {
         assert(*ready == static_cast<int32_t>(pub.table_rows));
         assert(std::equal(rows.begin(), rows.end(), static_cast<const int32_t*>(pooled_indices)));
     }
+}
+
+struct TestRecords {
+    std::array<int32_t, 4> rows{1, 2, 4, 6};
+    std::array<int32_t, 2> full_offsets{0, 4}, shrinking_offsets{0, 0};
+    std::array<int32_t, 4> readback{};
+};
+
+#if RDMA_PROXY_HAVE_CUDA
+static void check_cuda(cudaError_t status) {
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+}
+#endif
+
+// The source slot contains old rows beyond its new count. A second logical
+// source keeps the padded device extent at four throughout the test.
+static void check_borrowed_upload(ProxyConfig c, TestRecords& records) {
+    c.router_weighted_contributions_enabled = false;
+    CudaBuffers buffers(c);
+    buffers.initialize();
+    const auto destroy_stream = [&](void* stream) { destroy_cuda_stream(stream, c.mock_mode); };
+    std::unique_ptr<void, decltype(destroy_stream)> consumer(
+        create_cuda_stream(c.cuda_device_id, true, c.mock_mode), destroy_stream);
+    const int32_t shrinking_counts[] = {4, 2, 0};
+    for (std::size_t iteration = 0; iteration < 3; ++iteration) {
+        const auto count = static_cast<std::size_t>(shrinking_counts[iteration]);
+        records.shrinking_offsets[1] = shrinking_counts[iteration];
+        auto full = table(0, {});
+        full.weighted_contributions = false;
+        auto shrinking = full;
+        shrinking.source_gpu_index = 1;
+        full.borrow_expert_lists(records.full_offsets.data(), records.rows.data(), records.rows.size());
+        shrinking.borrow_expert_lists(records.shrinking_offsets.data(), count ? records.rows.data() : nullptr, count);
+        buffers.install_iteration_expert_metadata({full, shrinking}, iteration);
+
+        const auto& source = buffers.nvlink_receive_buffer_for_source(0, 1);
+        const auto* device = static_cast<const int32_t*>(source.expert_token_indices_device.ptr);
+        if (c.mock_mode) {
+            std::copy_n(device, records.readback.size(), records.readback.begin());
+        } else {
+#if RDMA_PROXY_HAVE_CUDA
+            // The real consumer can use the indices immediately after install.
+            // A nonblocking stream has no implicit dependency on the uploader.
+            check_cuda(cudaMemcpyAsync(records.readback.data(), device, sizeof(records.readback),
+                                       cudaMemcpyDeviceToHost, static_cast<cudaStream_t>(consumer.get())));
+            synchronize_cuda_stream(consumer.get(), false);
+#endif
+        }
+        buffers.retire_borrowed_expert_metadata();
+        if (!std::equal(records.rows.begin(), records.rows.begin() + count, records.readback.begin()) ||
+            !std::all_of(records.readback.begin() + count, records.readback.end(),
+                         [](int32_t row) { return row == 0; }))
+            throw std::runtime_error("borrowed A_idx has an incorrect prefix or stale padding");
+    }
+}
+
+int main(int argc, char** argv) try {
+    auto config = gather_config();
+    if (argc == 2 && std::string(argv[1]) == "--cuda") {
+#if RDMA_PROXY_HAVE_CUDA
+        int devices = 0;
+        if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+        config.mock_mode = false;
+        check_cuda(cudaSetDevice(config.cuda_device_id));
+        void* memory = nullptr;
+        check_cuda(cudaMallocHost(&memory, sizeof(TestRecords)));
+        std::unique_ptr<void, decltype(&cudaFreeHost)> owner(memory, cudaFreeHost);
+        // TestRecords is trivially destructible. Its pinned backing outlives
+        // CudaBuffers, including cleanup after a partially completed upload.
+        auto* records = new (memory) TestRecords{};
+        check_borrowed_upload(config, *records);
+#else
+        return 77;
+#endif
+    } else {
+        check_mock_gather(config);
+        TestRecords records;
+        check_borrowed_upload(config, records);
+    }
+    return 0;
+} catch (const std::exception& error) {
+    std::cerr << error.what() << '\n';
+    return 1;
 }

@@ -1673,16 +1673,19 @@ def shutdown_embedded_proxy(library, handle, buffers, initialized, success, retu
     pools = buffers.tensors_of_kind(DEVICE_BUFFER_INPUT_POOL) if buffers is not None else []
     error = None
     backend_error = None
+    payload_stopped = False
     try:
         # A partially initialized proxy can already have exported its pool.
-        if (initialized or pools) and library.rdma_proxy_shutdown(handle) != 0:
-            error = proxy_last_error(library)
-            _unclosed_input_pools.extend(pools)
-            print(f"proxy shutdown failed: {error}", file=sys.stderr, flush=True)
+        if initialized or pools:
+            payload_stopped = library.rdma_proxy_shutdown(handle) == 0
+            if not payload_stopped:
+                error = proxy_last_error(library)
+                _unclosed_input_pools.extend(pools)
+                print(f"proxy shutdown failed: {error}", file=sys.stderr, flush=True)
     finally:
         try:
             if benchmark_metadata is not None:
-                benchmark_metadata.close(clean=success and error is None)
+                benchmark_metadata.close(clean=success and payload_stopped)
         except Exception as exc:
             backend_error = exc
             print(f"benchmark metadata shutdown failed: {exc}", file=sys.stderr, flush=True)
@@ -1849,6 +1852,7 @@ def print_benchmark_routing(node, gpu, iteration, elapsed_ns, stats, up_submitte
           f"exchange_staging_us={stats['exchange_staging_elapsed_ns'] / 1000:.3f} "
           f"install_us={stats['install_elapsed_ns'] / 1000:.3f} "
           f"r_ready_to_install_us={stats['r_ready_to_install_elapsed_ns'] / 1000:.3f} "
+          f"retire_us={stats['retire_elapsed_ns'] / 1000:.3f} "
           f"reuse_barrier_us={stats['reuse_barrier_ns'] / 1000:.3f} "
           f"release_barrier_us={stats['release_barrier_ns'] / 1000:.3f}{submit}",
           flush=True)

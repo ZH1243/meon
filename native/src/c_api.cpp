@@ -449,8 +449,8 @@ extern "C" int rdma_proxy_get_benchmark_routing_config(
     return 0;
 }
 
-extern "C" int rdma_proxy_install_benchmark_routing(
-    RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing) {
+static int install_benchmark_routing(RdmaProxyHandle* handle, uint64_t iteration,
+                                     const RdmaProxyBenchmarkRouting* routing, bool borrow_expert_lists) {
     clear_error();
     if (!handle || !handle->initialized || handle->shut_down || handle->finished ||
         !handle->config.router_benchmark_metadata_enabled || iteration != handle->next_iteration ||
@@ -460,7 +460,35 @@ extern "C" int rdma_proxy_install_benchmark_routing(
     }
     try {
         select_proxy_cuda_device(*handle);
-        handle->proxy.install_benchmark_routing(iteration, *routing);
+        if (borrow_expert_lists)
+            handle->proxy.install_borrowed_benchmark_routing(iteration, *routing);
+        else
+            handle->proxy.install_benchmark_routing(iteration, *routing);
+        return 0;
+    } catch (...) {
+        return record_current_exception();
+    }
+}
+
+extern "C" int rdma_proxy_install_benchmark_routing(
+    RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing) {
+    return install_benchmark_routing(handle, iteration, routing, false);
+}
+
+extern "C" int rdma_proxy_install_borrowed_benchmark_routing(
+    RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing) {
+    return install_benchmark_routing(handle, iteration, routing, true);
+}
+
+extern "C" int rdma_proxy_retire_borrowed_benchmark_routing(RdmaProxyHandle* handle, uint64_t iteration) {
+    clear_error();
+    if (!handle || !handle->initialized || handle->shut_down || !handle->config.router_benchmark_metadata_enabled) {
+        last_error = "benchmark routing retirement requires an initialized benchmark proxy";
+        return -1;
+    }
+    try {
+        select_proxy_cuda_device(*handle);
+        handle->proxy.retire_borrowed_benchmark_routing(iteration);
         return 0;
     } catch (...) {
         return record_current_exception();

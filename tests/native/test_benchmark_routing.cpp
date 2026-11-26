@@ -20,9 +20,17 @@ struct Rank {
     uint8_t* send{};
     uint8_t* rdma_receive{};
     std::array<uint8_t*, nodes*gpus> inputs{};
+    std::array<const int32_t*, nodes*gpus> device_indices{};
+    std::array<std::array<int32_t, experts_per_gpu+1>, nodes*gpus> offsets{};
+    std::array<std::vector<int32_t>, nodes*gpus> indices;
     std::array<int32_t, nodes * gpus * combine_row_stride> combine_rows{};
     std::array<int32_t, nodes * (tokens + 2)> inter_rows{};
     std::unique_ptr<Proxy> proxy;
+
+    void poison_expert_records() {
+        for (auto& source : indices) std::fill(source.begin(), source.end(), -1);
+        for (auto& source : offsets) source.fill(-1);
+    }
 };
 
 template<class F> void on_all_gpus(F work) {
@@ -54,7 +62,7 @@ uint8_t payload_value(int epoch, int gpu, int token) {
     return static_cast<uint8_t>(epoch*40 + gpu*3 + token + 1);
 }
 
-void install(Rank& rank, int gpu, int epoch) {
+void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
     std::array<std::vector<int32_t>, nodes> rows;
     std::vector<int32_t> r;
     const auto dest = destination_gpu(epoch, gpu, 0);
@@ -82,16 +90,18 @@ void install(Rank& rank, int gpu, int epoch) {
     if (epoch == 2) remote_rows = {1};  // This GPU sends token 0 and receives the remote source's token 1.
     std::vector<uint8_t> remote_masks(remote_rows.size(), 1u << ((gpu - remote_dest + gpus) % gpus));
     const int32_t node_offsets[] = {0, static_cast<int32_t>(rows[0].size()), tokens};
-    std::array<std::array<int32_t, experts_per_gpu+1>, nodes*gpus> offsets{};
-    std::array<std::vector<int32_t>, nodes*gpus> indices;
+    auto& offsets = rank.offsets;
+    auto& indices = rank.indices;
     std::array<RdmaProxyBenchmarkSource, nodes*gpus> sources;
     for (int s = 0; s < nodes*gpus; ++s) {
+        offsets[s][0] = 0;
+        indices[s].clear();
         const auto count = destination_gpu(epoch, s % gpus, s / gpus) == gpu ? rows[s/gpus].size() : 0;
         for (int expert = 0; expert < experts_per_gpu; ++expert) {
             for (std::size_t i = 0; i < count; ++i) indices[s].push_back(static_cast<int32_t>(i));
             offsets[s][expert+1] = static_cast<int32_t>(indices[s].size());
         }
-        sources[s] = {offsets[s].data(), indices[s].data(), indices[s].size()};
+        sources[s] = {offsets[s].data(), indices[s].empty() ? nullptr : indices[s].data(), indices[s].size()};
     }
     RdmaProxyBenchmarkRouting data{sizeof(data), nodes*gpus, sources.data(), remote_rows.data(),
         remote_masks.data(), remote_rows.size(), reinterpret_cast<uintptr_t>(r.data()),
@@ -117,17 +127,49 @@ void install(Rank& rank, int gpu, int epoch) {
     struct Extended { RdmaProxyBenchmarkRouting current; uint64_t extension; };
     Extended extended{data, 0};
     extended.current.struct_size = sizeof(extended);
-    rank.proxy->install_benchmark_routing(epoch, extended.current);
+    // Keep the original call-scoped contract on epoch zero. The next two
+    // generations use the same producer storage with an explicit retirement.
+    if (epoch == 0) {
+        rank.proxy->install_benchmark_routing(epoch, extended.current);
+        expect_error([&] { rank.proxy->retire_borrowed_benchmark_routing(epoch); });
+    } else {
+        rank.proxy->install_borrowed_benchmark_routing(epoch, extended.current);
+        expect_error([&] { rank.proxy->retire_borrowed_benchmark_routing(epoch); });
+        expect_error([&] { rank.proxy->install_borrowed_benchmark_routing(epoch, data); });
+    }
     expect_error([&] { rank.proxy->install_benchmark_routing(epoch, data); });
     rank.proxy->prepare_routing(epoch);
-    // The external buffers may now be reused, including the remote pinned views.
-    std::fill(x3.begin(), x3.end(), -1);
-    std::fill(x4.begin(), x4.end(), 0);
-    std::fill(remote_masks.begin(), remote_masks.end(), 0);
     const auto expected_r = r;
-    std::fill(r.begin(), r.end(), -1);
-    for (auto& source_indices : indices) std::fill(source_indices.begin(), source_indices.end(), -1);
-    for (auto& source_offsets : offsets) source_offsets.fill(-1);
+    // Retain epoch one's descriptor for the attempted unretired reinstall below.
+    // In both install modes, all arrays besides the expert lists are call-scoped.
+    if (epoch != 1) {
+        std::fill(x3.begin(), x3.end(), -1);
+        std::fill(x4.begin(), x4.end(), 0);
+        std::fill(remote_masks.begin(), remote_masks.end(), 0);
+        std::fill(r.begin(), r.end(), -1);
+    }
+    const auto common_indices = std::max(rows[0].size(), rows[1].size()) * experts_per_gpu;
+    for (int s = 0; s < nodes*gpus; ++s) {
+        const auto& installed = rank.proxy->router_expert_metadata_for_source(s / gpus, s % gpus);
+        const bool borrowed = epoch > 0;
+        const bool shares_offsets = installed.offsets_view().data() == sources[s].offsets;
+        const bool shares_indices = installed.indices_view().data() == sources[s].indices;
+        if (shares_offsets != borrowed || (!indices[s].empty() && shares_indices != borrowed))
+            throw std::runtime_error("incorrect ownership of installed expert records");
+        const auto* device = rank.device_indices[s];
+        if (!device || !std::equal(indices[s].begin(), indices[s].end(), device) ||
+            !std::all_of(device + indices[s].size(), device + common_indices, [](int32_t n) { return n == 0; }))
+            throw std::runtime_error("incorrect valid indices or stale padding in device A_idx");
+        if (borrowed) {
+            const auto decoded = deserialize_router_expert_metadata(
+                serialize_router_expert_metadata(installed), tokens, tokens * experts_per_gpu);
+            if (!std::equal(offsets[s].begin(), offsets[s].end(),
+                            decoded.expert_offsets.begin(), decoded.expert_offsets.end()) ||
+                decoded.expert_token_indices != indices[s])
+                throw std::runtime_error("borrowed expert records changed on the wire");
+        }
+    }
+    if (epoch == 0) rank.poison_expert_records();
     const auto& weights = rank.proxy->original_router_weights();
     if (rank.proxy->original_router_experts() != expected_r || weights != std::vector<float>(r.size(), 1))
         throw std::runtime_error("incorrect source routing snapshot");
@@ -206,6 +248,13 @@ void install(Rank& rank, int gpu, int epoch) {
                 throw std::runtime_error("incorrect combine input stride or domain count");
         }
     }
+    rank.proxy->run_iteration_step(epoch);
+    if (epoch == 1) {
+        // A completed payload alone cannot authorize either install path to
+        // replace expert records while the producer still has an active lease.
+        expect_error([&] { rank.proxy->install_benchmark_routing(epoch + 1, data); });
+        expect_error([&] { rank.proxy->install_borrowed_benchmark_routing(epoch + 1, data); });
+    }
 }
 }
 
@@ -246,15 +295,14 @@ int main() {
             if (r.kind == DeviceBufferKind::kRdmaSend) rank.send = ptr;
             if (r.kind == DeviceBufferKind::kRdmaReceive) rank.rdma_receive = ptr;
             if (r.kind == DeviceBufferKind::kNvlinkReceive) rank.inputs.at(source) = ptr;
+            if (r.kind == DeviceBufferKind::kRouterAIdx)
+                rank.device_indices.at(source) = reinterpret_cast<const int32_t*>(ptr);
             return ptr;
         });
     }
     on_all_gpus([&](int gpu) { ranks[gpu].proxy->initialize(); });
     for (int epoch = 0; epoch < 3; ++epoch) {
-        on_all_gpus([&](int gpu) {
-            install(ranks[gpu], gpu, epoch);
-            ranks[gpu].proxy->run_iteration_step(epoch);
-        });
+        on_all_gpus([&](int gpu) { run_benchmark_iteration(ranks[gpu], gpu, epoch); });
         for (int source = 0; source < gpus; ++source) {
             std::array<std::size_t, nodes> row{};
             for (int token = 0; token < tokens; ++token) {
@@ -269,11 +317,25 @@ int main() {
                 const auto& rank = ranks[destination_gpu(epoch, source, node)];
                 const auto& table = rank.proxy->router_expert_metadata_for_source(node, source);
                 const auto state = rank.proxy->router_expert_token_head_state_for_source(node, source);
-                if (table.expert_token_indices.size() != row[node]*experts_per_gpu ||
+                if (table.indices_view().size() != row[node]*experts_per_gpu ||
                     state.received_token_frontier != row[node])
                     throw std::runtime_error("incorrect benchmark source table or completion frontier");
             }
         }
+        if (epoch > 0) {
+            for (int gpu = 0; gpu < gpus; ++gpu) {
+                auto& rank = ranks[gpu];
+                // The worker may shut down directly after the last iteration.
+                if (epoch == 2 && gpu == 0) continue;
+                expect_error([&] { rank.proxy->retire_borrowed_benchmark_routing(epoch - 1); });
+                rank.proxy->retire_borrowed_benchmark_routing(epoch);
+                expect_error([&] { rank.proxy->retire_borrowed_benchmark_routing(epoch); });
+                expect_error([&] { (void)rank.proxy->router_expert_metadata_for_source(0, 0); });
+                rank.poison_expert_records();
+            }
+        }
     }
     on_all_gpus([&](int gpu) { ranks[gpu].proxy->shutdown(); });
+    expect_error([&] { (void)ranks[0].proxy->router_expert_metadata_for_source(0, 0); });
+    ranks[0].poison_expert_records();
 }

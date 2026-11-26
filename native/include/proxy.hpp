@@ -40,6 +40,8 @@ public:
     void initialize();
     void prepare_routing(uint64_t iteration);
     void install_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing);
+    void install_borrowed_benchmark_routing(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing);
+    void retire_borrowed_benchmark_routing(uint64_t iteration);
     void run();
     void run_once();
     void prepare_iteration_step(uint64_t iteration);
@@ -318,6 +320,8 @@ private:
     const RouterRouting& active_routing() const;
     const std::vector<uint8_t>& intra_node_raw_masks(int source_node) const;
     bool routing_install_required(uint64_t iteration) const;
+    void install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing,
+                                        bool borrow_expert_lists);
     void install_iteration_routing(uint64_t iteration, IterationRouteData route);
     std::shared_lock<std::shared_mutex> lock_forwarding_routes() const;
     std::shared_lock<std::shared_mutex> lock_installed_combine_route() const;
@@ -386,7 +390,8 @@ private:
     std::unique_ptr<IterationRouting> iteration_routing_;
     std::unique_ptr<RouterRouting> iteration_source_;
     std::optional<uint64_t> routing_iteration_;
-    uint64_t completed_routing_iterations_{0};
+    std::atomic<uint64_t> completed_routing_iterations_{0};
+    bool benchmark_expert_lists_borrowed_{false};
     bool routing_failed_{false};
     // A dynamic route cannot be replaced while a forwarding poller still
     // scans the previous generation's vectors, even after its last copy.

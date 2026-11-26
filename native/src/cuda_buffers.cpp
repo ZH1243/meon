@@ -168,6 +168,10 @@ CudaBuffers::~CudaBuffers() {
     catch (const std::exception& error) {
         RDMA_PROXY_LOG_WARN("CPU scatter worker cleanup failed: ", error.what());
     }
+    try { finish_borrowed_index_uploads(); }
+    catch (const std::exception& error) {
+        RDMA_PROXY_LOG_WARN("borrowed index upload cleanup failed: ", error.what());
+    }
 #if RDMA_PROXY_HAVE_CUDA
     if (!config_.mock_mode && router_notification_publication_stream_) {
         const auto set_device_status = cudaSetDevice(config_.cuda_device_id);
@@ -652,39 +656,34 @@ void CudaBuffers::validate_expert_metadata(const RouterExpertMetadata& metadata)
         metadata.num_tokens != config_.num_tokens) {
         throw std::runtime_error("expert metadata dimensions do not match this proxy");
     }
-    if (metadata.expert_offsets.size() !=
+    const auto offsets = metadata.offsets_view();
+    const auto indices = metadata.indices_view();
+    if (offsets.size() !=
             static_cast<std::size_t>(expected_experts_per_gpu + 1) ||
-        metadata.expert_offsets.front() != 0 ||
-        metadata.expert_offsets.back() < 0 ||
-        static_cast<std::size_t>(metadata.expert_offsets.back()) !=
-            metadata.expert_token_indices.size() ||
-        !std::is_sorted(metadata.expert_offsets.begin(), metadata.expert_offsets.end())) {
+        offsets.front() != 0 || offsets.back() < 0 ||
+        static_cast<std::size_t>(offsets.back()) != indices.size() ||
+        !std::is_sorted(offsets.begin(), offsets.end())) {
         throw std::runtime_error("expert metadata offsets are invalid");
     }
-    if (std::any_of(
-            metadata.expert_token_indices.begin(),
-            metadata.expert_token_indices.end(),
-            [&](int32_t index) {
-                return index < 0 ||
-                    static_cast<std::size_t>(index) >= config_.num_tokens;
-            })) {
-        throw std::runtime_error("expert metadata contains an invalid token index");
+    if (indices.size() && !indices.data())
+        throw std::runtime_error("expert metadata is missing its token indices");
+    for (const int32_t index : indices) {
+        if (index < 0 || static_cast<std::size_t>(index) >= config_.num_tokens)
+            throw std::runtime_error("expert metadata contains an invalid token index");
     }
     if ((metadata.top_k != 0 && metadata.top_k != config_.router_top_k) ||
         (metadata.weighted_contributions && metadata.top_k != config_.router_top_k) ||
         metadata.weighted_contributions != config_.router_weighted_contributions_enabled ||
         metadata.expert_route_weights.size() !=
-            (metadata.weighted_contributions ? metadata.expert_token_indices.size() : 0))
+            (metadata.weighted_contributions ? indices.size() : 0))
         throw std::runtime_error("expert metadata weighted configuration or length mismatch");
     for (float weight : metadata.expert_route_weights)
         if (!std::isfinite(weight) || weight < 0.0f)
             throw std::runtime_error("expert metadata weights must be finite and nonnegative");
     for (int expert = 0; expert < expected_experts_per_gpu; ++expert) {
-        const auto begin = metadata.expert_token_indices.begin() +
-            metadata.expert_offsets[static_cast<std::size_t>(expert)];
-        const auto end = metadata.expert_token_indices.begin() +
-            metadata.expert_offsets[static_cast<std::size_t>(expert + 1)];
-        if (!std::is_sorted(begin, end)) {
+        const auto begin = offsets[expert];
+        const auto end = offsets[expert + 1];
+        if (begin != end && !std::is_sorted(indices.begin() + begin, indices.begin() + end)) {
             throw std::runtime_error(
                 "expert metadata token indices are not monotonic within an expert list");
         }
@@ -768,6 +767,30 @@ void CudaBuffers::install_iteration_expert_metadata(
     if (config_.nvlink_forward_completion_notifications_enabled)
         initialize_router_computation_scheduler_locked();
     ++metadata_generations_installed_;
+}
+
+void CudaBuffers::retire_borrowed_expert_metadata() {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    if (cpu_scatter_threaded_ && cpu_scatter_worker_thread_.joinable())
+        quiesce_cpu_scatter_worker();
+    // Installation normally drained these copies. An allocator or CUDA error
+    // partway through the source list may have left earlier H2Ds in flight.
+    finish_borrowed_index_uploads();
+    for (auto& buffer : nvlink_recv_buffers_) {
+        if (buffer.expert_metadata.has_borrowed_expert_lists()) {
+            buffer.expert_metadata_ready = false;
+            buffer.expert_metadata = RouterExpertMetadata{};
+        }
+    }
+}
+
+void CudaBuffers::finish_borrowed_index_uploads() {
+    if (!borrowed_index_uploads_pending_) return;
+#if RDMA_PROXY_HAVE_CUDA
+    select_cuda_device_for_thread(config_.cuda_device_id, config_.mock_mode);
+    check_cuda(cudaStreamSynchronize(cudaStreamLegacy), "complete borrowed routing index uploads");
+    borrowed_index_uploads_pending_ = false;
+#endif
 }
 
 void CudaBuffers::clear_iteration_cpu_scatter() {
@@ -870,7 +893,7 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
             throw std::runtime_error(
                 "cannot initialize router computation scheduler before metadata exchange completes");
         }
-        const auto& offsets = buffer.expert_metadata.expert_offsets;
+        const auto offsets = buffer.expert_metadata.offsets_view();
         for (std::size_t expert = 0; expert < experts_per_gpu; ++expert) {
             const auto count = static_cast<std::size_t>(
                 offsets[expert + 1] - offsets[expert]);
@@ -881,7 +904,7 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
             total += count;
         }
         a_idx_capacity = std::max(
-            a_idx_capacity, buffer.expert_metadata.expert_token_indices.size());
+            a_idx_capacity, buffer.expert_metadata.indices_view().size());
     }
 
     // QuACK requires every A_idx_j tensor to have the same shape. Keep each
@@ -903,7 +926,8 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
         throw std::runtime_error("routing index capacity exceeds the supported range");
     for (const auto buffer_index : router_computation_buffer_indices_) {
         auto& buffer = nvlink_recv_buffers_[buffer_index];
-        buffer.expert_token_index_count = buffer.expert_metadata.expert_token_indices.size();
+        const auto indices = buffer.expert_metadata.indices_view();
+        buffer.expert_token_index_count = indices.size();
         // Padding is visible to callers, so clear the logical prefix up to the
         // common length even when this source shrank since the prior generation.
         const auto upload = [&](GpuBuffer& device, const auto& values, DeviceBufferKind kind,
@@ -913,8 +937,33 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
                 allocate_buffer(device, DeviceBufferAllocationRequest{
                     kind, type, -1, buffer.source_node_rank, buffer.source_gpu_index,
                     storage_indices * sizeof(Value), {storage_indices}});
+            if (buffer.expert_metadata.has_borrowed_expert_lists()) {
+                // The benchmark exposes only its valid prefix. Never read its
+                // unused host capacity, even when another source is longer.
+                const auto live_bytes = values.size() * sizeof(Value);
+                const auto tail_bytes = (a_idx_capacity - values.size()) * sizeof(Value);
+                auto* tail = static_cast<unsigned char*>(device.ptr) + live_bytes;
+                if (config_.mock_mode) {
+                    if (live_bytes) std::memcpy(device.ptr, values.data(), live_bytes);
+                    if (tail_bytes) std::memset(tail, 0, tail_bytes);
+                } else {
+#if RDMA_PROXY_HAVE_CUDA
+                    // Use the explicit device default stream so even shutdown
+                    // from a different host thread can fence a partial upload.
+                    borrowed_index_uploads_pending_ = true;
+                    if (live_bytes)
+                        check_cuda(cudaMemcpyAsync(device.ptr, values.data(), live_bytes,
+                                                   cudaMemcpyHostToDevice, cudaStreamLegacy),
+                                   "upload borrowed QuACK routing list");
+                    if (tail_bytes)
+                        check_cuda(cudaMemsetAsync(tail, 0, tail_bytes, cudaStreamLegacy),
+                                   "clear QuACK routing list padding");
+#endif
+                }
+                return;
+            }
             std::vector<Value> padded(a_idx_capacity);
-            std::copy(values.begin(), values.end(), padded.begin());
+            if (values.size()) std::copy(values.begin(), values.end(), padded.begin());
             if (config_.mock_mode) {
                 std::memcpy(device.ptr, padded.data(), padded.size() * sizeof(Value));
             } else {
@@ -924,14 +973,16 @@ void CudaBuffers::initialize_router_computation_scheduler_locked() {
 #endif
             }
         };
-        upload(buffer.expert_token_indices_device, buffer.expert_metadata.expert_token_indices,
+        upload(buffer.expert_token_indices_device, indices,
                DeviceBufferKind::kRouterAIdx, DeviceBufferElementType::kInt32);
         if (config_.router_weighted_contributions_enabled)
             upload(buffer.expert_route_weights_device, buffer.expert_metadata.expert_route_weights,
                    DeviceBufferKind::kRouterRouteWeights, DeviceBufferElementType::kFP32);
     }
 #if RDMA_PROXY_HAVE_CUDA
-    if (config_.router_dynamic_routing_enabled && !config_.mock_mode)
+    if (borrowed_index_uploads_pending_)
+        finish_borrowed_index_uploads();
+    else if (config_.router_dynamic_routing_enabled && !config_.mock_mode)
         check_cuda(cudaStreamSynchronize(nullptr), "complete routing index uploads before compute");
 #endif
     std::size_t total_batches = 0;
@@ -1107,7 +1158,7 @@ void CudaBuffers::configure_cpu_scatter(const RdmaProxyCpuScatterConfig& c) {
     const std::size_t columns = c.tile_n ? 2 : 1;
     std::size_t routes = 0;
     for (auto index : router_computation_buffer_indices_)
-        routes += nvlink_recv_buffers_[index].expert_metadata.expert_token_indices.size();
+        routes += nvlink_recv_buffers_[index].expert_metadata.indices_view().size();
     if (c.routes != routes || !routes ||
         routes > std::numeric_limits<std::size_t>::max() / (columns * sizeof(int64_t)) ||
         c.capacity > std::numeric_limits<std::size_t>::max() / c.num_sources)
@@ -1119,7 +1170,7 @@ void CudaBuffers::configure_cpu_scatter(const RdmaProxyCpuScatterConfig& c) {
         if (c.source_pairs[2*j] != source.source_node_rank ||
             c.source_pairs[2*j+1] != source.source_gpu_index || !c.output_bases[j])
             throw std::runtime_error("CPU scatter source order differs from gather order");
-        const auto& indices = source.expert_metadata.expert_token_indices;
+        const auto indices = source.expert_metadata.indices_view();
         std::vector<int64_t> compact(c.capacity, -1);
         for (auto row : indices) {
             if (row < 0 || static_cast<uint64_t>(row) >= c.capacity)
@@ -1826,6 +1877,8 @@ void CudaBuffers::update_expert_token_heads_locked(
     }
 
     const auto received_end = start_token + num_tokens;
+    const auto offsets = metadata.offsets_view();
+    const auto indices = metadata.indices_view();
     if (progress.expert_token_heads.size() !=
             static_cast<std::size_t>(metadata.experts_per_gpu) ||
         progress.expert_token_tails.size() !=
@@ -1835,14 +1888,14 @@ void CudaBuffers::update_expert_token_heads_locked(
     for (int expert = 0; expert < metadata.experts_per_gpu; ++expert) {
         const auto expert_index = static_cast<std::size_t>(expert);
         const auto list_begin = static_cast<std::size_t>(
-            metadata.expert_offsets[expert_index]);
+            offsets[expert_index]);
         const auto list_end = static_cast<std::size_t>(
-            metadata.expert_offsets[expert_index + 1]);
+            offsets[expert_index + 1]);
         auto& head = progress.expert_token_heads[expert_index];
         const auto old_head = head;
         while (list_begin + head < list_end &&
                static_cast<std::size_t>(
-                   metadata.expert_token_indices[list_begin + head]) < received_end) {
+                   indices[list_begin + head]) < received_end) {
             ++head;
         }
         scheduler.expert_num_ready_tokens[expert_index] += head - old_head;
@@ -1927,7 +1980,7 @@ void CudaBuffers::publish_pooled_batch(std::size_t expert, const std::vector<int
     for (std::size_t j = 0; j < router_computation_buffer_indices_.size(); ++j) {
         const auto& buffer = nvlink_recv_buffers_[router_computation_buffer_indices_[j]];
         const auto base = input_pool_row_base(buffer.source_node_rank, buffer.source_gpu_index);
-        const auto& indices = buffer.expert_metadata.expert_token_indices;
+        const auto indices = buffer.expert_metadata.indices_view();
         for (auto pos = ranges[2 * j]; pos < ranges[2 * j + 1]; ++pos)
             *flat++ = static_cast<int32_t>(base + indices[pos]);
     }
@@ -1997,7 +2050,7 @@ CudaBuffers::schedule_ready_computation_batches_for_expert_locked(
             const auto available = head - tail;
             const auto selected = std::min(available, remaining);
             const auto expert_offset = static_cast<std::size_t>(
-                buffer.expert_metadata.expert_offsets[expert]);
+                buffer.expert_metadata.offsets_view()[expert]);
             if (tail > std::numeric_limits<std::size_t>::max() - expert_offset) {
                 throw std::runtime_error(
                     "QuACK gather-table route range overflows size_t");

@@ -289,12 +289,15 @@ bash scripts/run_node0_torchrun.sh "${args[@]}"
 bash scripts/run_node1_torchrun.sh "${args[@]}"
 ```
 
-Each iteration generates fresh affine R using meon's per-rank seed sequence. The backend runs the benchmark's captured metadata graph with its native launch barrier, direct x3/x4 output, overlapping receiver and local staging after the receiver. The gather writes directly into meon's own input slice. After the benchmark worker completes, the native runtime copies the source records and local route arrays, rebuilds its forward plan and publishes the new index lists. Python binds the current compute views before up-GEMM submission.
+Each iteration generates fresh affine R using meon's per-rank seed sequence. The backend runs the benchmark's captured metadata graph with its native launch barrier, direct x3/x4 output, overlapping receiver and local staging after the receiver. The gather writes directly into meon's own input slice. After the benchmark worker completes, meon borrows the 16 pinned expert lists for the payload iteration and uploads each list's valid indices directly into its GPU `A_idx` buffer. The GPU buffer has zero padding through the common logical length. Meon also imports the local route and remote x3/x4 and rebuilds the forwarding plan. Python binds the current compute views before up-GEMM submission.
+
+Before the next exchange, each rank retires its readers of the previous expert lists, then enters the existing Gloo reuse barrier. Once all ranks leave that barrier, peer writes may reuse the pinned storage. At the end of the run the worker shuts down the payload proxy before freeing the benchmark's storage. With an older payload library that only supports call-duration borrowing, the worker uses the original snapshot install.
 
 | Per-rank field | Host wall interval |
 | --- | --- |
 | `exchange_staging_us` | Aligned submission through benchmark wait completion, including the seven kernels, GPU exchange, RDMA and local gather. This matches the standalone benchmark's end-to-end timing boundary. |
 | `install_us` | Benchmark wait return through importing the source views and installing meon's dispatch and gather metadata. |
+| `retire_us` | Local time to release the previous iteration's borrowed expert lists before entering the reuse barrier. Zero for the first iteration and for snapshot installs. |
 | `r_ready_to_up_submit_us` | Fresh R completed through host return from up-GEMM submission, including alignment, installation, rank release and compute setup. Available for compute iterations that submit work. Use a GPU trace to measure the actual kernel start. |
 | `generation_us`, `reuse_barrier_us`, `release_barrier_us` | Route generation, the world alignment before submission, and the world release after installation. |
 
@@ -316,6 +319,25 @@ python -m timeit -n 100 -r 5 \
 On macOS 15.6.1 arm64 with Python 3.9.12 and CPU PyTorch 1.13.1, a one-thread replay alternated the original QuACK builder at `05e4efc` with the packed builder for 100 measured calls each. Mean host construction time was 20.03 ms and 0.96 ms, respectively. All 24,024 descriptors and 388 ready-prefix values matched. A new two-node H800 profile is needed to measure the resulting change in gather-to-up-GEMM latency.
 
 Host coverage includes a three-epoch, eight-rank mock handoff that checks empty expert lists, distinct local and remote masks, payload destinations, and reuse of staging and metadata buffers. Both launchers passed a 10,240-token worker dry run. The two-node numerical check above, CUDA graph replay, GPUDirect registration and the 300–400 µs timing target still need a hardware run.
+
+The shared expert-list handoff was checked on an arm64 Mac running macOS 15.6.1 with Debug native builds and CPU PyTorch. The mock regression checks pointer identity, rejection of early reuse, final shutdown, and zero padding when the valid list shrinks from four rows to two and then zero. The worker tests cover retirement before the reuse barrier and interrupted shutdown. The host checks used these commands from the meon root.
+
+```bash
+cmake --build build/mock -j4 && ctest --test-dir build/mock --output-on-failure
+OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python
+cmake --build build/exchange-host -j4 && ctest --test-dir build/exchange-host --output-on-failure
+cmake --build build/exchange-cpu -j4 && ctest --test-dir build/exchange-cpu --output-on-failure
+ROUTER_METADATA_BENCH_LIBRARY="$PWD/build/exchange-cpu/librouter_metadata_bench.dylib" PYTHONDONTWRITEBYTECODE=1 \
+  /Users/zhuhao/opt/anaconda3/bin/python3 -m unittest discover -s benchmarks/router_metadata_exchange -p test_benchmark.py -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s metadata -p test_metadata_cute.py
+```
+
+The single-GPU check below exercises pinned-memory uploads and reads the result on an independent CUDA stream. The two-node H800 run above is needed to measure the change in `install_us`, `retire_us`, and the interval from local gather completion to up-GEMM.
+
+```bash
+cmake --build "$RDMA_PROXY_BUILD_DIR" --target rdma_cpu_proxy_shared test_dynamic_gather -j4
+ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R '^test_borrowed_routing_upload_cuda$' --output-on-failure
+```
 
 ### Two-node test on Hopper
 

@@ -2297,9 +2297,9 @@ def run_proxy_with_concurrent_kernel(
         for iteration, pipeline_ms in pipeline_timings:
             print(f"  pipeline iteration {iteration}: elapsed_ms={pipeline_ms:.4f}", flush=True)
         if benchmark_metadata is not None:
-            print("Benchmark metadata host timings include route generation and both rank barriers in "
-                  "routing elapsed_us. exchange_staging_us runs from aligned submit through benchmark wait "
-                  "after R is ready, excluding the outer barrier. r_ready_to_up_submit_us starts before "
+            print("Benchmark routing elapsed_us covers route generation through local installation, "
+                  "including the pre-exchange rank barrier. exchange_staging_us runs from aligned submit "
+                  "through benchmark wait. r_ready_to_up_submit_us starts before "
                   "alignment and ends at host return from up-GEMM submission. Iteration zero also includes "
                   "compute setup in this last interval.", flush=True)
             for iteration, (stats, submitted) in enumerate(benchmark_timings):

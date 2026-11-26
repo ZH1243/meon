@@ -9,6 +9,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 using namespace rdma_proxy;
 
@@ -563,7 +564,26 @@ void run(bool prepared, bool validate) {
     }
     on_all_gpus([&](int gpu) { ranks[gpu].proxy->initialize(); });
     for (int epoch = 0; epoch < 3; ++epoch) {
-        on_all_gpus([&](int gpu) { run_benchmark_iteration(ranks[gpu], gpu, epoch); });
+        on_all_gpus([&](int gpu) {
+            if (prepared && !validate && epoch == 2 && gpu == gpus - 1) {
+                // Hold this rank before installation until rank 0 has installed
+                // its route and reset ready_rows for this epoch's payload.
+                const auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(config.completion_timeout_ms);
+                for (;;) {
+                    const auto state = ranks[0].proxy->router_computation_scheduler_state();
+                    if (state.iteration_initialized && state.iteration == static_cast<uint64_t>(epoch)) {
+                        if (state.published_rows != 0)
+                            throw std::runtime_error("published gather rows before all local routes were installed");
+                        break;
+                    }
+                    if (std::chrono::steady_clock::now() >= deadline)
+                        throw std::runtime_error("fast rank did not reach native preparation before the late installer");
+                    std::this_thread::yield();
+                }
+            }
+            run_benchmark_iteration(ranks[gpu], gpu, epoch);
+        });
         for (int source = 0; source < gpus; ++source) {
             std::array<std::size_t, nodes> row{};
             for (int token = 0; token < tokens; ++token) {

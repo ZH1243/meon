@@ -198,6 +198,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                                   ("shutdown",), ("close", True), ("destroy",)])
         self.assertIn("phase=steady generation_us=1.000 exchange_staging_us=2.000 install_us=3.000", result)
         self.assertIn("retire_us=0.100", result)
+        self.assertEqual(result.count("release_barrier_us=0.000"), 2)
         self.assertIn("source_route=receiver source_route_storage=borrowed", result)
         self.assertIn("a_idx_storage=exchange_device", result)
         self.assertNotIn("r_ready_to_up_submit_us", result)

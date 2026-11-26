@@ -301,15 +301,19 @@ Look for `a_idx_storage=exchange_device` on the per-rank timing line to confirm 
 
 | Per-rank field | Host wall interval |
 | --- | --- |
+| `routing … elapsed_us` | Entry to benchmark preparation through completion of local route installation, including generation, retirement, alignment and exchange. |
 | `exchange_staging_us` | Aligned submission through benchmark wait completion, including the seven kernels, GPU exchange, RDMA and local gather. With `source_route=receiver`, this includes writing the outgoing snapshot. With direct GPU indices, it also includes the remote index mirrors and their GPU visibility. Pass `--device-indices` to the standalone two-node benchmark to include those writes there. |
 | `install_us` | Benchmark wait return through importing the source views and installing meon's dispatch and gather metadata. |
 | `retire_us` | Local time to release the previous iteration's borrowed route data before entering the reuse barrier. Zero for the first iteration and for snapshot installs. |
-| `r_ready_to_up_submit_us` | Fresh R completed through host return from up-GEMM submission, including alignment, installation, rank release and compute setup. Available for compute iterations that submit work. Use a GPU trace to measure the actual kernel start. |
-| `generation_us`, `reuse_barrier_us`, `release_barrier_us` | Route generation, the world alignment before submission, and the world release after installation. |
+| `r_ready_to_up_submit_us` | Fresh R completed through host return from up-GEMM submission, including rank alignment before exchange, installation and compute setup. Available for compute iterations that submit work. Use a GPU trace to measure the actual kernel start. |
+| `generation_us`, `reuse_barrier_us` | Route generation and the Gloo barrier before exchange submission, respectively. |
+| `release_barrier_us` | Reports zero for compatibility with existing log readers. Older workers measured the post-install Gloo barrier here. |
 
 To compare with the standalone timing table, discard meon iterations 0–19. For each of the remaining 200 iterations take the largest `exchange_staging_us` across all 16 ranks, then compute median and p95 over those 200 samples. Shape, token width, GPU/NIC placement, and rank skew affect the measured values. Inspect `install_us` and `r_ready_to_up_submit_us` when investigating the generator-to-GEMM gap. The first iteration also includes compute setup.
 
-The two-node launchers enable the QuACK down gather table, expert waves and ready publication. With dynamic routing, the worker builds a fresh down schedule from the current expert counts before submitting up-GEMM. Set `QUACK_ROOT` on both hosts to the checkout containing `run.wave_ready.build_expert_wave_schedule`. It packs the four integers in each descriptor into a CPU tensor and tracks each column group's last wave as it orders the descriptors. This work falls within `r_ready_to_up_submit_us`, after the release barrier.
+Use the same Python worker and benchmark backend on all 16 ranks so their Gloo collectives occur in the same order. For comparison with H800 profile 13, update both hosts and repeat the same launch with `--no-benchmark-metadata-validation`. Compare the steady-state intervals from the end of `clear_index_tails_kernel` to the first combine-row fill and from local gather completion to up-GEMM start. Also compare the time to the first gather-table ready-row publication. Ranks arriving early can spend some of their time waiting at native payload startup.
+
+The two-node launchers enable the QuACK down gather table, expert waves and ready publication. With dynamic routing, the worker builds a fresh down schedule from the current expert counts before submitting up-GEMM. Set `QUACK_ROOT` on both hosts to the checkout containing `run.wave_ready.build_expert_wave_schedule`. It packs the four integers in each descriptor into a CPU tensor and tracks each column group's last wave as it orders the descriptors. This work falls within `r_ready_to_up_submit_us`, after local route installation.
 
 These commands check the schedule on CPU and time construction for node 0, GPU 0 of the 20,480-token H800 run.
 
@@ -390,6 +394,8 @@ ctest --test-dir build/mock --output-on-failure
 OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python
 ctest --test-dir build/exchange-host --output-on-failure
 ```
+
+The post-install barrier removal passed the same host suites on the M1 Max. The eight-rank mock delayed one install until another rank reached native preparation, then checked the iteration's forwarding and returned rows. It also passed five consecutive runs with `ctest --test-dir build/mock -R '^test_benchmark_routing$' --repeat until-fail:5 --output-on-failure`.
 
 The CUDA build, two-node numerical and transport checks, and Nsight timing comparison require the Hopper hosts.
 

@@ -378,8 +378,8 @@ class BenchmarkMetadataBackend:
             exchanged = time.perf_counter_ns()
             self._install(iteration)
             installed = time.perf_counter_ns()
-            self._barrier()  # All ranks installed this generation before allowing up/dispatch.
-            released = time.perf_counter_ns()
+            # Local setup can use this route now. Native iteration-start synchronization
+            # precedes payload dispatch and publication of ready rows on both nodes.
             extents = None
             if compute_extents:
                 indices, rows = C.c_uint64(), C.c_uint64()
@@ -391,7 +391,7 @@ class BenchmarkMetadataBackend:
                 "exchange_staging_elapsed_ns": exchanged - exchange_start, "install_elapsed_ns": installed - exchanged,
                 "r_ready_to_install_elapsed_ns": installed - r_ready,
                 "retire_elapsed_ns": reuse_start - r_ready, "reuse_barrier_ns": exchange_start - reuse_start,
-                "release_barrier_ns": released - installed,
+                "release_barrier_ns": 0,  # Retain the timing field for older log readers.
                 "source_route": "receiver" if self.source_snapshot_view is not None else "device_readback",
                 "source_route_storage": ("borrowed" if self.source_snapshot_view is not None
                                          and self.borrow_source_route else "copied"),
@@ -399,7 +399,7 @@ class BenchmarkMetadataBackend:
                 "rme2_stats": native_stats,
             }
             self.next_iteration += 1
-            return extents, released - started
+            return extents, installed - started
         except BaseException:
             self.failed = True
             raise

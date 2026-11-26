@@ -232,7 +232,7 @@ class ProviderTests(unittest.TestCase):
         self.assertIs(p.install_host_routing, lib.rdma_proxy_install_borrowed_benchmark_host_routing)
         self.assertFalse(p.borrow_source_route)
 
-    def test_timed_windows_fork_after_r_ready_and_join_before_release(self):
+    def test_epoch_waits_for_reuse_then_returns_local_installed_extents(self):
         p = self.provider()
         events = []
         p.plan = object()
@@ -245,6 +245,7 @@ class ProviderTests(unittest.TestCase):
             return {"metadata_gpu_ms": 0.125}
         p.session = SimpleNamespace(submit=lambda i, plan, stream: events.append(("rme2", i)), wait=wait)
         def extents(handle, n, r):
+            events.append("query extents")
             C.cast(n, C.POINTER(C.c_uint64))[0] = 18
             C.cast(r, C.POINTER(C.c_uint64))[0] = 4
             return 0
@@ -253,17 +254,17 @@ class ProviderTests(unittest.TestCase):
             events.append(("retire", handle, iteration))
             return 0
         p.retire_routing = retire
-        with patch.object(backend.time, "perf_counter_ns", side_effect=[100, 130, 145, 190, 215, 219]):
-            self.assertEqual(p.prepare(0), ((18, 4), 119))
+        with patch.object(backend.time, "perf_counter_ns", side_effect=[100, 130, 145, 190, 215]):
+            self.assertEqual(p.prepare(0), ((18, 4), 115))
         self.assertEqual(events, [("R", 0), "R complete", "world", ("rme2", 1),
-                                  "rme2 complete", ("install", 0), "world"])
+                                  "rme2 complete", ("install", 0), "query extents"])
         self.assertEqual(p.last_stats["r_ready_ns"], 130)
         self.assertEqual(p.last_stats["exchange_staging_elapsed_ns"], 45)
         self.assertEqual(p.last_stats["install_elapsed_ns"], 25)
         self.assertEqual(p.last_stats["r_ready_to_install_elapsed_ns"], 85)
         self.assertEqual(p.last_stats["reuse_barrier_ns"], 15)
         self.assertEqual(p.last_stats["retire_elapsed_ns"], 0)
-        self.assertEqual(p.last_stats["release_barrier_ns"], 4)
+        self.assertEqual(p.last_stats["release_barrier_ns"], 0)
         self.assertEqual(p.last_stats["rme2_stats"]["metadata_gpu_ms"], 0.125)
         self.assertEqual(p.last_stats["source_route_storage"], "copied")
         self.assertEqual(p.last_stats["a_idx_storage"], "host_upload")
@@ -273,12 +274,13 @@ class ProviderTests(unittest.TestCase):
         p.borrow_source_route = True
         p.source_snapshot_view = MagicMock()
         p.device_indices = backend.BenchmarkDeviceIndices()
-        with patch.object(backend.time, "perf_counter_ns", side_effect=[220, 235, 240, 250, 272, 292, 300]):
-            self.assertEqual(p.prepare(1), ((18, 4), 80))
+        with patch.object(backend.time, "perf_counter_ns", side_effect=[220, 235, 240, 250, 272, 292]):
+            self.assertEqual(p.prepare(1), ((18, 4), 72))
         self.assertEqual(events, [("R", 1), "R complete", ("retire", 3, 0), "world", ("rme2", 2),
-                                  "rme2 complete", ("install", 1), "world"])
+                                  "rme2 complete", ("install", 1), "query extents"])
         self.assertEqual(p.last_stats["retire_elapsed_ns"], 5)
         self.assertEqual(p.last_stats["reuse_barrier_ns"], 10)
+        self.assertEqual(p.last_stats["release_barrier_ns"], 0)
         self.assertEqual(p.last_stats["source_route_storage"], "borrowed")
         self.assertEqual(p.last_stats["a_idx_storage"], "exchange_device")
 
@@ -294,6 +296,21 @@ class ProviderTests(unittest.TestCase):
         p._barrier.assert_not_called()
         p.session.submit.assert_not_called()
         self.assertTrue(p.failed)
+
+    def test_failed_install_does_not_query_extents_or_advance_epoch(self):
+        p = self.provider()
+        p.plan, p.stream, p.session, p.library = object(), MagicMock(), MagicMock(), MagicMock()
+        p._generate, p._barrier = MagicMock(), MagicMock()
+        p._install = MagicMock(side_effect=RuntimeError("bad route"))
+        with self.assertRaisesRegex(RuntimeError, "bad route"):
+            p.prepare(0)
+        p._barrier.assert_called_once_with()
+        p.session.wait.assert_called_once_with()
+        p.library.rdma_proxy_get_routing_extents.assert_not_called()
+        self.assertTrue(p.failed)
+        self.assertEqual(p.next_iteration, 0)
+        with self.assertRaisesRegex(RuntimeError, "active session"):
+            p.prepare(0)
 
     def test_borrowed_default_group_survives_clean_disconnect(self):
         p = self.provider()
@@ -321,6 +338,8 @@ class ProviderTests(unittest.TestCase):
         extents, elapsed = p.prepare(0, compute_extents=False)
         self.assertIsNone(extents)
         self.assertGreaterEqual(elapsed, 0)
+        p._barrier.assert_called_once_with()
+        self.assertEqual(p.last_stats["release_barrier_ns"], 0)
         p._install.assert_called_once_with(0)
         p.library.rdma_proxy_get_routing_extents.assert_not_called()
 

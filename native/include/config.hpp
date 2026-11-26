@@ -66,6 +66,7 @@ struct ProxyConfig {
     bool router_routing_enabled{false};
     bool router_dynamic_routing_enabled{false};
     bool router_benchmark_metadata_enabled{false};
+    bool router_benchmark_metadata_validation_enabled{true};
     bool router_weighted_contributions_enabled{false};
     int router_num_experts{0};
     int router_top_k{0};

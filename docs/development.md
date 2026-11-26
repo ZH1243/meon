@@ -293,7 +293,11 @@ Each iteration generates fresh affine R using meon's per-rank seed sequence. The
 
 Before the next exchange, each rank retires the previous route after its payload and assignment-query readers finish, then enters the Gloo reuse barrier. Once all ranks leave that barrier, the receiver may reuse its outgoing buffer and peers may write the next incoming lists. At the end of the run the worker shuts down the payload proxy before freeing the benchmark's storage.
 
-Look for `a_idx_storage=exchange_device` on the per-rank timing line to confirm that the incoming indices use the direct GPU path. If any rank's libraries lack the required interfaces, the worker selects `a_idx_storage=host_upload` across the group. The separate fields `source_route=receiver source_route_storage=borrowed` describe this GPU's outgoing route. The receiver writes its outgoing node offsets, x3, x4 and top-8 R into pinned memory before the local staging gather. Meon checks the data there and borrows x3, x4 and R for the iteration. Older payload builds that support only the call-duration host handoff report `source_route=receiver source_route_storage=copied` with the updated worker. If the receiver handoff is unavailable, the worker reports `source_route=device_readback` and reads the arrays from the GPU during installation.
+For an A/B timing run with the benchmark's generated routes, build the updated `rdma_cpu_proxy_shared` on both hosts. Run the same seed and launch arguments twice, adding `--no-benchmark-metadata-validation` to both node commands for the second run. The default checks every outgoing expert ID, checks each x3/x4 slice for duplicates, valid masks and row ordering, and checks every incoming `A_idx` for bounds and ordering within its expert. The switch skips those installation scans. The benchmark producer must supply valid values and sorted per-expert lists because QuACK reads the indices and the CPU uses their order to decide which rows are ready.
+
+Both modes check x3 token bounds before those IDs can become RDMA addresses. They also check source identities, pointers, offsets and storage capacities, observe exchange completion, and construct receive chunks and forwarding tables. The four `--no-check-*` result switches are independent. For a numerical comparison, run the small two-node `--check-projections` example above in both modes. For a profile comparison, examine steady `install_us`, local gather end to the first index operation, and local gather end to up-GEMM start.
+
+Look for `a_idx_storage=exchange_device` on the per-rank timing line to confirm that the incoming indices use the direct GPU path. If any rank's libraries lack the required interfaces, the worker selects `a_idx_storage=host_upload` across the group. The separate fields `source_route=receiver source_route_storage=borrowed` describe this GPU's outgoing route. The receiver writes its outgoing node offsets, x3, x4 and top-8 R into pinned memory before the local staging gather. Meon borrows x3, x4 and R for the iteration and, by default, checks the routing values there. Older payload builds that support only the call-duration host handoff report `source_route=receiver source_route_storage=copied` with the updated worker. If the receiver handoff is unavailable, the worker reports `source_route=device_readback` and reads the arrays from the GPU during installation.
 
 | Per-rank field | Host wall interval |
 | --- | --- |
@@ -359,7 +363,7 @@ cmake --build "$RDMA_PROXY_BUILD_DIR/receiver-tests" --target test_receiver_kern
 ctest --test-dir "$RDMA_PROXY_BUILD_DIR/receiver-tests" -R '^receiver_kernel_cuda$' --output-on-failure
 ```
 
-For the two-node H800 profile, rebuild `rdma_cpu_proxy_shared` on both hosts and run the same launch arguments as profile 11. First run the small two-node projection check above, then compare steady-state `exchange_staging_us`, `install_us` and the interval from local gather completion to up-GEMM. In the direct path the GPU trace shows at most one `clear_index_tails_kernel` in place of the 16 H2Ds and their padding memsets. Each rank receives one extra RDMA write per nonempty remote list, carrying its live indices. Route validation still precedes padding and compute.
+For the two-node H800 profile, rebuild `rdma_cpu_proxy_shared` on both hosts and run the same launch arguments as profile 11. First run the small two-node projection check above, then compare steady-state `exchange_staging_us`, `install_us` and the interval from local gather completion to up-GEMM. In the direct path the GPU trace shows at most one `clear_index_tails_kernel` in place of the 16 H2Ds and their padding memsets. Each rank receives one extra RDMA write per nonempty remote list, carrying its live indices. With the default settings, route validation precedes padding and compute.
 
 To check the device and host lists independently against generated routes, run this GPU exchange suite concurrently on the two nodes with `NODE_RANK=0` or `1` and `RME2_LIBRARY` pointing at the rebuilt exchange library. Its cycling routes exercise empty lists, skew and changing lengths.
 
@@ -375,6 +379,16 @@ cmake -S . -B /private/tmp/meon-direct-indices-ubsan -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_CXX_FLAGS='-fsanitize=undefined -fno-sanitize-recover=all'
 cmake --build /private/tmp/meon-direct-indices-ubsan --target test_benchmark_routing test_c_api -j4
 ctest --test-dir /private/tmp/meon-direct-indices-ubsan -R '^test_(benchmark_routing|c_api)$' --output-on-failure
+```
+
+The validation switch was tested on an Apple M1 Max with macOS 15.6.1, Python 3.9.12 and CPU PyTorch 1.13.1. The eight-rank mock exercises both validation settings across routing generations and checks forwarding, return rows, and acceptance or rejection of individual malformed fields. The ordinary dynamic-routing test checks that an unsorted expert list is rejected even when benchmark validation is disabled.
+
+```bash
+cmake -S . -B build/mock -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/mock -j4
+ctest --test-dir build/mock --output-on-failure
+OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python
+ctest --test-dir build/exchange-host --output-on-failure
 ```
 
 The CUDA build, two-node numerical and transport checks, and Nsight timing comparison require the Hopper hosts.

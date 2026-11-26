@@ -52,7 +52,17 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
             (["--no-benchmark-metadata-exchange", "--dynamic-routing"],
              ["--router_dynamic_routing_enabled=true", "--router_benchmark_metadata_enabled=false"]),
             (["--communication-only", "--router_benchmark_metadata_enabled=true", "--dynamic-routing"],
-             ["--router_dynamic_routing_enabled=true", "--router_benchmark_metadata_enabled=true"]),
+             ["--router_benchmark_metadata_enabled=true", "--router_dynamic_routing_enabled=true"]),
+            (["--benchmark-metadata-exchange", "--no-benchmark-metadata-validation"],
+             ["--router_dynamic_routing_enabled=true", "--router_benchmark_metadata_enabled=true",
+              "--router_benchmark_metadata_validation_enabled=false"]),
+            (["--no-benchmark-metadata-validation", "--benchmark-metadata-validation"],
+             ["--router_benchmark_metadata_validation_enabled=true"]),
+            (["--router_benchmark_metadata_validation_enabled=false"],
+             ["--router_benchmark_metadata_validation_enabled=false"]),
+            (["--no-benchmark-metadata-validation", "--router_benchmark_metadata_validation_enabled=true"],
+             ["--router_benchmark_metadata_validation_enabled=true",
+              "--router_benchmark_metadata_validation_enabled=false"]),
             ([], []),
         ):
             output = io.StringIO()
@@ -61,8 +71,9 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                     self.assertEqual(worker.main(), 0)
                 derived = output.getvalue().splitlines()[-1].split()
                 observed = [arg for arg in derived if arg.startswith(("--router_dynamic_routing_enabled=",
-                                                                       "--router_benchmark_metadata_enabled="))]
-                self.assertCountEqual(observed, expected)
+                                                                       "--router_benchmark_metadata_enabled=",
+                                                                       "--router_benchmark_metadata_validation_enabled="))]
+                self.assertEqual(observed, expected)
 
     def test_legacy_library_rejects_enabled_config_and_respects_override(self):
         lib = SimpleNamespace()

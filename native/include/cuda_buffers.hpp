@@ -312,7 +312,7 @@ private:
     void free_buffer(GpuBuffer& buffer);
     void allocate_pinned_buffer(CpuPinnedBuffer& buffer, std::size_t bytes);
     void free_pinned_buffer(CpuPinnedBuffer& buffer);
-    void validate_expert_metadata(const RouterExpertMetadata& metadata) const;
+    void validate_expert_metadata(const RouterExpertMetadata& metadata, bool validate_indices) const;
     void assign_expert_metadata(NvlinkReceiveBuffer& buffer, RouterExpertMetadata metadata);
     void clear_iteration_cpu_scatter();
     void initialize_router_computation_scheduler_locked(const RdmaProxyBenchmarkDeviceIndices* device_indices = nullptr);

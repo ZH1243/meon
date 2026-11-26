@@ -79,25 +79,41 @@ void check_borrowed_source_views(const ProxyConfig& config) {
     std::array<uint8_t, 3> x4{2, 1, 4};
     std::array<int32_t, tokens * experts_per_gpu> r{};
     for (std::size_t i = 0; i < r.size(); ++i) r[i] = static_cast<int32_t>(i);
-    auto reject = [&] {
-        RouterRouting bad(config);
-        expect_error([&] { bad.borrow_benchmark_host(r.data(), offsets.data(), x3.data(), x4.data(), x3.size()); });
+    auto check_install = [&](bool should_reject) {
+        auto borrow = [&] {
+            RouterRouting route(config);
+            route.borrow_benchmark_host(r.data(), offsets.data(), x3.data(), x4.data(), x3.size());
+        };
+        auto copy = [&] {
+            RouterRouting route(config);
+            route.initialize_benchmark_host(r.data(), offsets.data(), x3.data(), x4.data(), x3.size());
+        };
+        if (should_reject) {
+            expect_error(borrow);
+            expect_error(copy);
+        } else {
+            borrow();
+            copy();
+        }
     };
+    const bool validate = config.router_benchmark_metadata_validation_enabled;
     offsets[1] = 3;
-    reject();
+    check_install(true);
     offsets[1] = 2;
     x3[0] = tokens;
-    reject();
+    check_install(true);
+    x3[0] = -1;
+    check_install(true);
     x3[0] = 0;
-    reject(); // Duplicate original token in the first node.
+    check_install(validate); // Duplicate original token in the first node.
     x3[0] = 1;
     x4[0] = 0;
-    reject();
+    check_install(validate);
     x4[0] = 1;
-    reject(); // Equal masks require increasing original token IDs.
+    check_install(validate); // Equal masks require increasing original token IDs.
     x4[0] = 2;
     r[0] = config.router_num_experts;
-    reject();
+    check_install(validate);
     r[0] = 0;
 
     RouterRouting route(config);
@@ -242,10 +258,10 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
             bad = host;
             bad.r = nullptr;
             reject(bad);
-            const int32_t saved = rank.source_r[0];
-            rank.source_r[0] = nodes * gpus * experts_per_gpu;
+            const int32_t saved = rank.source_x3[0];
+            rank.source_x3[0] = tokens;
             reject(host);
-            rank.source_r[0] = saved;
+            rank.source_x3[0] = saved;
             if (gpu == 0) {
                 // Simulate the exchange delivering live indices directly into the
                 // allocator's device slots. Poison tails to expose stale rows.
@@ -430,18 +446,18 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
     }
 }
 
-void check_partial_borrowed_install(Rank& rank, uint64_t epoch, bool swap_device_sources = false) {
+void check_final_borrowed_install(Rank& rank, uint64_t epoch, std::vector<int32_t> rows,
+                                  bool swap_device_sources, const char* expected_error) {
     std::array<RdmaProxyBenchmarkSource, nodes * gpus> sources{};
     for (std::size_t i = 0; i < sources.size(); ++i) {
         rank.offsets[i].fill(0);
         rank.indices[i].clear();
         sources[i] = {rank.offsets[i].data(), nullptr, 0};
     }
-    // This bad index is found after installing the source view, during
-    // validation of incoming expert rows. Keep storage alive through shutdown.
-    rank.offsets[0].back() = 1;
-    rank.indices[0].push_back(swap_device_sources ? 0 : tokens);
-    sources[0] = {rank.offsets[0].data(), rank.indices[0].data(), 1};
+    // Keep all arrays alive through shutdown, including after a partial installation.
+    rank.indices[0] = std::move(rows);
+    rank.offsets[0].back() = static_cast<int32_t>(rank.indices[0].size());
+    sources[0] = {rank.offsets[0].data(), rank.indices[0].data(), rank.indices[0].size()};
     rank.source_offsets.fill(0);
     rank.source_r.fill(0);
     RdmaProxyBenchmarkRouting routing{sizeof(routing), nodes * gpus, sources.data()};
@@ -452,12 +468,19 @@ void check_partial_borrowed_install(Rank& rank, uint64_t epoch, bool swap_device
     RdmaProxyBenchmarkDeviceIndices views{sizeof(views), nodes*gpus, tokens*experts_per_gpu, addresses.data()};
     if (swap_device_sources)
         for (auto* slot : rank.device_indices) std::fill_n(slot, tokens*experts_per_gpu, -9);
-    try {
+    auto install = [&] {
         rank.proxy->install_borrowed_benchmark_route_views(epoch, routing, source, swap_device_sources ? &views : nullptr);
+    };
+    if (!expected_error) {
+        // Observe that trusted mode skips this scan. Never dispatch the deliberately bad list.
+        install();
+        return;
+    }
+    try {
+        install();
         throw std::logic_error("partial borrowed installation unexpectedly succeeded");
     } catch (const std::runtime_error& error) {
-        const auto expected = swap_device_sources ? "device index slot disagrees" : "invalid token index";
-        if (std::string(error.what()).find(expected) == std::string::npos) throw;
+        if (std::string(error.what()).find(expected_error) == std::string::npos) throw;
     }
     if (swap_device_sources)
         for (const auto* slot : rank.device_indices)
@@ -491,7 +514,7 @@ void check_empty_device_indices(Rank& rank, uint64_t epoch) {
             throw std::runtime_error("empty source lists must expose exactly one zero index");
 }
 
-void run(bool prepared) {
+void run(bool prepared, bool validate) {
     ProxyConfig config;
     config.num_nodes = nodes;
     config.num_gpus_per_node = gpus;
@@ -502,6 +525,7 @@ void run(bool prepared) {
     config.fill_test_data = config.validate_data = false;
     config.router_routing_enabled = config.router_dynamic_routing_enabled = true;
     config.router_benchmark_metadata_enabled = config.router_local_input_staging_enabled = true;
+    config.router_benchmark_metadata_validation_enabled = validate;
     config.router_num_experts = nodes*gpus*experts_per_gpu;
     config.router_top_k = experts_per_gpu;
     config.nvlink_forwarding_enabled = config.nvlink_forward_synchronize_batches = true;
@@ -584,9 +608,10 @@ void run(bool prepared) {
             }
         }
     }
-    check_partial_borrowed_install(ranks[1], 3);
-    check_partial_borrowed_install(ranks[2], 3, true);
+    check_final_borrowed_install(ranks[1], 3, {tokens}, false, validate ? "invalid token index" : nullptr);
+    check_final_borrowed_install(ranks[2], 3, {0}, true, "device index slot disagrees");
     check_empty_device_indices(ranks[3], 3);
+    check_final_borrowed_install(ranks[4], 3, {1, 0}, false, validate ? "not monotonic" : nullptr);
     on_all_gpus([&](int gpu) { ranks[gpu].proxy->shutdown(); });
     expect_error([&] { (void)ranks[0].proxy->router_expert_metadata_for_source(0, 0); });
     for (int gpu : {0, 1}) {
@@ -602,5 +627,6 @@ void run(bool prepared) {
 
 int main() {
     Logger::instance().set_level(LogLevel::kError);
-    for (bool prepared : {false, true}) run(prepared);
+    for (bool prepared : {false, true}) run(prepared, true);
+    run(true, false);
 }

@@ -47,9 +47,17 @@ static ProxyConfig gather_config() {
     return c;
 }
 
-static void check_mock_gather(const ProxyConfig& c) {
+static void check_mock_gather(ProxyConfig c) {
+    // The benchmark opt-out must not relax ordinary dynamic routing.
+    c.router_benchmark_metadata_validation_enabled = false;
     CudaBuffers buffers(c);
     buffers.initialize();
+    bool rejected = false;
+    try { buffers.install_iteration_expert_metadata({table(0, {2, 1}), table(1, {})}, 0); }
+    catch (const std::runtime_error& e) {
+        rejected = std::string(e.what()).find("not monotonic") != std::string::npos;
+    }
+    assert(rejected);
     // Include an initially empty GPU, growth, same-size rerouting, then shrink.
     const std::vector<std::vector<int32_t>> lists{{}, {0,2,4,6}, {1,2,3,5}, {4}};
     void* indices = nullptr;

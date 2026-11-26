@@ -316,6 +316,14 @@ void apply_arg(ProxyConfig& config, const std::string& key, const std::string& v
     else if (key == "router_benchmark_metadata_enabled") {
         config.router_benchmark_metadata_enabled = (value == "1" || value == "true" || value == "yes");
     }
+    else if (key == "router_benchmark_metadata_validation_enabled") {
+        if (value == "1" || value == "true" || value == "yes")
+            config.router_benchmark_metadata_validation_enabled = true;
+        else if (value == "0" || value == "false" || value == "no")
+            config.router_benchmark_metadata_validation_enabled = false;
+        else
+            throw std::runtime_error(key + " must be a boolean");
+    }
     else if (key == "num_experts" || key == "router_num_experts") {
         config.router_num_experts = std::stoi(value);
     }
@@ -690,6 +698,8 @@ static ProxyConfig parse_config_file(const std::string& path) {
         object, "router_dynamic_routing_enabled", config.router_dynamic_routing_enabled);
     config.router_benchmark_metadata_enabled = get_bool(
         object, "router_benchmark_metadata_enabled", config.router_benchmark_metadata_enabled);
+    config.router_benchmark_metadata_validation_enabled = get_bool(
+        object, "router_benchmark_metadata_validation_enabled", config.router_benchmark_metadata_validation_enabled);
     config.router_num_experts = number_as<int>(
         object, "num_experts", number_as<int>(object, "router_num_experts", config.router_num_experts));
     config.router_top_k = number_as<int>(
@@ -1439,6 +1449,8 @@ std::string config_summary(const ProxyConfig& config) {
         << " router_routing_enabled=" << (config.router_routing_enabled ? "true" : "false")
         << " router_dynamic_routing_enabled=" << (config.router_dynamic_routing_enabled ? "true" : "false")
         << " router_benchmark_metadata_enabled=" << (config.router_benchmark_metadata_enabled ? "true" : "false")
+        << " router_benchmark_metadata_validation_enabled="
+        << (config.router_benchmark_metadata_validation_enabled ? "true" : "false")
         << " num_experts=" << config.router_num_experts
         << " top_k=" << config.router_top_k
         << " router_weighted_contributions_enabled=" << (config.router_weighted_contributions_enabled ? "true" : "false")

@@ -190,8 +190,12 @@ RDMA_PROXY_C_API int rdma_proxy_prepare_routing(RdmaProxyHandle* handle, uint64_
 
 /* Optional benchmark exchange provider. Set struct_size before either call.
  * Source views are in global source-rank order, offsets has local_experts + 1
- * entries, and count is the compact index count. remote_x3/x4 describes the
- * same-local-GPU peer's incoming payload (one destination mask per token).
+ * entries, and count is the compact index count. Each index must address a
+ * valid input row, with nondecreasing indices within each expert. With
+ * router_benchmark_metadata_validation_enabled=false the caller guarantees
+ * this ordering and range, valid expert IDs, and valid, ordered x3/x4 slices.
+ * remote_x3/x4 describes the same-local-GPU peer's incoming payload (one
+ * destination mask per token).
  * The four device arrays belong to this rank's completed metadata graph.
  * Complete exchange and local input staging before install. Install once per
  * retired epoch's successor, including epoch zero, before preparing or

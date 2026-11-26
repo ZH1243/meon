@@ -46,6 +46,7 @@ int main(int argc, char** argv) {
     assert(!config.rdma_discontinuous_token_payload_enabled);
     assert(!config.router_routing_enabled && !config.router_dynamic_routing_enabled);
     assert(!config.router_benchmark_metadata_enabled);
+    assert(config.router_benchmark_metadata_validation_enabled);
     {
         std::ofstream out("dynamic_router_config.json");
         out << R"({"num_nodes":1,"num_gpus_per_node":2,"num_tokens":7,"token_dimension":4,"num_experts":2,"top_k":1,
@@ -63,6 +64,7 @@ int main(int argc, char** argv) {
         std::ofstream out("benchmark_router_config.json");
         out << R"({"num_nodes":2,"num_gpus_per_node":8,"num_tokens":17,"token_dimension":4,"num_experts":128,"top_k":8,
                    "router_routing_enabled":true,"router_dynamic_routing_enabled":true,"router_benchmark_metadata_enabled":true,
+                   "router_benchmark_metadata_validation_enabled":false,
                    "nvlink_forwarding_enabled":true,"router_local_input_staging_enabled":true,"fill_test_data":false,
                    "nvlink_forward_completion_notifications_enabled":true,"nvlink_forward_synchronize_batches":true,
                    "nvlink_forward_threshold_tokens":2,"nvlink_forward_chunk_tokens":2,
@@ -70,8 +72,20 @@ int main(int argc, char** argv) {
         out.close();
         const auto base = rdma_proxy::load_config_file("benchmark_router_config.json");
         assert(base.router_benchmark_metadata_enabled);
+        assert(!base.router_benchmark_metadata_validation_enabled);
+        assert(rdma_proxy::config_summary(base).find(
+            "router_benchmark_metadata_validation_enabled=false") != std::string::npos);
         const char* args[] = {"proxy", "--config", "benchmark_router_config.json", "--router_benchmark_metadata_enabled=false"};
         assert(!rdma_proxy::load_config(4, const_cast<char**>(args)).router_benchmark_metadata_enabled);
+        args[3] = "--router_benchmark_metadata_validation_enabled=true";
+        assert(rdma_proxy::load_config(4, const_cast<char**>(args)).router_benchmark_metadata_validation_enabled);
+        args[3] = "--router_benchmark_metadata_validation_enabled=flase";
+        bool rejected_typo = false;
+        try { (void)rdma_proxy::load_config(4, const_cast<char**>(args)); }
+        catch (const std::runtime_error& e) {
+            rejected_typo = std::string(e.what()).find("must be a boolean") != std::string::npos;
+        }
+        assert(rejected_typo);
         for (const auto unsupported : {"--router_dynamic_routing_enabled=false", "--num_gpus_per_node=4",
                                        "--num_experts=256", "--top_k=4", "--router_weighted_contributions_enabled=true",
                                        "--num_tokens=10000001"}) {

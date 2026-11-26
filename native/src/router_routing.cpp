@@ -121,6 +121,14 @@ void RouterRouting::validate_benchmark_node_slice(
     if (count > config_.num_tokens || (count && (!x3 || !x4)))
         throw std::runtime_error("invalid benchmark x3/x4 slice length or address");
     if (!count) return;
+    if (!config_.router_benchmark_metadata_validation_enabled) {
+        // Token IDs become byte addresses in RDMA scatter/gather entries.
+        if (std::any_of(x3, x3 + count, [&](int32_t token) {
+                return static_cast<std::size_t>(token) >= config_.num_tokens;
+            }))
+            throw std::runtime_error("invalid benchmark x3 token");
+        return;
+    }
     std::vector<bool> seen(config_.num_tokens, false);
     for (std::size_t i = 0; i < count; ++i) {
         const auto token = x3[i];
@@ -233,6 +241,7 @@ void RouterRouting::copy_benchmark_nodes(const int32_t* offsets, const int32_t* 
 }
 
 void RouterRouting::validate_benchmark_experts(ExpertIndexView experts) const {
+    if (!config_.router_benchmark_metadata_validation_enabled) return;
     for (auto expert : experts)
         if (expert < 0 || expert >= config_.router_num_experts)
             throw std::runtime_error("benchmark R contains an out-of-range expert");

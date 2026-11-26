@@ -635,7 +635,7 @@ void CudaBuffers::stage_local_router_input(
 #endif
 }
 
-void CudaBuffers::validate_expert_metadata(const RouterExpertMetadata& metadata) const {
+void CudaBuffers::validate_expert_metadata(const RouterExpertMetadata& metadata, bool validate_indices) const {
     if (!config_.router_routing_enabled || !config_.nvlink_forwarding_enabled) {
         throw std::runtime_error(
             "expert metadata requires combined router/NVLink mode");
@@ -668,9 +668,11 @@ void CudaBuffers::validate_expert_metadata(const RouterExpertMetadata& metadata)
     }
     if (indices.size() && !indices.data())
         throw std::runtime_error("expert metadata is missing its token indices");
-    for (const int32_t index : indices) {
-        if (index < 0 || static_cast<std::size_t>(index) >= config_.num_tokens)
-            throw std::runtime_error("expert metadata contains an invalid token index");
+    if (validate_indices) {
+        for (const int32_t index : indices) {
+            if (index < 0 || static_cast<std::size_t>(index) >= config_.num_tokens)
+                throw std::runtime_error("expert metadata contains an invalid token index");
+        }
     }
     if ((metadata.top_k != 0 && metadata.top_k != config_.router_top_k) ||
         (metadata.weighted_contributions && metadata.top_k != config_.router_top_k) ||
@@ -681,12 +683,12 @@ void CudaBuffers::validate_expert_metadata(const RouterExpertMetadata& metadata)
     for (float weight : metadata.expert_route_weights)
         if (!std::isfinite(weight) || weight < 0.0f)
             throw std::runtime_error("expert metadata weights must be finite and nonnegative");
-    for (int expert = 0; expert < expected_experts_per_gpu; ++expert) {
-        const auto begin = offsets[expert];
-        const auto end = offsets[expert + 1];
-        if (begin != end && !std::is_sorted(indices.begin() + begin, indices.begin() + end)) {
-            throw std::runtime_error(
-                "expert metadata token indices are not monotonic within an expert list");
+    if (validate_indices) {
+        for (int expert = 0; expert < expected_experts_per_gpu; ++expert) {
+            const auto begin = offsets[expert];
+            const auto end = offsets[expert + 1];
+            if (begin != end && !std::is_sorted(indices.begin() + begin, indices.begin() + end))
+                throw std::runtime_error("expert metadata token indices are not monotonic within an expert list");
         }
     }
     if (metadata.source_node_rank < 0 ||
@@ -707,7 +709,7 @@ void CudaBuffers::assign_expert_metadata(NvlinkReceiveBuffer& buffer, RouterExpe
 }
 
 void CudaBuffers::install_expert_metadata(RouterExpertMetadata metadata) {
-    validate_expert_metadata(metadata);
+    validate_expert_metadata(metadata, true);
     std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
     auto it = std::find_if(
         nvlink_recv_buffers_.begin(), nvlink_recv_buffers_.end(),
@@ -743,8 +745,10 @@ void CudaBuffers::install_iteration_expert_metadata(
     // Validate the entire exchange before replacing any live source. The buffer
     // allocation order is global source rank, independent of message arrival.
     std::vector<bool> seen(tables.size(), false);
+    const bool validate_indices = !config_.router_benchmark_metadata_enabled ||
+                                  config_.router_benchmark_metadata_validation_enabled;
     for (const auto& table : tables) {
-        validate_expert_metadata(table);
+        validate_expert_metadata(table, validate_indices);
         const auto slot = static_cast<std::size_t>(table.source_node_rank) *
             config_.num_gpus_per_node + table.source_gpu_index;
         if (seen.at(slot)) throw std::runtime_error("duplicate source in routing generation");

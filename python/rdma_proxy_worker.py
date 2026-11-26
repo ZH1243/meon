@@ -1475,6 +1475,9 @@ def build_proxy_argv(
     if getattr(args, "benchmark_metadata_exchange", None) is not None:
         generated_args.append(
             f"--router_benchmark_metadata_enabled={str(args.benchmark_metadata_exchange).lower()}")
+    if getattr(args, "benchmark_metadata_validation", None) is not None:
+        generated_args.append(
+            f"--router_benchmark_metadata_validation_enabled={str(args.benchmark_metadata_validation).lower()}")
     if args.concurrent_kernel:
         generated_args.extend(
             [
@@ -2380,6 +2383,8 @@ def main() -> int:
                         help="regenerate, exchange and stage routing before each iteration")
     parser.add_argument("--benchmark-metadata-exchange", action=argparse.BooleanOptionalAction, default=None,
                         help="use the CuTe benchmark metadata exchange and staging backend for dynamic routing")
+    parser.add_argument("--benchmark-metadata-validation", action=argparse.BooleanOptionalAction, default=None,
+                        help="scan benchmark route values during native installation (default: enabled)")
     parser.add_argument("--gemm-arch", choices=("auto", "hopper", "blackwell"), default="auto",
                         help="resolve GEMM/table geometry before native initialization; explicit values are checked against the GPU")
     parser.add_argument("--check-projections", action=argparse.BooleanOptionalAction, default=False,

@@ -183,6 +183,30 @@ TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build/mock-tsan \
 
 On Hopper, run `ctest --test-dir "$RDMA_PROXY_BUILD_DIR" -R '^test_cpu_scatter_cuda$' --output-on-failure` after building the CUDA tests. Rebuild the shared library on both hosts and repeat the dynamic numerical check above with `--cpu-scatter-preparation --cpu-scatter-publication=threaded`. In Nsight Systems, follow the scatter metadata H2D back to its CUDA API call. Each rank should show one `rdma-scatter` thread issuing that upload across all nonempty iterations. Look for the pinned scatter allocation during setup and one upload per nonempty iteration, sized by that iteration's route count. To measure the effect on latency in the benchmark metadata run, compare steady-state `install_us` and the interval from the end of the local staging gather to the start of up-GEMM at the same workload. [Scatter staging and upload sizes](runtime.md#optional-cpu-scatter-preparation)
 
+To verify direct binding of threaded scatter addresses, use the updated
+`prepare_grouped_inputs` from `QUACK_ROOT` on both nodes and compare dynamic
+iterations after warmup. In the before/after profiles, check that the
+device-to-device copy of the provisional address table disappears during
+down-input setup and that the helper still uploads the final table before
+down-GEMM. For N-tile-major output, the provisional copy was 16 bytes per
+expert assignment. Compare the down-input setup interval at the same token
+count, and run the weighted projection check above to verify the packed weights.
+
+The host checks for this change used an Apple M1 Max, macOS 15.6.1, CPU
+PyTorch 1.13.1 and the Debug native build. From the meon checkout:
+
+```bash
+cmake --build build/mock --target test_cpu_scatter -j4
+ctest --test-dir build/mock -R '^test_cpu_scatter$' --output-on-failure
+OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -v
+(cd "$QUACK_ROOT" && PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  /Users/zhuhao/opt/anaconda3/bin/python3 -B -m pytest -q -p no:cacheprovider --noconftest tests/test_wave_ready_prefix.py)
+```
+
+The QuACK numerical and CUDA graph replay check on Hopper is
+`python -m pytest -q tests/test_gemm_gather_table.py -k wave_ready_publication_tail_and_replay`
+from `QUACK_ROOT`. It and the two-node timing comparison require a CUDA host.
+
 For the dynamic intra-node combine table, `test_c_api` compares the native output
 with the mask query, and `test_benchmark_routing` covers incoming remote masks
 and shrinking and empty domains. The Python regression in `test_dynamic_routing.py`

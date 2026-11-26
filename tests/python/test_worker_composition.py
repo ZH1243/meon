@@ -327,8 +327,18 @@ class CompositionCudaTests(unittest.TestCase):
                    for source, size in enumerate(valid)]
         compact = [output.flatten()[:size * hidden]
                    for output, size in zip(down.inputs.output_buffers(), valid)]
+        # Keep the warmup runner as an independent GPU producer of reference
+        # addresses. Only the refreshed runner consumes the threaded upload.
+        reference_down = down
+        if preparation == "threaded":
+            down = worker.DownProjectionRunner(torch, up, expert_counts, options,
+                                               trace_configure=configure_trace, previous=reference_down)
         combine = FinalCombine(compact, indices, input_rows, hidden, tile_n=tile_n, num_ctas=2,
                                register_prefetch=True, ready_groups=down.inputs.ready_groups)
+        # The initial down launch published the warmup prefix on the original runner.
+        if down is not reference_down:
+            with torch.inference_mode():
+                down.inputs.ready_groups.copy_(reference_down.inputs.ready_groups)
         combine()  # Warm the real callable before any waiting kernel is launched.
         torch.cuda.synchronize()
         down.finish_iteration()
@@ -397,17 +407,19 @@ class CompositionCudaTests(unittest.TestCase):
                 # Use the tested GPU address builder only to obtain invariant
                 # compact destination addresses; source weights are packed by a
                 # separate CPU descriptor walk, never by the implementation.
-                down.cpu_scatter = False
                 with torch.inference_mode():
-                    down._prepare_combine(up.work_table, up.a_idx)
+                    reference_down._prepare_combine(up.work_table, up.a_idx)
+                    if down is not reference_down:
+                        down.combine_valid_rows.copy_(reference_down.combine_valid_rows)
+                        down.combine_output_to_input.copy_(reference_down.combine_output_to_input)
                 torch.cuda.synchronize()
-                pinned_addresses = down.inputs.scatter_row_addresses.cpu().pin_memory()
+                pinned_addresses = reference_down.inputs.scatter_row_addresses.cpu().pin_memory()
                 if policy is not None:
                     expected_values = [up.route_weights[source][position].item()
                                        for _, source, position in validation.route_positions(up, routes)]
                     pinned_route_weights = torch.tensor(expected_values, dtype=torch.float32).pin_memory()
                 if single_upload:
-                    pinned_metadata = down.cpu_scatter_metadata.cpu().pin_memory()
+                    pinned_metadata = reference_down.cpu_scatter_metadata.cpu().pin_memory()
                     self.assertEqual(down.inputs.scatter_row_addresses.data_ptr(),
                                      down.cpu_scatter_metadata.data_ptr())
                     if pinned_route_weights is not None:

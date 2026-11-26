@@ -1939,6 +1939,14 @@ and each N-tile-major entry uses 16. Weighted mode appends 4 bytes per assignmen
 starting at the next 16-byte boundary after the current generation's addresses.
 Python retains the destination and its typed views until their last native use.
 
+On each nonempty dynamic refresh in threaded mode, meon passes QuACK the final
+device address table. The scatter helper uploads the current route's addresses
+and optional weights into that allocation before down-GEMM reads it. The initial
+warmup uses its synthetic destinations. This optimization requires the
+`scatter_row_addresses` keyword in the QuACK checkout's
+`run.hopper_pregather_gemm.prepare_grouped_inputs`. With an older checkout,
+meon uses the existing scatter-mapping setup.
+
 With dynamic routing and threaded publication, the torchrun worker reserves one
 pinned host buffer during setup, even when the first generation has zero routes.
 Its maximum assignment count is `active_sources * num_tokens * min(top_k, experts_per_gpu)`.

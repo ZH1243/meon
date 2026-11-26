@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 from functools import partial
+import inspect
 import math
 import os
 from pathlib import Path
@@ -846,32 +847,37 @@ def compact_combine_mapping(torch, mapping, num_sources, capacity):
     return compact, used.sum(dim=1), output_to_input
 
 
-def make_cpu_scatter_metadata_storage(torch, scatter_row_addresses, route_weights=None):
-    """One owned byte allocation, with contiguous typed views for one native H2D.
+def allocate_cpu_scatter_metadata_storage(torch, address_shape, device, weighted):
+    """Allocate the address and optional weight views for a single native upload."""
+    scatter_bytes = math.prod(address_shape) * 8  # int64 addresses
+    weight_offset = (scatter_bytes + 15) // 16 * 16
+    total_bytes = weight_offset + address_shape[0] * 4 if weighted else scatter_bytes
+    storage = torch.empty(total_bytes, dtype=torch.uint8, device=device)
+    addresses = storage[:scatter_bytes].view(torch.int64).reshape(address_shape)
+    weights = storage[weight_offset:].view(torch.float32) if weighted else None
+    return storage, addresses, weights
 
-    Preserve QuACK's tensor shapes and align FP32 route weights to 16 bytes.
-    The native deferred publisher validates this exact layout before borrowing it.
-    """
+
+def make_cpu_scatter_metadata_storage(torch, scatter_row_addresses, route_weights=None):
+    """Pack existing QuACK inputs into the native scatter layout, including for warmup."""
     if (scatter_row_addresses.dtype != torch.int64 or not scatter_row_addresses.is_contiguous()
             or scatter_row_addresses.ndim not in (1, 2)
             or (scatter_row_addresses.ndim == 2 and scatter_row_addresses.shape[1] != 2)
             or scatter_row_addresses.shape[0] <= 0):
         raise ValueError("CPU scatter storage requires contiguous int64 routes or routes-by-2 addresses")
-    scatter_bytes = scatter_row_addresses.numel() * scatter_row_addresses.element_size()
-    weight_offset = (scatter_bytes + 15) // 16 * 16
     if route_weights is not None and (
         route_weights.dtype != torch.float32 or route_weights.shape != (scatter_row_addresses.shape[0],)
         or route_weights.device != scatter_row_addresses.device or not route_weights.is_contiguous()
     ):
         raise ValueError("CPU scatter weights require contiguous FP32 storage matching address rows and device")
-    total_bytes = (scatter_bytes if route_weights is None else
-                   weight_offset + route_weights.numel() * route_weights.element_size())
-    storage = torch.zeros(total_bytes, dtype=torch.uint8, device=scatter_row_addresses.device)
-    addresses = storage[:scatter_bytes].view(torch.int64).reshape(scatter_row_addresses.shape)
+    storage, addresses, weights = allocate_cpu_scatter_metadata_storage(
+        torch, scatter_row_addresses.shape, scatter_row_addresses.device, route_weights is not None)
     addresses.copy_(scatter_row_addresses)
-    weights = None
     if route_weights is not None:
-        weights = storage[weight_offset:].view(torch.float32)
+        # An odd number of int64s leaves one int64 of padding before the weights.
+        if addresses.numel() % 2:
+            padding_start = addresses.numel() * addresses.element_size()
+            storage[padding_start:padding_start + 8].zero_()
         weights.copy_(route_weights)
     return storage, addresses, weights
 
@@ -939,11 +945,10 @@ class DownProjectionRunner:
         self.up = up
         self.routes = routes
         self.route_weights = None
-        if getattr(options, "weighted_contributions", False):
+        weighted = getattr(options, "weighted_contributions", False)
+        if weighted:
             if up.route_weights is None:
                 raise RuntimeError("weighted contributions require native per-source routing weights")
-            # Own the packed runtime argument through every launch and native shutdown.
-            self.route_weights = torch.zeros(routes, dtype=torch.float32, device=up.output.device)
         elif getattr(up, "route_weights", None) is not None:
             raise RuntimeError("native routing weights disagree with --no-weighted-contributions")
         clusters_n = math.ceil(up.gemm_dimension / up.tile_n)
@@ -993,16 +998,27 @@ class DownProjectionRunner:
                 len(outputs), dtype=torch.int64, device=up.output.device)
             self.combine_output_to_input = torch.full(
                 (len(outputs), rows), -1, dtype=torch.int64, device=up.output.device)
-            external = dict(output_buffers=outputs, scatter_mapping=torch.zeros(
-                (routes, 2), dtype=torch.int64, device=up.output.device))
-        if self.route_weights is not None:
+            external["output_buffers"] = outputs
+            if (previous is not None and self.cpu_scatter and self.cpu_scatter_publication == "threaded"
+                    and "scatter_row_addresses" in inspect.signature(pregather.prepare_grouped_inputs).parameters):
+                # The native publisher fills every live row before down's event wait.
+                address_shape = (routes, 2) if args.n_tile_major_output else (routes,)
+                self.cpu_scatter_metadata, addresses, self.route_weights = allocate_cpu_scatter_metadata_storage(
+                    torch, address_shape, up.output.device, weighted)
+                external["scatter_row_addresses"] = addresses
+            elif routes:
+                external["scatter_mapping"] = torch.zeros((routes, 2), dtype=torch.int64, device=up.output.device)
+        if weighted:
+            if self.route_weights is None:
+                self.route_weights = torch.zeros(routes, dtype=torch.float32, device=up.output.device)
             external["route_weights"] = self.route_weights
         if routes:
             self.inputs = pregather.prepare_grouped_inputs(
                 args, up.output[:routes], self.weights, counts, **external)
         else:
             self.inputs = EmptyDownInputs(torch, args, up.output, external.get("output_buffers"))
-        if self.cpu_scatter and self.cpu_scatter_publication in ("deferred", "threaded"):
+        if (self.cpu_scatter and self.cpu_scatter_metadata is None
+                and self.cpu_scatter_publication in ("deferred", "threaded")):
             (self.cpu_scatter_metadata, self.inputs.scatter_row_addresses,
              self.route_weights) = make_cpu_scatter_metadata_storage(
                 torch, self.inputs.scatter_row_addresses, self.route_weights)

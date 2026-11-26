@@ -126,6 +126,71 @@ class MetadataSlabTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "contiguous FP32"):
                     worker.make_cpu_scatter_metadata_storage(torch, addresses, weights)
 
+    def test_refresh_binds_quack_to_the_native_publication_slab(self):
+        torch = self.torch
+        parser = argparse.ArgumentParser()
+        worker.add_down_arguments(parser)
+        options = parser.parse_args(["--local-gpu-combine", "--cpu-scatter-preparation"])
+        up = SimpleNamespace(
+            output=torch.empty(8, 4), weights=torch.empty(2, 4, 4), device_capacity=9,
+            x_buffers=(torch.empty(8, 4), torch.empty(8, 4)), gemm_dimension=4,
+            tile_n=2, max_swizzle_size=1,
+        )
+        previous = mock.Mock()
+        previous.inputs.output_buffers.return_value = up.x_buffers
+        seen = []
+
+        def prepare(args, a, w, counts, *, output_buffers, scatter_mapping=None,
+                    scatter_row_addresses=None, route_weights=None):
+            seen.append((scatter_mapping, scatter_row_addresses, route_weights))
+            if scatter_row_addresses is None:
+                self.assertEqual(scatter_mapping.shape, (sum(counts), 2))
+                shape = (sum(counts), 2) if args.n_tile_major_output else (sum(counts),)
+                scatter_row_addresses = torch.full(shape, 123, dtype=torch.int64)
+            return SimpleNamespace(scatter_row_addresses=scatter_row_addresses,
+                                   output_buffers=lambda: output_buffers)
+
+        def legacy(args, a, w, counts, *, output_buffers, scatter_mapping, route_weights=None):
+            return prepare(args, a, w, counts, output_buffers=output_buffers,
+                           scatter_mapping=scatter_mapping, route_weights=route_weights)
+
+        pregather = mock.Mock()
+        with mock.patch.dict(sys.modules, {"run": SimpleNamespace(hopper_pregather_gemm=pregather),
+                                           "quack.gemm": mock.Mock()}):
+            cases = [
+                ("threaded", prepare, True, False), ("threaded", prepare, True, True),
+                ("threaded", prepare, False, True), ("threaded", legacy, True, False),
+                ("deferred", prepare, True, True), ("per-batch", prepare, False, False),
+            ]
+            for mode, builder, tiled, weighted in cases:
+                with self.subTest(mode=mode, builder=builder.__name__, tiled=tiled, weighted=weighted):
+                    options.cpu_scatter_publication = mode
+                    options.down_n_tile_major_output = tiled
+                    options.weighted_contributions = weighted
+                    up.route_weights = (torch.empty(3),) if weighted else None
+                    pregather.prepare_grouped_inputs = builder
+                    seen.clear()
+                    empty = worker.DownProjectionRunner(torch, up, [0, 0], options, previous=previous)
+                    self.assertEqual(seen, [])
+                    self.assertIsNone(empty.cpu_scatter_metadata)
+                    runner = worker.DownProjectionRunner(torch, up, [2, 1], options, previous=empty)
+                    self.assertEqual(len(seen), 1)
+                    mapping, supplied, weights = seen[0]
+                    if mode == "threaded" and builder is prepare:
+                        self.assertIsNone(mapping)
+                        self.assertIs(supplied, runner.inputs.scatter_row_addresses)
+                        self.assertEqual(supplied.shape, (3, 2) if tiled else (3,))
+                        self.assertEqual(supplied.data_ptr(), runner.cpu_scatter_metadata.data_ptr())
+                        self.assertIs(weights, runner.route_weights)
+                        if weighted:
+                            offset = weights.data_ptr() - supplied.data_ptr()
+                            self.assertEqual(offset, (supplied.numel() * 8 + 15) // 16 * 16)
+                            self.assertEqual(runner.cpu_scatter_metadata.numel(), offset + 3 * 4)
+                    else:
+                        self.assertIsNotNone(mapping)
+                        self.assertIsNone(supplied)
+                        self.assertTrue(torch.all(runner.inputs.scatter_row_addresses == 123).item())
+
     def test_native_configuration_selects_policy_and_retains_slab(self):
         torch = self.torch
         for mode in ("deferred", "threaded", "per-batch"):

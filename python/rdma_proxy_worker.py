@@ -439,9 +439,10 @@ class GroupedGemmRunner:
         if self.gated:
             self.weights = self.weights.transpose(1, 2)
         self.weights.mul_(1.0 / math.sqrt(hidden_dimension))
+        # Dynamic routing sizes the first allocation in bind_routing, just like later growth.
+        initial_output_rows = len(x_buffers) * first_a_idx.numel() if routing_extents is None else 0
         self.output_storage = torch_module.empty(
-            (len(x_buffers) * (int(first_a_idx.numel()) if routing_extents is None
-                               else routing_extents[0]), output_dimension),
+            (initial_output_rows, output_dimension),
             dtype=first_x.dtype,
             device=first_x.device,
         )
@@ -510,22 +511,38 @@ class GroupedGemmRunner:
 
     def bind_routing(self, source_index_rows, table_rows):
         """Bind QuACK to live prefixes. Padding is storage, never scheduler work."""
-        if (not 1 <= source_index_rows <= self.index_storage[0].numel()
+        max_source_rows = self.index_storage[0].numel()
+        if (not 1 <= source_index_rows <= max_source_rows
                 or not 0 <= table_rows <= self.table_storage.shape[0]):
             raise ValueError("native routing extents exceed their allocated storage")
+        weights = stacked_weights = None
+        if self.weight_storage is not None:
+            weights = tuple(t[:source_index_rows] for t in self.weight_storage)
+            stacked_weights = self.torch.stack(weights)
+        source_count = len(self.index_storage)
+        output_rows = source_index_rows * source_count
+        storage = self.output_storage
+        if output_rows > storage.shape[0]:
+            # One extra row per 64 live rows per source absorbs small routing fluctuations.
+            spare_per_source = (source_index_rows + 63) // 64
+            capacity_rows = min(source_index_rows + spare_per_source, max_source_rows) * source_count
+            try:
+                storage = storage.new_empty((capacity_rows, storage.shape[1]))
+            except self.torch.cuda.OutOfMemoryError:
+                if capacity_rows == output_rows:
+                    raise
+                storage = storage.new_empty((output_rows, storage.shape[1]))
+
+        self.route_weights = weights
+        self.route_weights_stacked = stacked_weights
+        self.output_storage = storage
+        self.output = storage[:output_rows]
         self.a_idx = tuple(t[:source_index_rows] for t in self.index_storage)
         self.work_table = self.table_storage[:table_rows]
         self.empty_epoch = table_rows == 0
-        output_rows = source_index_rows * len(self.a_idx)
-        if output_rows > self.output_storage.shape[0]:
-            self.output_storage = self.output_storage.new_empty((output_rows, self.output_storage.shape[1]))
-        self.output = self.output_storage[:output_rows]
         if self.x_pool is not None:
             self.pooled_a_idx = self.pooled_index_storage[:output_rows]
             self.pooled_work_table = self.pooled_table_storage[:table_rows]
-        if self.weight_storage is not None:
-            self.route_weights = tuple(t[:source_index_rows] for t in self.weight_storage)
-            self.route_weights_stacked = self.torch.stack(self.route_weights)
 
     def launch(self, *, pooled: bool | None = None) -> None:
         if pooled is None:

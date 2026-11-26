@@ -39,6 +39,13 @@ The default native routing path uses the raw CUDA entry points. A PyTorch extens
 
 ## Up, scatter and down
 
+With dynamic routing, up-GEMM sizes its output from the longest active source
+index list, since all source lists use the same padded length. At startup and
+on growth, the worker reserves an extra 1/64 of that length per source, rounded
+up and capped at the source index capacity. If the reservation runs out of GPU
+memory, the worker retries with the required size. QuACK receives a view sized
+to the current route on every iteration.
+
 The multi-input up table contains `[expert, cid_n_base, start_0, end_0, …]`. The second column is the first N-cluster index of the swizzle group. Each half-open range addresses that source's padded int32 `A_idx` array. Source order must agree across tables, indices, weights and input buffers. A descriptor's packed output begins at the sum of the starts. N groups repeat the same M work. The persistent up kernel waits for ready rows and gathers from those sources while more transfers are in flight.
 
 On Hopper, `--pooled-up-gemm` allocates one `X_pool` per destination GPU before transport setup. Slice `source_node * gpus_per_node + source_gpu` holds up to `num_tokens` received rows. Local staging and forwarded NVLink copies land in these slices, and a remote same-index source has its slice registered for direct RDMA writes. At teardown, each forwarder closes its IPC imports before unlinking its notification object. The pool owner waits for those objects to retire before releasing storage. If it cannot confirm closure, it retains the exported pool for the process lifetime.

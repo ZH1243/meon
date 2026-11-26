@@ -3,6 +3,7 @@ import ctypes
 import os
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -46,17 +47,26 @@ class DynamicRoutingTests(unittest.TestCase):
             self.skipTest("requires PyTorch")
         up = worker.GroupedGemmRunner.__new__(worker.GroupedGemmRunner)
         up.torch = torch
-        up.index_storage = [torch.arange(8, dtype=torch.int32) for _ in range(2)]
-        up.weight_storage = [torch.arange(8, dtype=torch.float32) for _ in range(2)]
+        capacity = 130
+        up.index_storage = [torch.arange(capacity, dtype=torch.int32) for _ in range(2)]
+        up.weight_storage = [torch.arange(capacity, dtype=torch.float32) for _ in range(2)]
         up.output_storage = torch.empty((2, 16))
         up.table_storage = torch.empty((8, 6), dtype=torch.int32)
         up.x_pool = object()
-        up.pooled_index_storage = torch.empty(16, dtype=torch.int32)
+        up.pooled_index_storage = torch.empty(2 * capacity, dtype=torch.int32)
         up.pooled_table_storage = torch.empty((8, 4), dtype=torch.int32)
-        for epoch, (indices, rows) in enumerate(((2, 4), (1, 0), (7, 8), (2, 2))):
+        epochs = ((64, 4), (65, 4), (1, 0), (129, 8), (130, 8), (2, 2))
+        for epoch, (indices, rows) in enumerate(epochs):
+            old_storage = up.output_storage
             up.weight_storage[0].fill_(epoch)
             up.bind_routing(indices, rows)
             self.assertEqual(tuple(up.output.shape), (2 * indices, 16))
+            self.assertEqual(up.output.data_ptr(), up.output_storage.data_ptr())
+            if epoch in (0, 3):
+                self.assertIsNot(old_storage, up.output_storage)
+            else:
+                self.assertIs(old_storage, up.output_storage)
+            self.assertLessEqual(up.output_storage.shape[0], 2 * capacity)
             self.assertEqual(up.work_table.shape[0], rows)
             self.assertEqual(up.pooled_work_table.shape[0], rows)
             self.assertEqual(up.pooled_a_idx.numel(), 2 * indices)
@@ -66,7 +76,67 @@ class DynamicRoutingTests(unittest.TestCase):
             if up.empty_epoch:
                 up.launch()
         with self.assertRaises(ValueError):
-            up.bind_routing(9, 1)
+            up.bind_routing(capacity + 1, 1)
+
+    def test_initial_dynamic_reserve_and_fixed_output_shape(self):
+        torch = self.torch
+        if torch is None:
+            self.skipTest("requires PyTorch")
+        buffers = worker.TorchDeviceBuffers(torch, 0, node_rank=0, local_gpu_index=0)
+        for source in range(2):
+            buffers.tensors[(worker.DEVICE_BUFFER_ROUTER_A_IDX, -1, 0, source)] = torch.empty(256, dtype=torch.int32)
+            buffers.tensors[(worker.DEVICE_BUFFER_NVLINK_RECEIVE, -1, 0, source)] = torch.empty(256, 8, dtype=torch.bfloat16)
+        buffers.tensors[(worker.DEVICE_BUFFER_GATHER_TABLE, -1, -1, -1)] = torch.empty(8, 6, dtype=torch.int32)
+        buffers.tensors[(worker.DEVICE_BUFFER_GATHER_READY_ROWS, -1, -1, -1)] = torch.zeros(1, dtype=torch.int32)
+        modules = {"quack.gemm": SimpleNamespace(gemm=None),
+                   "quack.gemm_config": SimpleNamespace(cta_tile_shape_m=lambda m, cluster, arch: m)}
+        with TemporaryDirectory() as tmp, patch.dict(sys.modules, modules), patch.object(sys, "path", sys.path[:]), \
+                patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)), \
+                patch.object(torch.cuda, "synchronize"):
+            root = Path(tmp)
+            (root / "quack").mkdir()
+            (root / "quack" / "gemm.py").touch()
+            for extents, live_rows, capacity_rows in (((128, 4), 256, 260), (None, 512, 512)):
+                with self.subTest(extents=extents):
+                    up = worker.GroupedGemmRunner(
+                        torch, buffers, cuda_device_id=0, world_size=1, num_experts=2,
+                        output_dimension=16, activation=None, tile_m=128, tile_n=128,
+                        tile_k=None, cluster_m=1, max_swizzle_size=1, quack_root=root,
+                        routing_extents=extents)
+                    self.assertEqual(up.output.shape, (live_rows, 16))
+                    self.assertEqual(up.output_storage.shape, (capacity_rows, 16))
+
+    def test_up_growth_retries_exact_rows_and_keeps_previous_bindings_on_oom(self):
+        torch = self.torch
+        if torch is None:
+            self.skipTest("requires PyTorch")
+        up = worker.GroupedGemmRunner.__new__(worker.GroupedGemmRunner)
+        up.torch = torch
+        up.index_storage = [torch.arange(256, dtype=torch.int32) for _ in range(2)]
+        up.weight_storage = [torch.arange(256, dtype=torch.float32) for _ in range(2)]
+        up.table_storage = torch.empty((8, 6), dtype=torch.int32)
+        up.output_storage = torch.empty((2, 16))
+        up.x_pool = None
+        up.bind_routing(1, 0)
+        original = torch.Tensor.new_empty
+        requested = []
+
+        def limited_allocation(storage, shape):
+            requested.append(shape)
+            if shape[0] > 256:
+                raise torch.cuda.OutOfMemoryError("simulated allocation limit")
+            return original(storage, shape)
+
+        with patch.object(torch.Tensor, "new_empty", limited_allocation):
+            up.bind_routing(128, 4)
+            self.assertEqual(requested, [(260, 16), (256, 16)])
+            self.assertEqual(up.output.shape, (256, 16))
+            bindings = ("output_storage", "output", "work_table", "a_idx", "route_weights", "route_weights_stacked")
+            previous = {name: getattr(up, name) for name in bindings}
+            with self.assertRaises(torch.cuda.OutOfMemoryError):
+                up.bind_routing(180, 6)
+            for name, old in previous.items():
+                self.assertIs(getattr(up, name), old)
 
     def test_bind_down_retains_ipc_and_updates_pinned_counts(self):
         torch = self.torch

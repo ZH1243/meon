@@ -161,6 +161,20 @@ The source seed for zero-based iteration `i` is `router_seed + 0x9e3779b97f4a7c1
 
 The torchrun worker also accepts `--dynamic-routing`. At the end of a concurrent run, each rank prints `routing node=… gpu=… iteration=… elapsed_us=…`. This is host wall time from entry to return of `rdma_proxy_prepare_routing`, including generation, exchange, staging and native installation. Python then binds the new compute views. Iteration zero includes first-use allocation of route and scheduler storage. The separate `pipeline iteration … elapsed_ms=…` line includes payload and compute. With `--dynamic-routing` alone, the runtime uses the shared raw CUDA routing kernels and its native metadata worker.
 
+The CPU tests for up-output capacity exercise growth, live views and retrying
+an allocation under memory pressure. Host verification used a Debug build on
+an Apple M1 Max with CPU PyTorch 1.13.1.
+
+```bash
+OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -v
+ctest --test-dir build/mock -R '^test_(dynamic_gather|pooled_gather|gemm_geometry)$' --output-on-failure
+```
+
+For the H800 timing check, rerun the same two-node dynamic routing workload.
+On each GPU, compare the steady-state interval from the final routing-index
+upload to the kernel that zeros the combine row counts. Look for a
+`cudaMalloc` when the required up-output rows exceed the reserved capacity.
+
 To check threaded CPU scatter staging on the host, run these commands from the meon root.
 
 ```bash

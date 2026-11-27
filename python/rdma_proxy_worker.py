@@ -980,18 +980,10 @@ class AsyncScatterLookup:
         return lookup
 
 
-class DownProjectionRunner:
-    """Compose QuACK's existing plain grouped-GEMM runner with the up output."""
+class _DownKernelOptions:
+    """QuACK configuration shared by the routing iterations of one worker."""
 
-    def __init__(self, torch, up, counts, options, trace_configure=None, previous=None, *,
-                 defer_wave_schedule=False, external_wave_schedule=None, async_scatter=None):
-        # GroupedGemmRunner has already inserted the selected QuACK checkout.
-        from run import hopper_pregather_gemm as pregather
-
-        routes = sum(counts)
-        if len(counts) != up.weights.shape[0] or any(n < 0 for n in counts) or routes > up.output.shape[0]:
-            raise ValueError("expert counts do not describe the up-projection output")
-        # Reuse QuACK's defaults for internal options outside the exposed subset.
+    def __init__(self, pregather, up, options):
         parser = argparse.ArgumentParser()
         pregather.add_kernel_arguments(parser)
         args = parser.parse_args([])
@@ -1001,11 +993,43 @@ class DownProjectionRunner:
         args.device_capacity = up.device_capacity
         args.pingpong = resolve_down_pingpong(
             args.pingpong, up.device_capacity, args.gather_table_wave_barrier)
-        hidden = int(up.output.shape[1])
-        output_dim = int(up.x_buffers[0].shape[1])
-        vars(args).update(tokens=routes, routes=routes, experts=len(counts),
-                          hidden=hidden, output_dim=output_dim, activation=None,
+        vars(args).update(experts=int(up.weights.shape[0]), hidden=int(up.output.shape[1]),
+                          output_dim=int(up.x_buffers[0].shape[1]), activation=None,
                           down_projection=False, iterations=1, timing_samples=1, warmup=0)
+        if options.local_gpu_combine:
+            args.scatter_table = True
+            args.multi_buffer_scatter = True
+            args.epilogue_store = "bulk_rows_reduce"
+            args.scatter_output_buffers = len(up.x_buffers)
+        self._fixed_args = vars(args)
+        self.external_scatter_addresses = (
+            options.local_gpu_combine and options.cpu_scatter_preparation
+            and options.cpu_scatter_publication == "threaded"
+            and "scatter_row_addresses" in inspect.signature(pregather.prepare_grouped_inputs).parameters)
+
+    def for_routes(self, routes):
+        # Deferred setup and the launch callable retain their iteration's namespace.
+        args = argparse.Namespace(**self._fixed_args)
+        args.tokens = args.routes = routes
+        return args
+
+
+class DownProjectionRunner:
+    """Compose QuACK's existing plain grouped-GEMM runner with the up output."""
+
+    def __init__(self, torch, up, counts, options, trace_configure=None, previous=None, *,
+                 defer_wave_schedule=False, external_wave_schedule=None, async_scatter=None, kernel_options=None):
+        # GroupedGemmRunner has already inserted the selected QuACK checkout.
+        from run import hopper_pregather_gemm as pregather
+
+        routes = sum(counts)
+        if len(counts) != up.weights.shape[0] or any(n < 0 for n in counts) or routes > up.output.shape[0]:
+            raise ValueError("expert counts do not describe the up-projection output")
+        if kernel_options is None:
+            kernel_options = _DownKernelOptions(pregather, up, options)
+        self.kernel_options = kernel_options
+        args = self.kernel_options.for_routes(routes)
+        hidden, output_dim = args.hidden, args.output_dim
         self.combine = options.local_gpu_combine
         self.output_reset_policy = options.down_output_reset
         self.cpu_scatter = options.cpu_scatter_preparation and routes > 0
@@ -1028,18 +1052,11 @@ class DownProjectionRunner:
             raise RuntimeError("native routing weights disagree with --no-weighted-contributions")
         clusters_n = math.ceil(up.gemm_dimension / up.tile_n)
         self.combine_n_groups = clusters_n // min(up.max_swizzle_size, clusters_n)
-        if self.combine:
-            args.scatter_table = True
-            args.multi_buffer_scatter = True
-            args.epilogue_store = "bulk_rows_reduce"
-            args.scatter_output_buffers = len(up.x_buffers)
-        validation_args = argparse.Namespace(**vars(args))
-        if self.combine:
-            # The benchmark partitions `routes` among outputs. Our externally
-            # allocated source buffers can be mostly empty and have independent
-            # capacities; build_scatter_row_addresses validates those below.
-            validation_args.multi_buffer_scatter = False
         if routes:
+            validation_args = argparse.Namespace(**vars(args))
+            if self.combine:
+                # Externally allocated source buffers have independent capacities.
+                validation_args.multi_buffer_scatter = False
             pregather.validate_args(validation_args, prepacked=True)
         if previous is None:
             self.weights = torch.randn(
@@ -1084,8 +1101,7 @@ class DownProjectionRunner:
                         self.combine_output_to_input.fill_(-1)
             self.registered_outputs = outputs
             external["output_buffers"] = outputs
-            if (previous is not None and self.cpu_scatter and self.cpu_scatter_publication == "threaded"
-                    and "scatter_row_addresses" in inspect.signature(pregather.prepare_grouped_inputs).parameters):
+            if previous is not None and self.cpu_scatter and self.kernel_options.external_scatter_addresses:
                 # The native publisher fills every live row before down's event wait.
                 address_shape = (routes, 2) if args.n_tile_major_output else (routes,)
                 self.cpu_scatter_metadata, addresses, self.route_weights = allocate_cpu_scatter_metadata_storage(
@@ -2266,7 +2282,8 @@ def run_proxy_with_concurrent_kernel(
                     down = DownProjectionRunner(torch, grouped_gemm, counts, down_options,
                                                 trace_configure=trace.configure if trace else None,
                                                 previous=previous, defer_wave_schedule=True,
-                                                external_wave_schedule=wave_views, async_scatter=async_scatter)
+                                                external_wave_schedule=wave_views, async_scatter=async_scatter,
+                                                kernel_options=previous.kernel_options)
                     if down.cpu_scatter:
                         down.configure_cpu_scatter(library, handle)
                     if down.output_reset_policy == "end-of-iteration" and not down.combine:

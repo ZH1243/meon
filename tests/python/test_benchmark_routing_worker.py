@@ -240,13 +240,17 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
 
     def test_steady_down_schedule_orders_construction_publication_and_consumption(self):
         def down_factory(events):
-            def create(torch, up, counts, options, *, defer_wave_schedule=False, external_wave_schedule=None, **kwargs):
+            prepared_options = object()
+
+            def create(torch, up, counts, options, *, defer_wave_schedule=False, external_wave_schedule=None,
+                       previous=None, kernel_options=None, **kwargs):
+                self.assertIs(kernel_options, prepared_options if previous is not None else None)
                 rows, = counts
                 clock = Mock()
                 clock.elapsed_time.return_value = 1.0
                 down = SimpleNamespace(
                     cpu_scatter=bool(rows), cpu_scatter_publication="threaded", combine=True, combine_rows=4,
-                    route_weights=None,
+                    route_weights=None, kernel_options=prepared_options,
                     output_reset_policy="before-down", intra_node_combine=None, flops=2 * rows,
                     reset_start=clock, reset_end=clock, mapping_start=clock, gemm_start=clock, end=clock,
                     warmup=lambda: None,

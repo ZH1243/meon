@@ -311,15 +311,12 @@ class MetadataSlabTests(unittest.TestCase):
         ])
         options.weighted_contributions = True
         options.return_token_results = True
-        outputs = (torch.empty(8, 4), torch.empty(8, 4))
+        sources = (torch.empty(8, 4), torch.empty(8, 4))
         up = SimpleNamespace(torch=torch, output=torch.empty(8, 4), weights=torch.empty(2, 4, 4),
-                             device_capacity=9, x_buffers=outputs, gemm_dimension=4, tile_n=2,
+                             device_capacity=9, x_buffers=sources, source_pairs=((0, 0), (0, 1)),
+                             gemm_dimension=4, tile_n=2,
                              max_swizzle_size=1, route_weights=(torch.empty(8),), cuda_device_id=0)
-        previous = mock.Mock()
-        previous.inputs.output_buffers.return_value = outputs
-        previous.trace_groups = 1
         ready_address = torch.tensor([0x1234], dtype=torch.int64)
-        previous.inputs.wave_ready_host_address = ready_address
         submitted = []
         setup_stream = object()
         compute_stream = mock.Mock()
@@ -349,6 +346,9 @@ class MetadataSlabTests(unittest.TestCase):
             self.assertIs(external_wave_schedule, external_views)
             self.assertIs(active_stream, setup_stream)
             self.assertEqual(a.shape[0], sum(counts))
+            self.assertEqual((args.tokens, args.routes, args.experts), (sum(counts), sum(counts), len(counts)))
+            self.assertEqual(args.tile_k, 32)
+            self.assertTrue(args.multi_buffer_scatter)
             self.assertIs(output_buffers[0], outputs[0])
             self.assertEqual(scatter_row_addresses.data_ptr(), runner.cpu_scatter_metadata.data_ptr())
             self.assertIs(route_weights, runner.route_weights)
@@ -357,11 +357,19 @@ class MetadataSlabTests(unittest.TestCase):
                                    wave_ready_prefix=torch.tensor([1], dtype=torch.int32))
 
         pregather = mock.Mock(prepare_grouped_inputs=prepare)
+        # Model a QuACK default that the meon CLI does not expose.
+        pregather.add_kernel_arguments.side_effect = lambda parser: parser.add_argument("--tile-k", type=int, default=32)
         empty_publisher = SimpleNamespace(prepare_empty_down_publisher=mock.Mock())
         with mock.patch.dict(sys.modules, {"run": SimpleNamespace(hopper_pregather_gemm=pregather),
                                            "quack.gemm": mock.Mock(), "empty_down": empty_publisher}), \
+                mock.patch.object(torch.cuda, "Event", side_effect=lambda **kwargs: mock.Mock()), \
+                mock.patch.object(torch.cuda, "synchronize"), \
                 mock.patch.object(torch.cuda, "current_stream", side_effect=lambda _: active_stream), \
                 mock.patch.object(torch.cuda, "stream", side_effect=use_stream):
+            previous = worker.DownProjectionRunner(torch, up, [0, 0], options,
+                                                   trace_configure=lambda groups: ready_address.item())
+            outputs = previous.output_buffers()
+            empty_publisher.prepare_empty_down_publisher.reset_mock()
             for epoch, counts in enumerate(([1, 4], [4, 1], [0, 0], [2, 1]), start=1):
                 with self.subTest(counts=counts):
                     count_before = len(submitted)
@@ -369,6 +377,7 @@ class MetadataSlabTests(unittest.TestCase):
                     external_views = (torch.empty(2, 4), torch.empty(1)) if epoch in (2, 4) else None
                     runner = worker.DownProjectionRunner(torch, up, counts, options, previous=previous,
                                                          trace_configure=lambda groups: ready_address.item(),
+                                                         kernel_options=previous.kernel_options,
                                                          defer_wave_schedule=True, external_wave_schedule=external_views)
                     runner.wait_cpu_scatter_ready = mock.Mock()
                     self.assertEqual(len(submitted), count_before)
@@ -400,14 +409,22 @@ class MetadataSlabTests(unittest.TestCase):
                                       wait_for_wave_schedule=wait_for_schedule if external_views is not None else None)
                     runner.launch_gemm.assert_called_once()
                     self.assertEqual(submitted[-1], tuple(counts))
+                    # QuACK may retain the argument namespace captured by a launch.
+                    # Its changes must not affect the next route's argument defaults.
+                    pregather.make_launch.call_args.args[0].tile_k = 16
                     compute_stream.wait_stream.assert_called_once_with(setup_stream)
                     self.assertIs(runner.inputs.wave_ready_host_address, address)
                     self.assertIs(runner.output_buffers()[0], outputs[0])
                     previous = runner
 
+            pregather.add_kernel_arguments.assert_called_once()
+            checked = [call.args[0] for call in pregather.validate_args.call_args_list]
+            self.assertEqual([(args.tokens, args.routes) for args in checked], [(5, 5), (5, 5), (3, 3)])
+            self.assertTrue(all(not args.multi_buffer_scatter for args in checked))
             external_views = None
             runner = worker.DownProjectionRunner(torch, up, [3, 1], options, previous=previous,
-                                                 trace_configure=mock.Mock(), defer_wave_schedule=True)
+                                                 trace_configure=mock.Mock(), defer_wave_schedule=True,
+                                                 kernel_options=previous.kernel_options)
             epoch += 1
             runner.wait_cpu_scatter_ready = mock.Mock()
             with self.assertRaisesRegex(RuntimeError, "current scatter publication"):

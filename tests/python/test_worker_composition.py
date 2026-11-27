@@ -350,7 +350,8 @@ class CompositionCudaTests(unittest.TestCase):
         reference_down = down
         if preparation == "threaded" and not defer_wave_schedule:
             down = worker.DownProjectionRunner(torch, up, expert_counts, options,
-                                               trace_configure=configure_trace, previous=reference_down)
+                                               trace_configure=configure_trace, previous=reference_down,
+                                               kernel_options=reference_down.kernel_options)
         combine = FinalCombine(compact, indices, input_rows, hidden, tile_n=tile_n, num_ctas=2,
                                register_prefetch=True, ready_groups=down.inputs.ready_groups)
         # The initial down launch published the warmup prefix on the original runner.
@@ -436,6 +437,7 @@ class CompositionCudaTests(unittest.TestCase):
             if defer_wave_schedule:
                 down = worker.DownProjectionRunner(torch, up, expert_counts, options,
                                                    trace_configure=configure_trace, previous=down,
+                                                   kernel_options=down.kernel_options,
                                                    defer_wave_schedule=True, external_wave_schedule=wave_views)
                 self.assertIsNone(down.inputs)
             if up_sm_counts is not None:

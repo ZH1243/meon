@@ -332,6 +332,10 @@ For iterations 1–4, identify the final up-table ready-row publication on the n
 
 For comparison with report 17, rebuild the shared library and install the updated meon worker on both hosts. Use the same threaded scatter and dynamic routing flags. Check for `Native return maps reserved` on each participating rank. For iterations 1–4 of the 20,480-token two-node configuration, the publication stream should show one **2,785,424-byte** return-map H2D after the last up-gather ready write. Identify it separately from the down-wave and scatter uploads on that stream. Report 17’s median local gather completion to up-GEMM start was **5.24 ms**, its up-to-down handoff **21.1 µs**, and its complete iteration **59.60 ms**. Also compare when the first combine actually starts. Run a smaller two-node comparison with projection and combine checks enabled before collecting the timing run.
 
+The Python worker resolves fixed QuACK down-GEMM options once per run. Each refreshed route gets a private copy with its current row count, and each nonempty route is validated before use. To measure the effect, repeat the report 18 launch with the updated worker on both Hopper nodes. Across the eight Node 0 GPUs in iterations 1–4, report 18’s median local-gather-end to up-GEMM-start interval was **2.15 ms**. The **~1.04 ms** host interval from route installation to entry into `cudaDeviceSynchronize` included runner construction, tensor binding and worker handoffs. [Down projection runner](../python/rdma_proxy_worker.py)
+
+The CPU regression covers empty routes, changing row counts and isolation of QuACK’s per-iteration arguments. On an Apple M1 Max with macOS 15.6.1 and CPU PyTorch 1.13.1, `OMP_NUM_THREADS=1 PYTHONPATH=tests/python python -B -m unittest -v test_cpu_scatter_publication` passed all 12 tests.
+
 The async scatter and return-map change passed 47 native tests and 102 Python tests on an Apple M1 Max with macOS 15.6.1 and CPU PyTorch 1.13.1. Six native tests and eight Python tests were skipped. The two-node Hopper numerical and timing runs remain outstanding. Reproduce the local checks from the meon checkout.
 
 ```bash

@@ -319,9 +319,13 @@ existing torchrun command. This native CLI/JSON option defaults to `false` and
 passes through the Python worker unchanged. It requires local input staging and
 forward-completion notifications, and rejects the diagnostic flush-only mode.
 
-After the iteration-start barrier, the iteration coordinator posts a local
-readiness request to the existing native notification receiver and releases
-forwarding without waiting for that request to finish. The receiver marks
+On refreshed two-node benchmark routes, the concurrent worker with direct
+device indices posts the local readiness request during iteration preparation,
+after the ready counter has been reset on the GPU. The native coordinator can
+prepare peer receive chunks and forwarding tables while the notification
+receiver serves this request and Python launches up-GEMM. Iteration zero and
+the synchronous installation paths post the request after the iteration-start
+barrier. Peer traffic always follows that barrier. The receiver marks
 `[0, local_x3.size())` of its own staged source ready, builds the gather entries,
 and submits their H2D copies and ready-prefix publication. These operations can
 overlap the first NVLink forwarding batch on its separate CUDA stream. There is
@@ -357,10 +361,10 @@ scatter policies support the resulting row order, including FP32 route weights.
 In threaded mode, the scatter worker can start packing this early prefix while
 forwarding continues; its single final metadata upload keeps the existing gate.
 
-The enabled iteration timer starts before posting the local request. The native
-up-GEMM timer still begins at its first gather-table submission; publication is
-not moved into pre-iteration setup. Earlier GEMM activity can overlap forwarding but
-can also compete for GPU resources. Building the local prefix now occupies the
+The native RDMA timer starts after iteration-start synchronization. On a
+refreshed compute route the receiver may already have posted local work by
+then. The native up-GEMM timer begins at the first gather-table submission,
+which can precede the kernel launch. Building the local prefix occupies the
 notification receiver while forwarding proceeds independently. Compare total
 warmed iteration latency as well as the first gather publication and first
 useful GEMM activity. In an Nsight Systems trace, compare the receiver's

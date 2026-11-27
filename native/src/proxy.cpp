@@ -591,7 +591,8 @@ void Proxy::install_borrowed_benchmark_routing(uint64_t iteration, const RdmaPro
 
 void Proxy::install_borrowed_benchmark_route_views(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff,
                                                   const RdmaProxyBenchmarkHostRoute& host_route,
-                                                  const RdmaProxyBenchmarkDeviceIndices* device_indices) {
+                                                  const RdmaProxyBenchmarkDeviceIndices* device_indices,
+                                                  bool defer_transport) {
     if (device_indices) {
         std::array<uintptr_t, BenchmarkIndexPadding::sources> addresses{};
         if (device_indices->struct_size < sizeof(*device_indices) ||
@@ -610,12 +611,18 @@ void Proxy::install_borrowed_benchmark_route_views(uint64_t iteration, const Rdm
                 throw std::runtime_error("invalid or overlapping benchmark device index slots");
         }
     }
-    install_benchmark_routing_impl(iteration, handoff, BenchmarkBorrow::RouteViews, &host_route, device_indices);
+    // Initialization, legacy installers, and paths without the local source
+    // ready protocol keep the synchronous transport handoff.
+    const bool split = defer_transport && iteration != 0 && device_indices &&
+        config_.router_local_input_early_ready_enabled && config_.num_nodes == 2 &&
+        config_.num_gpus_per_node == 8;
+    install_benchmark_routing_impl(iteration, handoff, BenchmarkBorrow::RouteViews, &host_route, device_indices, split);
 }
 
 void Proxy::install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff,
                                            BenchmarkBorrow borrow, const RdmaProxyBenchmarkHostRoute* host_route,
-                                           const RdmaProxyBenchmarkDeviceIndices* device_indices) {
+                                           const RdmaProxyBenchmarkDeviceIndices* device_indices,
+                                           bool defer_transport) {
     if (!config_.router_benchmark_metadata_enabled)
         throw std::runtime_error("benchmark metadata handoff is disabled");
     if (!routing_install_required(iteration))
@@ -636,6 +643,14 @@ void Proxy::install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBe
     auto remote = iteration_node_record(config_, other, config_.node_rank);
     route.source->copy_benchmark_node_slice(handoff.remote_x3, handoff.remote_x4, handoff.remote_count,
                                             remote.token_indices, remote.token_masks);
+    // In the eight-GPU layout any nonzero byte is a valid mask. The synchronous
+    // installer checks this when normalizing masks; keep that error before an
+    // external GPU consumer may start polling for the current iteration.
+    if (defer_transport) {
+        const auto& masks = remote.token_masks;
+        if (std::find(masks.begin(), masks.end(), uint8_t{0}) != masks.end())
+            throw std::runtime_error("router x4 contains an invalid GPU mask");
+    }
     route.incoming_nodes.emplace(other, std::move(remote));
     route.incoming_experts.reserve(world);
     for (int source = 0; source < world; ++source) {
@@ -682,7 +697,7 @@ void Proxy::install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBe
     // From this point a partial install may already have retained source pointers.
     // Shutdown retires these as well if the installation fails.
     benchmark_expert_lists_borrowed_ = borrow != BenchmarkBorrow::None;
-    install_iteration_routing(iteration, std::move(route), device_indices);
+    install_iteration_routing(iteration, std::move(route), device_indices, defer_transport);
 }
 
 void Proxy::retire_borrowed_benchmark_routing(uint64_t iteration) {
@@ -700,7 +715,8 @@ void Proxy::retire_borrowed_benchmark_routing(uint64_t iteration) {
 }
 
 void Proxy::install_iteration_routing(uint64_t iteration, IterationRouteData route,
-                                      const RdmaProxyBenchmarkDeviceIndices* device_indices) {
+                                      const RdmaProxyBenchmarkDeviceIndices* device_indices,
+                                      bool defer_transport) {
     // The previous completion barrier retired all data WRs, but the ready
     // thread may still be leaving its last scan. Hold the lock through
     // validation and rollback so readers can only see a committed route.
@@ -714,22 +730,22 @@ void Proxy::install_iteration_routing(uint64_t iteration, IterationRouteData rou
             auto& remote = route.incoming_nodes.at(peer.peer_rank);
             if (remote.token_indices.size() != remote.token_masks.size())
                 throw std::runtime_error("iteration receive x3/x4 length mismatch");
-            peer.receive_chunks = compute_chunks_from_token_indices(remote.token_indices,
-                config_.token_dimension, dtype_size(config_.dtype), config_.tokens_per_chunk,
-                config_.num_qps_per_peer);
+            if (defer_transport)
+                pending_benchmark_receive_indices_ = std::move(remote.token_indices);
+            else
+                configure_receive_chunks(peer, remote.token_indices);
             peer.router_x4 = std::move(remote.token_masks);
-            for (auto& worker : peer.workers) worker->configure_expected_chunks(peer.receive_chunks.size());
         }
         iteration_source_ = std::move(route.source);
         if (config_.nvlink_forwarding_enabled) {
             cuda_buffers_.install_iteration_expert_metadata(std::move(route.incoming_experts), iteration, device_indices);
-            prepare_forwarding_routing_tables();
-            prepare_local_forwarding_routing_table();
-            for (std::size_t p = 0; p < peers_.size(); ++p) {
-                forwarding_next_chunk_by_peer_[p] = 0;
-                forwarding_next_batch_by_peer_[p] = 0;
-                forwarding_ready_chunks_by_peer_[p].store(0);
-                forwarding_ready_batches_by_peer_[p].store(0);
+            if (defer_transport) {
+                // Local early publication consumes the already-staged source.
+                // It only needs this stable allocation and the installed route.
+                local_router_staging_buffer_ = &cuda_buffers_.nvlink_receive_buffer_for_source(
+                    config_.node_rank, config_.local_gpu_index).recv;
+            } else {
+                install_iteration_forwarding_tables();
             }
         }
         local_router_input_staged_ = config_.router_local_input_staging_enabled;
@@ -740,6 +756,44 @@ void Proxy::install_iteration_routing(uint64_t iteration, IterationRouteData rou
         routing_failed_ = true;
         if (iteration_source_ && iteration_source_->has_borrowed_source_route())
             iteration_source_.reset();
+        throw;
+    }
+}
+
+void Proxy::configure_receive_chunks(PeerState& peer, const std::vector<std::size_t>& token_indices) {
+    peer.receive_chunks = compute_chunks_from_token_indices(token_indices, config_.token_dimension,
+        dtype_size(config_.dtype), config_.tokens_per_chunk, config_.num_qps_per_peer);
+    for (auto& worker : peer.workers) worker->configure_expected_chunks(peer.receive_chunks.size());
+}
+
+void Proxy::install_iteration_forwarding_tables() {
+    prepare_forwarding_routing_tables();
+    prepare_local_forwarding_routing_table();
+    for (std::size_t p = 0; p < peers_.size(); ++p) {
+        forwarding_next_chunk_by_peer_[p] = 0;
+        forwarding_next_batch_by_peer_[p] = 0;
+        forwarding_ready_chunks_by_peer_[p].store(0);
+        forwarding_ready_batches_by_peer_[p].store(0);
+    }
+}
+
+bool Proxy::has_pending_benchmark_transport(uint64_t iteration) const {
+    return pending_benchmark_receive_indices_.has_value() && routing_iteration_ == iteration;
+}
+
+void Proxy::finish_benchmark_transport(uint64_t iteration) {
+    ScopedPreparedRange range(config_.nvlink_forward_prepared_nvtx_enabled, "router/prepare_peer_transport");
+    std::unique_lock<std::shared_mutex> lock(forwarding_routes_mutex_);
+    if (!has_pending_benchmark_transport(iteration))
+        throw std::runtime_error("no pending benchmark transport for this iteration");
+    try {
+        // Own-source publication uses the receiver's mailbox and scheduler.
+        // The coordinator alone prepares peer state, before releasing any WRs.
+        configure_receive_chunks(peers_.at(0), *pending_benchmark_receive_indices_);
+        install_iteration_forwarding_tables();
+        pending_benchmark_receive_indices_.reset();
+    } catch (...) {
+        routing_failed_ = true;
         throw;
     }
 }
@@ -836,8 +890,21 @@ void Proxy::prepare_iteration_step(uint64_t iteration) {
     prepare_rdma_returns(iteration);
     down_ready_trace_.reset(iteration);
     iteration_prepared_ = true;
-    if (forwarding_rounds_)
+    if (has_pending_benchmark_transport(iteration)) {
+        // The benchmark has completed our own staging and installed all expert
+        // lists. The notification receiver can publish work from this one source
+        // while the coordinator prepares the peer transfers. All other source
+        // frontiers still advance only on their actual completion records.
+        try {
+            request_local_router_input_ready(iteration);
+        } catch (...) {
+            routing_failed_ = true;
+            iteration_prepared_ = false;
+            throw;
+        }
+    } else if (forwarding_rounds_) {
         forwarding_round_requested_.store(iteration + 1, std::memory_order_release);
+    }
 }
 
 void Proxy::run_iteration_step(uint64_t iteration) {
@@ -1302,6 +1369,7 @@ void Proxy::shutdown() {
         std::unique_lock<std::shared_mutex> lock(forwarding_routes_mutex_);
         iteration_source_.reset();
         routing_iteration_.reset();
+        pending_benchmark_receive_indices_.reset();
     }
     completed_routing_iterations_ = 0;
     dynamic_payload_active_.store(false);
@@ -3345,6 +3413,14 @@ void Proxy::nvlink_forward_notification_loop() {
 }
 
 void Proxy::run_iteration(uint64_t iteration) {
+    const bool local_input_requested = has_pending_benchmark_transport(iteration);
+    if (local_input_requested) {
+        finish_benchmark_transport(iteration);
+        // Only peer traffic needs the round collector. Owner-only preparation
+        // may be retired on shutdown without ever starting a forwarding round.
+        if (forwarding_rounds_)
+            forwarding_round_requested_.store(iteration + 1, std::memory_order_release);
+    }
     std::vector<std::vector<ChunkDescriptor>> chunks_by_peer;
     chunks_by_peer.reserve(peers_.size());
     std::size_t total_bytes = 0;
@@ -3373,7 +3449,7 @@ void Proxy::run_iteration(uint64_t iteration) {
     // Finish potentially allocating/locking setup before posting. The enabled
     // timer includes this work, but no publication-completion wait or setup
     // separates the mailbox release from prepared forwarding activation.
-    if (config_.router_local_input_early_ready_enabled)
+    if (config_.router_local_input_early_ready_enabled && !local_input_requested)
         request_local_router_input_ready(iteration);
     enqueue_empty_forwarding_phases(iteration);
     if (prepared_forwarding_) {

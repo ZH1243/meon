@@ -568,17 +568,30 @@ extern "C" int rdma_proxy_install_borrowed_benchmark_route_views(
     });
 }
 
-extern "C" int rdma_proxy_install_borrowed_benchmark_device_indices(
+static int install_benchmark_device_indices(
     RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing,
-    const RdmaProxyBenchmarkHostRoute* host_route, const RdmaProxyBenchmarkDeviceIndices* device_indices) {
+    const RdmaProxyBenchmarkHostRoute* host_route, const RdmaProxyBenchmarkDeviceIndices* device_indices,
+    bool defer_transport) {
     if (!host_route || !device_indices) {
         last_error = "benchmark device index installation requires host and device views";
         return -1;
     }
     return install_benchmark_routing(handle, iteration, routing,
-        [iteration, host_route, device_indices](auto& proxy, const auto& route) {
-            proxy.install_borrowed_benchmark_route_views(iteration, route, *host_route, device_indices);
+        [iteration, host_route, device_indices, defer_transport](auto& proxy, const auto& route) {
+            proxy.install_borrowed_benchmark_route_views(iteration, route, *host_route, device_indices, defer_transport);
         });
+}
+
+extern "C" int rdma_proxy_install_borrowed_benchmark_device_indices(
+    RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing,
+    const RdmaProxyBenchmarkHostRoute* host_route, const RdmaProxyBenchmarkDeviceIndices* device_indices) {
+    return install_benchmark_device_indices(handle, iteration, routing, host_route, device_indices, false);
+}
+
+extern "C" int rdma_proxy_install_benchmark_device_indices_for_compute(
+    RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing,
+    const RdmaProxyBenchmarkHostRoute* host_route, const RdmaProxyBenchmarkDeviceIndices* device_indices) {
+    return install_benchmark_device_indices(handle, iteration, routing, host_route, device_indices, true);
 }
 
 extern "C" int rdma_proxy_retire_borrowed_benchmark_routing(RdmaProxyHandle* handle, uint64_t iteration) {

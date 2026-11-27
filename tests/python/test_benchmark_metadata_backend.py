@@ -227,6 +227,17 @@ class ProviderTests(unittest.TestCase):
         self.assertTrue(p.borrow_source_route)
         self.assertEqual(p.install_host_routing.argtypes, [
             C.c_void_p, C.c_uint64, C.POINTER(backend.BenchmarkRouting), C.POINTER(backend.BenchmarkHostRoute)])
+        lib.rdma_proxy_install_borrowed_benchmark_device_indices = MagicMock()
+        p._bind(concurrent_compute=True)
+        self.assertIs(p.install_device_indices, lib.rdma_proxy_install_borrowed_benchmark_device_indices)
+        lib.rdma_proxy_install_benchmark_device_indices_for_compute = MagicMock()
+        p._bind()
+        self.assertIs(p.install_device_indices, lib.rdma_proxy_install_borrowed_benchmark_device_indices)
+        p._bind(concurrent_compute=True)
+        self.assertIs(p.install_device_indices, lib.rdma_proxy_install_benchmark_device_indices_for_compute)
+        self.assertEqual(p.install_device_indices.argtypes, [
+            C.c_void_p, C.c_uint64, C.POINTER(backend.BenchmarkRouting), C.POINTER(backend.BenchmarkHostRoute),
+            C.POINTER(backend.BenchmarkDeviceIndices)])
         del lib.rdma_proxy_install_borrowed_benchmark_route_views
         p._bind()
         self.assertIs(p.install_host_routing, lib.rdma_proxy_install_borrowed_benchmark_host_routing)

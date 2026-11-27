@@ -128,8 +128,9 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
         test = self
 
         class Provider:
-            def __init__(self, lib, handle, torch, device_buffers):
+            def __init__(self, lib, handle, torch, device_buffers, *, concurrent_compute):
                 test.assertIs(device_buffers, buffers)
+                test.assertEqual(concurrent_compute, compute)
                 events.append(("provider",))
 
             def prepare(self, epoch, *, compute_extents=True):

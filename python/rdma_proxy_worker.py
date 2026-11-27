@@ -1989,11 +1989,11 @@ def dynamic_routing_enabled(library, handle, proxy_argv):
                                 "router_dynamic_routing_enabled", "dynamic routing")
 
 
-def open_benchmark_metadata(library, handle, argv, torch, buffers):
+def open_benchmark_metadata(library, handle, argv, torch, buffers, *, concurrent_compute=False):
     if optional_router_mode(library, handle, argv, "rdma_proxy_benchmark_metadata_enabled",
                             "router_benchmark_metadata_enabled", "benchmark metadata exchange"):
         from benchmark_metadata_backend import BenchmarkMetadataBackend
-        return BenchmarkMetadataBackend(library, handle, torch, buffers)
+        return BenchmarkMetadataBackend(library, handle, torch, buffers, concurrent_compute=concurrent_compute)
     return None
 
 
@@ -2124,7 +2124,8 @@ def run_proxy_with_concurrent_kernel(
                 "--concurrent-kernel requires a finite, nonzero --num_iterations"
             )
 
-        benchmark_metadata = open_benchmark_metadata(library, handle, proxy_argv, torch, device_buffers)
+        benchmark_metadata = open_benchmark_metadata(
+            library, handle, proxy_argv, torch, device_buffers, concurrent_compute=True)
         dynamic = benchmark_metadata is not None or dynamic_routing_enabled(library, handle, proxy_argv)
         prepare_epoch = (benchmark_metadata.prepare if benchmark_metadata is not None
                          else partial(prepare_routing, library, handle))

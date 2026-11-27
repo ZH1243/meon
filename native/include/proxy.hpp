@@ -44,7 +44,8 @@ public:
                                             const RdmaProxyBenchmarkHostRoute* host_route = nullptr);
     void install_borrowed_benchmark_route_views(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing,
                                                 const RdmaProxyBenchmarkHostRoute& host_route,
-                                                const RdmaProxyBenchmarkDeviceIndices* device_indices = nullptr);
+                                                const RdmaProxyBenchmarkDeviceIndices* device_indices = nullptr,
+                                                bool defer_transport = false);
     void retire_borrowed_benchmark_routing(uint64_t iteration);
     void run();
     void run_once();
@@ -347,9 +348,15 @@ private:
     enum class BenchmarkBorrow { None, ExpertLists, RouteViews };
     void install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBenchmarkRouting& routing,
                                        BenchmarkBorrow borrow, const RdmaProxyBenchmarkHostRoute* host_route,
-                                       const RdmaProxyBenchmarkDeviceIndices* device_indices = nullptr);
+                                       const RdmaProxyBenchmarkDeviceIndices* device_indices = nullptr,
+                                       bool defer_transport = false);
     void install_iteration_routing(uint64_t iteration, IterationRouteData route,
-                                  const RdmaProxyBenchmarkDeviceIndices* device_indices = nullptr);
+                                  const RdmaProxyBenchmarkDeviceIndices* device_indices = nullptr,
+                                  bool defer_transport = false);
+    bool has_pending_benchmark_transport(uint64_t iteration) const;
+    void finish_benchmark_transport(uint64_t iteration);
+    void configure_receive_chunks(PeerState& peer, const std::vector<std::size_t>& token_indices);
+    void install_iteration_forwarding_tables();
     std::shared_lock<std::shared_mutex> lock_forwarding_routes() const;
     std::shared_lock<std::shared_mutex> lock_installed_combine_route() const;
     void require_installed_combine_route() const;
@@ -420,6 +427,9 @@ private:
     std::unique_ptr<IterationRouting> iteration_routing_;
     std::unique_ptr<RouterRouting> iteration_source_;
     std::optional<uint64_t> routing_iteration_;
+    // The exchange's remote x3/x4 are call-scoped. The coordinator owns this
+    // snapshot for the one remote peer until it installs the transport tables.
+    std::optional<std::vector<std::size_t>> pending_benchmark_receive_indices_;
     std::atomic<uint64_t> completed_routing_iterations_{0};
     bool benchmark_expert_lists_borrowed_{false};
     bool routing_failed_{false};

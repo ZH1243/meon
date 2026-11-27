@@ -303,7 +303,7 @@ Look for `a_idx_storage=exchange_device` on the per-rank timing line to confirm 
 | --- | --- |
 | `routing … elapsed_us` | Entry to benchmark preparation through completion of local route installation, including generation, retirement, alignment and exchange. |
 | `exchange_staging_us` | Aligned submission through benchmark wait completion, including the seven kernels, GPU exchange, RDMA and local gather. With `source_route=receiver`, this includes writing the outgoing snapshot. With direct GPU indices, it also includes the remote index mirrors and their GPU visibility. Pass `--device-indices` to the standalone two-node benchmark to include those writes there. |
-| `install_us` | Benchmark wait return through importing the source views and installing meon's dispatch and gather metadata. |
+| `install_us` | Benchmark wait return through completion of route installation on the calling thread. On the concurrent early-local path, peer transport preparation runs later on the coordinator. |
 | `retire_us` | Local time to release the previous iteration's borrowed route data before entering the reuse barrier. Zero for the first iteration and for snapshot installs. |
 | `r_ready_to_up_submit_us` | Fresh R completed through host return from up-GEMM submission, including rank alignment before exchange, installation and compute setup. Available for compute iterations that submit work. Use a GPU trace to measure the actual kernel start. |
 | `generation_us`, `reuse_barrier_us` | Route generation and the Gloo barrier before exchange submission, respectively. |
@@ -335,6 +335,19 @@ For comparison with report 17, rebuild the shared library and install the update
 The Python worker resolves fixed QuACK down-GEMM options once per run. Each refreshed route gets a private copy with its current row count, and each nonempty route is validated before use. To measure the effect, repeat the report 18 launch with the updated worker on both Hopper nodes. Across the eight Node 0 GPUs in iterations 1–4, report 18’s median local-gather-end to up-GEMM-start interval was **2.15 ms**. The **~1.04 ms** host interval from route installation to entry into `cudaDeviceSynchronize` included runner construction, tensor binding and worker handoffs. [Down projection runner](../python/rdma_proxy_worker.py)
 
 The CPU regression covers empty routes, changing row counts and isolation of QuACK’s per-iteration arguments. On an Apple M1 Max with macOS 15.6.1 and CPU PyTorch 1.13.1, `OMP_NUM_THREADS=1 PYTHONPATH=tests/python python -B -m unittest -v test_cpu_scatter_publication` passed all 12 tests.
+
+To compare with report 19, rebuild `rdma_cpu_proxy_shared` and update the worker on both Hopper nodes. Add `--router_local_input_early_ready_enabled=true` to both commands in the small two-node numerical run above, with projection and return/combine checks enabled. Then repeat the original timing command and confirm `a_idx_storage=exchange_device`. For iterations 1–4 compare local staging gather end to the first positive ready-row publication, up-GEMM start, and full iteration time. Report 19's median gather-to-up-GEMM interval on Node 0 was 1.56 ms. For an attribution run, enable `--nvlink_forward_prepared_nvtx_enabled=true` and inspect `router/local_input_early_ready` on the notification receiver and `router/prepare_peer_transport` on the coordinator. An expert with too few ready local rows waits for another source.
+
+Local verification of this change used an Apple M1 Max, macOS 15.6.1 and CPU PyTorch 1.13.1. The Debug native regressions cover a delayed rank, an empty local source, multiple epochs and shutdown after preparation. The two-node Hopper numerical and timing checks above require CUDA, NVLink and RDMA.
+
+```bash
+cmake --build build/mock -j4
+ctest --test-dir build/mock --output-on-failure
+ctest --test-dir build/mock -R '^test_benchmark_routing$' --repeat until-fail:10 --output-on-failure
+cmake --build build/exchange-host -j4
+ctest --test-dir build/exchange-host --output-on-failure
+OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -q
+```
 
 The async scatter and return-map change passed 47 native tests and 102 Python tests on an Apple M1 Max with macOS 15.6.1 and CPU PyTorch 1.13.1. Six native tests and eight Python tests were skipped. The two-node Hopper numerical and timing runs remain outstanding. Reproduce the local checks from the meon checkout.
 

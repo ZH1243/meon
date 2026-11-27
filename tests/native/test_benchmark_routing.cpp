@@ -145,15 +145,18 @@ int destination_node(int epoch, int token) {
 }
 int destination_gpu(int epoch, int source_gpu, int source_node) {
     if (epoch != 2) return source_gpu;
-    // Local and remote original sources use different neighbors, so reusing
-    // an outgoing mask for the same-index incoming record is observable.
+    // Rank zero has enough work from its own staged source to publish before
+    // peer traffic. The other ranks still exercise distinct remote/local masks.
+    if (source_node == 0 && source_gpu == 0) return 0;
+    if (source_node == 0 && source_gpu == gpus - 1) return 1;
+    if (source_node == 1 && source_gpu == 1) return 1;
     return (source_gpu + (source_node == 0 ? 1 : gpus - 1)) % gpus;
 }
 uint8_t payload_value(int epoch, int gpu, int token) {
     return static_cast<uint8_t>(epoch*40 + gpu*3 + token + 1);
 }
 
-void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
+void run_benchmark_iteration(Rank& rank, int gpu, int epoch, bool split_transport) {
     std::array<std::vector<int32_t>, nodes> rows;
     std::vector<int32_t> r;
     const auto dest = destination_gpu(epoch, gpu, 0);
@@ -274,7 +277,8 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
                 auto addresses = rank.index_addresses();
                 RdmaProxyBenchmarkDeviceIndices views{sizeof(views), nodes*gpus, tokens*experts_per_gpu, addresses.data()};
                 const auto direct_install = [&](const RdmaProxyBenchmarkDeviceIndices& views) {
-                    rank.proxy->install_borrowed_benchmark_route_views(epoch, extended.current, host, &views);
+                    rank.proxy->install_borrowed_benchmark_route_views(epoch, extended.current, host, &views,
+                                                                      split_transport);
                 };
                 auto invalid = views;
                 --invalid.struct_size;
@@ -289,6 +293,12 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
                 addresses[0] = addresses[1];
                 expect_error([&] { direct_install(views); });
                 addresses[0] = first;
+                if (split_transport && !remote_masks.empty()) {
+                    const auto mask = remote_masks.front();
+                    remote_masks.front() = 0;
+                    expect_error([&] { direct_install(views); });
+                    remote_masks.front() = mask;
+                }
                 // A canary in one live device prefix distinguishes direct consumption
                 // from a redundant host copy. Restore it before normal consumers run.
                 const auto live = std::find_if(indices.begin(), indices.end(), [](const auto& list) {
@@ -309,6 +319,10 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
         expect_error([&] { rank.proxy->retire_borrowed_benchmark_routing(epoch); });
         expect_error([&] { rank.proxy->install_borrowed_benchmark_routing(epoch, data); });
     }
+    // Even the direct-device installer only borrows remote_x3/x4 for the
+    // call. Neither transport setup nor return maps may read these later.
+    std::fill(remote_rows.begin(), remote_rows.end(), -1);
+    std::fill(remote_masks.begin(), remote_masks.end(), 0);
     expect_error([&] { rank.proxy->install_benchmark_routing(epoch, data); });
     rank.proxy->prepare_routing(epoch);
     const auto expected_r = r;
@@ -318,7 +332,6 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
         std::fill(std::begin(node_offsets), std::end(node_offsets), -1);
         std::fill(x3.begin(), x3.end(), -1);
         std::fill(x4.begin(), x4.end(), 0);
-        std::fill(remote_masks.begin(), remote_masks.end(), 0);
         std::fill(r.begin(), r.end(), -1);
     }
     const auto common_indices = std::max(rows[0].size(), rows[1].size()) * experts_per_gpu;
@@ -449,6 +462,24 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
         if (mask_counts[domain] != domain_counts[domain] || token_counts[domain] != rows[domain_nodes[domain]].size())
             throw std::runtime_error("incorrect async return map extents");
     }
+    if (split_transport && gpu == 0 && epoch != 0) {
+        rank.proxy->prepare_iteration_step(epoch);
+        if (epoch == 2) {
+            // The coordinator has not entered run_iteration_step: transport
+            // preparation is still pending while the owner publishes real rows.
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (rank.proxy->router_computation_scheduler_state().published_rows == 0) {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    throw std::runtime_error("owner publication waited for deferred transport preparation");
+                std::this_thread::yield();
+            }
+        }
+        const auto state = rank.proxy->router_computation_scheduler_state();
+        rank.proxy->prepare_iteration_step(epoch);
+        if (rank.proxy->router_computation_scheduler_state().published_rows != state.published_rows ||
+            (epoch == 1 && state.published_rows != 0))
+            throw std::runtime_error("repeated preparation changed the local prefix");
+    }
     rank.proxy->run_iteration_step(epoch);
     rank.proxy->wait_return_maps(epoch, 1, 5000);
     if (!std::equal(rank.combine_rows.begin(), rank.combine_rows.end(), rank.packed_maps.begin()) ||
@@ -510,7 +541,7 @@ void check_final_borrowed_install(Rank& rank, uint64_t epoch, std::vector<int32_
     expect_error([&] { rank.proxy->install_borrowed_benchmark_route_views(epoch, routing, source); });
 }
 
-void check_empty_device_indices(Rank& rank, uint64_t epoch) {
+void check_empty_device_indices(Rank& rank, uint64_t epoch, bool split_transport) {
     std::array<RdmaProxyBenchmarkSource, nodes*gpus> sources{};
     for (int s = 0; s < nodes*gpus; ++s) {
         rank.offsets[s].fill(0);
@@ -524,13 +555,15 @@ void check_empty_device_indices(Rank& rank, uint64_t epoch) {
         rank.source_offsets.data(), nullptr, nullptr, rank.source_r.data()};
     const auto addresses = rank.index_addresses();
     RdmaProxyBenchmarkDeviceIndices views{sizeof(views), nodes*gpus, tokens*experts_per_gpu, addresses.data()};
-    rank.proxy->install_borrowed_benchmark_route_views(epoch, routing, host, &views);
+    rank.proxy->install_borrowed_benchmark_route_views(epoch, routing, host, &views, split_transport);
     for (const auto* slot : rank.device_indices)
         if (slot[0] != 0 || !std::all_of(slot + 1, slot + tokens*experts_per_gpu, [](int32_t n) { return n == -5; }))
             throw std::runtime_error("empty source lists must expose exactly one zero index");
+    if (split_transport)
+        rank.proxy->prepare_iteration_step(epoch);  // Shutdown before peer transport starts.
 }
 
-void run(bool prepared, bool validate) {
+void run(bool prepared, bool validate, bool split_transport) {
     ProxyConfig config;
     config.num_nodes = nodes;
     config.num_gpus_per_node = gpus;
@@ -542,6 +575,8 @@ void run(bool prepared, bool validate) {
     config.router_routing_enabled = config.router_dynamic_routing_enabled = true;
     config.router_benchmark_metadata_enabled = config.router_local_input_staging_enabled = true;
     config.router_benchmark_metadata_validation_enabled = validate;
+    config.router_local_input_early_ready_enabled = split_transport;
+    if (prepared && split_transport) config.nvlink_forward_notification_scheduling_mode = "complete_round";
     config.router_num_experts = nodes*gpus*experts_per_gpu;
     config.router_top_k = experts_per_gpu;
     config.nvlink_forwarding_enabled = config.nvlink_forward_synchronize_batches = true;
@@ -580,24 +615,33 @@ void run(bool prepared, bool validate) {
     on_all_gpus([&](int gpu) { ranks[gpu].proxy->initialize(); });
     for (int epoch = 0; epoch < 3; ++epoch) {
         on_all_gpus([&](int gpu) {
-            if (prepared && !validate && epoch == 2 && gpu == gpus - 1) {
-                // Hold this rank before installation until rank 0 has installed
-                // its route and reset ready_rows for this epoch's payload.
+            if (split_transport && epoch == 2 && gpu == gpus - 1) {
+                // Hold a peer before installation. Rank zero must publish real
+                // local work even though its payload start barrier cannot pass.
                 const auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(config.completion_timeout_ms);
                 for (;;) {
                     const auto state = ranks[0].proxy->router_computation_scheduler_state();
-                    if (state.iteration_initialized && state.iteration == static_cast<uint64_t>(epoch)) {
-                        if (state.published_rows != 0)
-                            throw std::runtime_error("published gather rows before all local routes were installed");
+                    if (state.iteration_initialized && state.iteration == static_cast<uint64_t>(epoch) &&
+                        state.published_rows != 0) {
+                        const auto& publication = ranks[0].proxy->router_notification_publication_buffers();
+                        const auto* table = static_cast<const int32_t*>(publication.host_table.ptr);
+                        for (std::size_t row = 0; row < state.published_rows; ++row) {
+                            const auto* ranges = table + row * publication.table_width + 2;
+                            if (ranges[1] != ranges[0] + 1)
+                                throw std::runtime_error("early row did not select rank zero's staged input");
+                            for (int slot = 1; slot < nodes * gpus; ++slot)
+                                if (ranges[slot * 2] != ranges[slot * 2 + 1])
+                                    throw std::runtime_error("early row used undelivered peer input");
+                        }
                         break;
                     }
                     if (std::chrono::steady_clock::now() >= deadline)
-                        throw std::runtime_error("fast rank did not reach native preparation before the late installer");
+                        throw std::runtime_error("rank zero waited for a late peer before publishing local work");
                     std::this_thread::yield();
                 }
             }
-            run_benchmark_iteration(ranks[gpu], gpu, epoch);
+            run_benchmark_iteration(ranks[gpu], gpu, epoch, split_transport);
         });
         for (int source = 0; source < gpus; ++source) {
             std::array<std::size_t, nodes> row{};
@@ -645,7 +689,7 @@ void run(bool prepared, bool validate) {
     }
     check_final_borrowed_install(ranks[1], 3, {tokens}, false, validate ? "invalid token index" : nullptr);
     check_final_borrowed_install(ranks[2], 3, {0}, true, "device index slot disagrees");
-    check_empty_device_indices(ranks[3], 3);
+    check_empty_device_indices(ranks[3], 3, split_transport);
     check_final_borrowed_install(ranks[4], 3, {1, 0}, false, validate ? "not monotonic" : nullptr);
     on_all_gpus([&](int gpu) { ranks[gpu].proxy->shutdown(); });
     expect_error([&] { (void)ranks[0].proxy->router_expert_metadata_for_source(0, 0); });
@@ -662,6 +706,7 @@ void run(bool prepared, bool validate) {
 
 int main() {
     Logger::instance().set_level(LogLevel::kError);
-    for (bool prepared : {false, true}) run(prepared, true);
-    run(true, false);
+    for (bool prepared : {false, true}) run(prepared, true, false);
+    run(false, true, true);
+    run(true, false, true);
 }

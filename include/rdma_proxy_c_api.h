@@ -345,6 +345,15 @@ RDMA_PROXY_C_API int rdma_proxy_install_borrowed_benchmark_route_views(
 RDMA_PROXY_C_API int rdma_proxy_install_borrowed_benchmark_device_indices(
     RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing,
     const RdmaProxyBenchmarkHostRoute* host_route, const RdmaProxyBenchmarkDeviceIndices* device_indices);
+/* Concurrent-compute version with the same buffer ownership and visibility
+ * requirements. The local staging gather must also have completed. The live
+ * compute extents and route views are available when the call returns. On a
+ * refreshed route with early local readiness, prepare_iteration can release
+ * this GPU's own gather rows. Run run_iteration concurrently with the GEMM
+ * to finish transport preparation and publish the remaining rows. */
+RDMA_PROXY_C_API int rdma_proxy_install_benchmark_device_indices_for_compute(
+    RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing,
+    const RdmaProxyBenchmarkHostRoute* host_route, const RdmaProxyBenchmarkDeviceIndices* device_indices);
 /* Call after run_iteration and any external consumers of this iteration have
  * completed. Drains the remaining native readers. Retire on every rank before
  * any rank starts the next exchange or otherwise reuses the records. */

@@ -83,7 +83,7 @@ def _generation_seed(base, global_rank, iteration):
 class BenchmarkMetadataBackend:
     """One benchmark metadata worker, IPC arena and same-index QP per meon rank."""
 
-    def __init__(self, library, handle, torch, device_buffers):
+    def __init__(self, library, handle, torch, device_buffers, *, concurrent_compute=False):
         self.library = library
         self.handle = handle
         self.torch = torch
@@ -101,7 +101,7 @@ class BenchmarkMetadataBackend:
         self.device_indices = None
         self.last_stats = {}
         self.config = BenchmarkConfig(struct_size=C.sizeof(BenchmarkConfig))
-        self._bind()
+        self._bind(concurrent_compute=concurrent_compute)
         self._check(library.rdma_proxy_get_benchmark_routing_config(handle, C.byref(self.config)),
                     "querying benchmark metadata configuration")
         try:
@@ -113,7 +113,7 @@ class BenchmarkMetadataBackend:
                 print(f"Benchmark metadata setup cleanup failed: {cleanup_error}", file=sys.stderr, flush=True)
             raise
 
-    def _bind(self):
+    def _bind(self, *, concurrent_compute=False):
         install = getattr(self.library, "rdma_proxy_install_borrowed_benchmark_routing", None)
         retire = getattr(self.library, "rdma_proxy_retire_borrowed_benchmark_routing", None)
         if install is None or retire is None:
@@ -138,6 +138,10 @@ class BenchmarkMetadataBackend:
             if self.borrow_source_route:
                 self.install_device_indices = getattr(
                     self.library, "rdma_proxy_install_borrowed_benchmark_device_indices", None)
+                if concurrent_compute:
+                    self.install_device_indices = getattr(
+                        self.library, "rdma_proxy_install_benchmark_device_indices_for_compute",
+                        self.install_device_indices)
                 if self.install_device_indices is not None:
                     self.install_device_indices.argtypes = [
                         C.c_void_p, C.c_uint64, C.POINTER(BenchmarkRouting),

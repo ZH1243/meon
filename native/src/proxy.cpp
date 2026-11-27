@@ -692,6 +692,7 @@ void Proxy::retire_borrowed_benchmark_routing(uint64_t iteration) {
     // The last forwarding scan may already hold a shared lock. Once it exits,
     // subsequent scans skip this completed generation while the payload is idle.
     std::unique_lock<std::shared_mutex> lock(forwarding_routes_mutex_);
+    cuda_buffers_.retire_return_maps();
     cuda_buffers_.retire_borrowed_expert_metadata();
     if (iteration_source_ && iteration_source_->has_borrowed_source_route())
         iteration_source_.reset();
@@ -705,6 +706,8 @@ void Proxy::install_iteration_routing(uint64_t iteration, IterationRouteData rou
     // validation and rollback so readers can only see a committed route.
     std::unique_lock<std::shared_mutex> lock(forwarding_routes_mutex_);
     try {
+        // Return-map construction borrows both the local route and peer x4 storage.
+        cuda_buffers_.retire_return_maps();
         if (!route.source || route.incoming_nodes.size() != peers_.size())
             throw std::runtime_error("iteration route is missing source or peer metadata");
         for (auto& peer : peers_) {
@@ -807,9 +810,9 @@ void Proxy::prepare_iteration_step(uint64_t iteration) {
         throw std::runtime_error("cannot reset while forwarding rounds are pending");
     cuda_buffers_.begin_router_notification_iteration(iteration);
     // begin_router_notification_iteration publishes ready_rows=0 on the
-    // proxy's private stream. Make that reset visible before Python queues a
-    // persistent scheduler which immediately polls the flag.
-    cuda_buffers_.synchronize_router_notification_publication();
+    // proxy's private stream. Up-GEMM may poll it immediately. Only the GPU
+    // reset needs to finish here; CPU scatter serves a later consumer.
+    cuda_buffers_.synchronize_router_notification_stream();
     if (config_.router_local_input_staging_enabled && !local_router_input_staged_) {
         const auto& local_x3 =
             router_routing_.token_indices_for_node(config_.node_rank);
@@ -849,6 +852,7 @@ void Proxy::run_iteration_step(uint64_t iteration) {
     run_iteration(iteration);
     finish_rdma_returns();
     synchronize_iteration(iteration);
+    cuda_buffers_.check_down_metadata_error();
     iteration_prepared_ = false;
     if (config_.router_dynamic_routing_enabled) {
         dynamic_payload_active_.store(false);
@@ -917,6 +921,15 @@ void Proxy::configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config) {
     if (!initialized_ || iteration_prepared_)
         throw std::runtime_error("CPU scatter requires initialized idle proxy");
     cuda_buffers_.configure_cpu_scatter(config);
+}
+
+void Proxy::configure_cpu_scatter_async(const RdmaProxyCpuScatterConfig& config,
+                                        uintptr_t packed_weights, std::size_t slab_bytes) {
+    auto lock = lock_forwarding_routes();
+    if (!initialized_ || !config_.router_dynamic_routing_enabled || iteration_prepared_ ||
+        routing_failed_ || routing_iteration_ != completed_routing_iterations_.load())
+        throw std::runtime_error("async CPU scatter requires a freshly installed idle dynamic route");
+    cuda_buffers_.configure_cpu_scatter_async(config, packed_weights, slab_bytes);
 }
 
 void Proxy::configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes) {
@@ -1006,6 +1019,7 @@ std::vector<std::pair<int32_t, double>> Proxy::read_down_ready_trace(uint64_t it
     std::vector<std::pair<int32_t, double>> result;
     while (true) {
         check_forwarding_error();
+        cuda_buffers_.check_down_metadata_error();
         if (down_ready_trace_.read(iteration, result) &&
             (!config_.nvlink_return_completion_notifications_enabled ||
              return_notifications_complete(iteration))) return result;
@@ -1044,10 +1058,61 @@ std::vector<uint8_t> Proxy::intra_node_source_masks(int source_node) const {
 
 std::shared_lock<std::shared_mutex> Proxy::lock_installed_combine_route() const {
     auto routes_lock = lock_forwarding_routes();
+    require_installed_combine_route();
+    return routes_lock;
+}
+
+void Proxy::require_installed_combine_route() const {
     if (!initialized_ || !config_.router_dynamic_routing_enabled || iteration_prepared_ ||
         routing_failed_ || routing_iteration_ != completed_routing_iterations_.load())
         throw std::runtime_error("combine rows require a freshly installed, idle dynamic route");
-    return routes_lock;
+}
+
+void Proxy::configure_return_maps(const int32_t* nodes, uint64_t num_nodes, uint64_t capacity,
+                                  uintptr_t device_slab, uint64_t words, bool include_inter) {
+    std::unique_lock<std::shared_mutex> routes_lock(forwarding_routes_mutex_);
+    require_installed_combine_route();
+    if (!nodes || !num_nodes || num_nodes > static_cast<uint64_t>(config_.num_nodes) ||
+        capacity != config_.num_tokens || words > std::numeric_limits<std::size_t>::max())
+        throw std::runtime_error("invalid async return map dimensions");
+    std::vector<int32_t> ordered;
+    for (uint64_t i = 0; i < num_nodes; ++i) {
+        if (nodes[i] < 0 || nodes[i] >= config_.num_nodes ||
+            std::find(ordered.begin(), ordered.end(), nodes[i]) != ordered.end())
+            throw std::runtime_error("invalid or duplicate async return map node");
+        ordered.push_back(nodes[i]);
+    }
+    cuda_buffers_.configure_return_maps(ordered.size(), include_inter, device_slab, words);
+    return_map_nodes_ = std::move(ordered);
+    return_map_inter_ = include_inter;
+}
+
+void Proxy::start_return_maps(uint64_t iteration, uint64_t* intra_counts,
+                             uint64_t* outgoing_counts, uint64_t num_nodes) {
+    auto routes_lock = lock_installed_combine_route();
+    if (!intra_counts || !outgoing_counts || intra_counts == outgoing_counts || !num_nodes ||
+        num_nodes != return_map_nodes_.size() || routing_iteration_ != iteration)
+        throw std::runtime_error("return map job requires distinct count arrays and the installed route");
+    ReturnMapRoute route;
+    route.masks.reserve(num_nodes);
+    if (return_map_inter_) route.tokens.reserve(num_nodes);
+    for (std::size_t d = 0; d < num_nodes; ++d) {
+        const auto masks = intra_node_raw_masks(return_map_nodes_[d]);
+        const auto tokens = outgoing_token_index_view(return_map_nodes_[d]);
+        if (masks.size() > config_.num_tokens || tokens.size() > config_.num_tokens)
+            throw std::runtime_error("async return map domain exceeds token capacity");
+        route.masks.push_back(masks);
+        if (return_map_inter_) route.tokens.push_back(tokens);
+        // Lengths are available before the worker fills a single map row. No
+        // output pointer is retained; only the backing route is leased to the job.
+        intra_counts[d] = masks.size();
+        outgoing_counts[d] = tokens.size();
+    }
+    cuda_buffers_.start_return_maps(iteration, std::move(route));
+}
+
+void Proxy::wait_return_maps(uint64_t iteration, uintptr_t consumer_stream, uint64_t timeout_ms) {
+    cuda_buffers_.wait_return_maps(iteration, consumer_stream, timeout_ms);
 }
 
 void Proxy::build_intra_node_combine_rows(
@@ -1059,10 +1124,7 @@ void Proxy::build_intra_node_combine_rows(
         capacity > std::numeric_limits<int32_t>::max() / num_nodes)
         throw std::runtime_error("invalid combine row table dimensions or host arrays");
     const int peers = config_.num_gpus_per_node;
-    const auto stride = num_nodes * capacity + 2;
-    const auto peer_rows = num_nodes * peers;
-    if (peer_rows > std::numeric_limits<std::size_t>::max() / sizeof(int32_t) / stride ||
-        row_elements != peer_rows * stride)
+    if (row_elements != intra_return_map_words(num_nodes, capacity, peers))
         throw std::runtime_error("combine row table has incorrect element count");
 
     // Resolve every domain before modifying caller storage. The route lock
@@ -1077,25 +1139,8 @@ void Proxy::build_intra_node_combine_rows(
             throw std::runtime_error("combine source domain exceeds row capacity");
         domains.push_back(masks);
     }
-    for (uint64_t d = 0; d < num_nodes; ++d) {
-        const auto masks = domains[d];
-        domain_counts[d] = masks.size();
-        for (int peer = 0; peer < peers; ++peer) {
-            auto* row = rows + (d * peers + peer) * stride;
-            auto* live = row + d * capacity;
-            const unsigned bit = 1U << ((config_.local_gpu_index - peer + peers) % peers);
-            std::fill(row, live, -1);
-            int32_t selected = 0;
-            for (std::size_t i = 0; i < masks.size(); ++i) {
-                const bool hit = (masks[i] & bit) != 0;
-                live[i] = hit ? selected : -1;
-                selected += hit;
-            }
-            std::fill(live + masks.size(), row + stride - 2, -1);
-            row[stride - 2] = selected;
-            row[stride - 1] = static_cast<int32_t>(masks.size());
-        }
-    }
+    for (std::size_t d = 0; d < domains.size(); ++d) domain_counts[d] = domains[d].size();
+    fill_intra_return_rows(domains, capacity, peers, config_.local_gpu_index, rows);
 }
 
 void Proxy::build_inter_node_combine_rows(
@@ -1106,9 +1151,7 @@ void Proxy::build_inter_node_combine_rows(
         num_nodes > static_cast<uint64_t>(config_.num_nodes) || num_tokens != config_.num_tokens ||
         num_tokens > std::numeric_limits<int32_t>::max())
         throw std::runtime_error("invalid inter-node combine row table dimensions or host arrays");
-    const auto stride = num_tokens + 2;
-    if (num_nodes > std::numeric_limits<std::size_t>::max() / sizeof(int32_t) / stride ||
-        row_elements != num_nodes * stride)
+    if (row_elements != inter_return_map_words(num_nodes, num_tokens))
         throw std::runtime_error("inter-node combine row table has incorrect element count");
 
     std::vector<TokenIndexView> domains;
@@ -1122,19 +1165,7 @@ void Proxy::build_inter_node_combine_rows(
             throw std::runtime_error("inter-node combine destination exceeds token capacity");
         domains.push_back(tokens);
     }
-    for (uint64_t d = 0; d < num_nodes; ++d) {
-        const auto tokens = domains[d];
-        auto* row = rows + d * stride;
-        std::fill_n(row, num_tokens, -1);
-        for (std::size_t ordinal = 0; ordinal < tokens.size(); ++ordinal) {
-            const auto token = tokens[ordinal];
-            if (token >= num_tokens || row[token] != -1)
-                throw std::runtime_error("invalid original token in inter-node combine route");
-            row[token] = static_cast<int32_t>(ordinal);
-        }
-        row[num_tokens] = static_cast<int32_t>(tokens.size());
-        row[num_tokens + 1] = 0;
-    }
+    fill_inter_return_rows(domains, num_tokens, rows);
 }
 
 int Proxy::return_ready_prefix(uint64_t iteration) const {
@@ -1225,22 +1256,23 @@ void Proxy::finish_run() {
 void Proxy::shutdown() {
     cancel_local_nvlink_return_batch_sync();
     down_ready_trace_.cancel();
+    std::exception_ptr shutdown_error;
     try {
         stop_forwarding_thread();
     } catch (...) {
-        // Forwarding producers have already joined before fallible CUDA/IPC
-        // cleanup. Drain writes to borrowed metadata even on that error.
-        try { cuda_buffers_.stop_cpu_scatter_worker(); } catch (...) {}
-        try { cuda_buffers_.stop_down_wave_worker(); } catch (...) {}
-        throw;
+        shutdown_error = std::current_exception();
     }
-    try {
-        cuda_buffers_.stop_cpu_scatter_worker();
-    } catch (...) {
-        try { cuda_buffers_.stop_down_wave_worker(); } catch (...) {}
-        throw;
+    // Forwarding producers have joined. Drain every writer of borrowed buffers,
+    // including when a preceding join or CUDA/IPC cleanup reported an error.
+    for (auto stop : {&CudaBuffers::stop_cpu_scatter_worker, &CudaBuffers::stop_down_wave_worker,
+                      &CudaBuffers::stop_return_map_worker}) {
+        try {
+            (cuda_buffers_.*stop)();
+        } catch (...) {
+            if (!shutdown_error) shutdown_error = std::current_exception();
+        }
     }
-    cuda_buffers_.stop_down_wave_worker();
+    if (shutdown_error) std::rethrow_exception(shutdown_error);
     if (benchmark_expert_lists_borrowed_) {
         cuda_buffers_.retire_borrowed_expert_metadata();
         benchmark_expert_lists_borrowed_ = false;
@@ -1296,6 +1328,7 @@ void Proxy::shutdown() {
     rdma_bandwidth_reports_.clear();
     if (routing_error) std::rethrow_exception(routing_error);
     check_forwarding_error();
+    cuda_buffers_.check_down_metadata_error();
 }
 
 PeerConnectionInfo Proxy::make_local_peer_info(const PeerState& peer) const {

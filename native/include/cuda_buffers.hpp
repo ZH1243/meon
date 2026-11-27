@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include "down_wave_schedule.hpp"
 #include "protocol.hpp"
+#include "return_map_worker.hpp"
 #include "rdma_proxy_c_api.h"
 
 #if RDMA_PROXY_HAVE_CUDA
@@ -18,6 +19,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -254,6 +256,7 @@ public:
     RouterComputationSchedulerState router_computation_scheduler_state() const;
     RouterNotificationSchedulingDiagnostics router_notification_scheduling_diagnostics() const;
     void begin_router_notification_iteration(uint64_t iteration);
+    void synchronize_router_notification_stream();
     void synchronize_router_notification_publication();
     void record_router_computation_end(uint64_t iteration, uintptr_t cuda_stream);
     float router_computation_elapsed_ms(uint64_t iteration);
@@ -261,6 +264,8 @@ public:
     void reserve_threaded_cpu_scatter(std::size_t address_columns);
     std::size_t dynamic_computation_route_capacity() const;
     void configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config);
+    void configure_cpu_scatter_async(const RdmaProxyCpuScatterConfig& config,
+                                     uintptr_t packed_weights, std::size_t bytes);
     void configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes);
     void configure_cpu_scatter_deferred(std::size_t bytes);
     void configure_cpu_scatter_threaded(std::size_t bytes);
@@ -271,6 +276,12 @@ public:
     DownWaveLayout start_down_wave_schedule(uint64_t iteration, const std::vector<std::size_t>& counts);
     void wait_down_wave_schedule(uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms);
     void stop_down_wave_worker();
+    void configure_return_maps(std::size_t nodes, bool include_inter, uintptr_t device_slab, std::size_t words);
+    void start_return_maps(uint64_t iteration, ReturnMapRoute route);
+    void wait_return_maps(uint64_t iteration, uintptr_t consumer_stream, uint64_t timeout_ms);
+    void check_down_metadata_error() const;
+    void retire_return_maps();
+    void stop_return_map_worker();
     void update_expert_token_heads(
         int source_node_rank,
         int source_gpu_index,
@@ -379,9 +390,21 @@ private:
         bool started{false};
         bool final_gather{false}, busy{false}, stop{false};
     } down_wave_;
+    CpuPinnedBuffer return_map_staging_;
+    std::atomic<bool> down_metadata_failed_{false};
+    std::unique_ptr<ReturnMapWorker> return_maps_;
     void reserve_threaded_cpu_scatter_locked(std::size_t address_columns);
     void reserve_cpu_scatter_slab_locked(std::size_t capacity);
     void configure_cpu_scatter_slab_locked(std::size_t bytes, bool threaded);
+    void configure_cpu_scatter_threaded_locked(std::size_t bytes);
+    struct CpuScatterLookupJob {
+        std::size_t capacity, width, tile_n, element_bytes;
+        std::vector<uint64_t> output_bases;
+        int64_t* counts;
+        int64_t* output_to_input;
+    };
+    CpuScatterLookupJob make_cpu_scatter_lookup_job(const RdmaProxyCpuScatterConfig& config) const;
+    void build_cpu_scatter_lookup(const CpuScatterLookupJob& job);
     std::pair<std::size_t, std::size_t> pack_cpu_scatter_batch(const int32_t* ranges);
     void prepare_cpu_scatter_batch(const int32_t* ranges);
     void upload_cpu_scatter_slab();
@@ -407,11 +430,14 @@ private:
     // never acquires scheduler state and releases this lock for ALL packing.
     bool cpu_scatter_threaded_{false};  // Publication policy of the current route.
     std::thread cpu_scatter_worker_thread_;
-    std::mutex cpu_scatter_worker_mutex_;
+    mutable std::mutex cpu_scatter_worker_mutex_;
     std::condition_variable cpu_scatter_worker_cv_;
     // Final consumers sleep separately from per-prefix work/progress waiters.
     std::condition_variable cpu_scatter_worker_ready_cv_;
     bool cpu_scatter_worker_busy_{false};
+    // Installed source indices are immutable until the worker is quiesced.
+    // The job owns its output bases and borrows only the host result arrays.
+    std::optional<CpuScatterLookupJob> cpu_scatter_pending_lookup_;
     bool cpu_scatter_worker_stop_{false};
     bool cpu_scatter_worker_epoch_valid_{false};
     bool cpu_scatter_worker_cancelled_{false};
@@ -424,6 +450,7 @@ private:
     std::exception_ptr cpu_scatter_worker_error_;
     // Only the friend test fixture installs this, before any epoch is active.
     std::function<void()> cpu_scatter_pack_test_hook_;
+    std::function<void()> cpu_scatter_lookup_test_hook_;
     uintptr_t cpu_route_weights_device_{0};
     uintptr_t cpu_scatter_device_{0};
     std::size_t cpu_scatter_columns_{0};

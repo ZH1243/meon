@@ -58,6 +58,9 @@ struct CpuScatterTestAccess {
     static void set_hook(CudaBuffers& buffers, std::function<void()> hook) {
         buffers.cpu_scatter_pack_test_hook_ = std::move(hook);
     }
+    static void set_lookup_hook(CudaBuffers& buffers, std::function<void()> hook) {
+        buffers.cpu_scatter_lookup_test_hook_ = std::move(hook);
+    }
     static void require_full_bundle(CudaBuffers& buffers) {
         std::lock_guard<std::mutex> lock(buffers.cpu_scatter_worker_mutex_);
         const auto groups = buffers.router_notification_publication_buffers_.n_groups_per_m_cluster;
@@ -602,7 +605,7 @@ static void run(bool per_entry, uint64_t tile, bool cuda, int weight_mode,
     destroy_cuda_stream(compute_stream, config.mock_mode);
 }
 
-static void test_threaded_dynamic_reuse(bool reserve_at_startup, bool cuda) {
+static void test_threaded_dynamic_reuse(bool reserve_at_startup, bool cuda, bool async_lookup = false) {
     ProxyConfig c;
     c.mock_mode = !cuda;
     c.router_routing_enabled = c.router_dynamic_routing_enabled = true;
@@ -613,6 +616,9 @@ static void test_threaded_dynamic_reuse(bool reserve_at_startup, bool cuda) {
     c.router_top_k = 1;
     c.num_tokens = 4;
     c.token_dimension = c.expert_gemm_dimension = c.expert_gemm_n_tile = 1;
+    const std::size_t tile = async_lookup ? 128 : 0;
+    const std::size_t columns = tile ? 2 : 1;
+    if (tile) c.token_dimension = 2 * tile;
     c.expert_gemm_m_tile = 4;  // The largest generation covers two M batches.
     c.dtype = DataType::kBF16;
 
@@ -633,9 +639,13 @@ static void test_threaded_dynamic_reuse(bool reserve_at_startup, bool cuda) {
 #endif
     // Join the publisher and finish all copies before releasing its destination.
     PackingGate packing_gate;
+    PackingGate lookup_gate;
+    int64_t counts[2]{}, inverse[8]{};
     std::atomic<unsigned> packing_threads{0};
     CudaBuffers buffers(c);
     ReleasePackingGate release_before_buffers_cleanup{packing_gate};
+    ReleasePackingGate release_lookup{lookup_gate};
+    CpuScatterTestAccess::set_lookup_hook(buffers, [&] { lookup_gate(); });
     CpuScatterTestAccess::set_hook(buffers, [&] {
         // A newly created std::thread can have the same OS ID as its predecessor.
         thread_local bool first_pack = true;
@@ -646,10 +656,10 @@ static void test_threaded_dynamic_reuse(bool reserve_at_startup, bool cuda) {
         packing_gate();
     });
     buffers.initialize();
-    constexpr std::size_t reserved_bytes = 8 * (sizeof(int64_t) + sizeof(float));
+    const std::size_t reserved_bytes = 8 * (columns * sizeof(int64_t) + sizeof(float));
     void* pinned = nullptr;
     if (reserve_at_startup) {
-        buffers.reserve_threaded_cpu_scatter(1);
+        buffers.reserve_threaded_cpu_scatter(columns);
         const auto& slab = CpuScatterTestAccess::slab(buffers);
         pinned = slab.ptr;
         require(pinned && slab.bytes == reserved_bytes);
@@ -707,21 +717,33 @@ static void test_threaded_dynamic_reuse(bool reserve_at_startup, bool cuda) {
             require(publication.cpu_scatter_copy_count == previous_copies);
             continue;
         }
-        const auto scatter_bytes = routes * sizeof(int64_t);
+        const auto scatter_bytes = routes * columns * sizeof(int64_t);
         const auto weight_offset = (scatter_bytes + 15) & ~std::size_t{15};
         const auto active_bytes = weight_offset + routes * sizeof(float);
         int32_t pairs[]{0, 0, 0, 1};
         uint64_t bases[]{0x1000, 0x2000};
-        int64_t counts[2], inverse[8];
-        RdmaProxyCpuScatterConfig setup{sizeof(setup), 2, routes, c.num_tokens, 1, 0, 2,
+        RdmaProxyCpuScatterConfig setup{sizeof(setup), 2, routes, c.num_tokens, c.token_dimension, tile, 2,
             reinterpret_cast<uintptr_t>(destination), pairs, bases, counts, inverse};
-        buffers.configure_cpu_scatter(setup);
-        buffers.configure_cpu_route_weights(reinterpret_cast<uintptr_t>(destination + weight_offset), routes);
-        CpuScatterTestAccess::require_no_batch_staging(buffers);
-        if (!per_batch) {
-            buffers.configure_cpu_scatter_threaded(active_bytes);
-            if (!pinned) pinned = slab.ptr;
+        const auto weights = reinterpret_cast<uintptr_t>(destination + weight_offset);
+        const bool pause_lookup = async_lookup && epoch == busy_epoch;
+        if (async_lookup && !per_batch) {
+            if (epoch == 1) setup.output_to_input = nullptr;  // Counts suffice for unchecked returns.
+            if (pause_lookup) lookup_gate.arm();
+            rejects([&] { buffers.configure_cpu_scatter_async(setup, weights, active_bytes - 1); });
+            buffers.configure_cpu_scatter_async(setup, weights, active_bytes);
+            if (pause_lookup) {
+                lookup_gate.wait_entered();
+                // Pair IDs and numerical bases belong to the caller only through configure.
+                std::fill_n(pairs, 4, -1);
+                std::fill_n(bases, 2, 0);
+            }
+        } else {
+            buffers.configure_cpu_scatter(setup);
+            buffers.configure_cpu_route_weights(weights, routes);
+            if (!per_batch) buffers.configure_cpu_scatter_threaded(active_bytes);
         }
+        CpuScatterTestAccess::require_no_batch_staging(buffers);
+        if (!per_batch && !pinned) pinned = slab.ptr;
         require(pinned && slab.ptr == pinned && slab.bytes == reserved_bytes);
 
         // Leave old packed bytes in the pinned slab, and detect oversized uploads
@@ -730,10 +752,25 @@ static void test_threaded_dynamic_reuse(bool reserve_at_startup, bool cuda) {
         if (cuda) require(cudaDeviceSynchronize() == cudaSuccess);
 #endif
         std::memset(destination, 0xa5, sizeof(mock_destination));
-        buffers.begin_router_notification_iteration(epoch);
-        if (cancel_busy_pack && epoch == busy_epoch) packing_gate.arm();
-        for (int source = 0; source < 2; ++source)
-            buffers.process_router_notification_completion(0, source, epoch, 0, c.num_tokens);
+        auto publish = [&] {
+            buffers.begin_router_notification_iteration(epoch);
+            buffers.synchronize_router_notification_publication(); // Pre-up ready=0 fence.
+            if (cancel_busy_pack && epoch == busy_epoch) packing_gate.arm();
+            for (int source = 0; source < 2; ++source)
+                buffers.process_router_notification_completion(0, source, epoch, 0, c.num_tokens);
+        };
+        if (pause_lookup) {
+            // A blocked lookup must permit pre-up reset and ALL gather commits.
+            auto publisher = std::async(std::launch::async, publish);
+            ReleasePackingGate release_before_future{lookup_gate};
+            require(publisher.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+            publisher.get();
+            require(publication.cpu_scatter_copy_count == previous_copies);
+            rejects([&] { buffers.wait_cpu_scatter_ready(epoch, stream_address, 1); });
+            lookup_gate.release();
+        } else {
+            publish();
+        }
         if (cancel_busy_pack && epoch == busy_epoch) {
             packing_gate.wait_entered();
             continue;
@@ -752,9 +789,22 @@ static void test_threaded_dynamic_reuse(bool reserve_at_startup, bool cuda) {
         }
         std::size_t packed = 0;
         for (int source = 0; source < 2; ++source) {
+            require(counts[source] == static_cast<int64_t>(lists[source].size()));
+            if (setup.output_to_input) {
+                auto begin = inverse + source*c.num_tokens;
+                require(std::equal(lists[source].begin(), lists[source].end(), begin));
+                require(std::all_of(begin + lists[source].size(), begin + c.num_tokens,
+                                    [](int64_t i) { return i == -1; }));
+            }
             for (std::size_t row = 0; row < lists[source].size(); ++row, ++packed) {
-                const auto address = bases[source] + row * 2;
-                require(std::memcmp(destination + packed * sizeof(address), &address, sizeof(address)) == 0);
+                const auto row_bytes = (tile ? tile : c.token_dimension) * sizeof(uint16_t);
+                const uint64_t address = (source + 1) * 0x1000 + row * row_bytes;
+                const auto* entry = destination + packed * columns * sizeof(address);
+                require(std::memcmp(entry, &address, sizeof(address)) == 0);
+                if (tile) {
+                    const uint64_t stride = lists[source].size() * row_bytes;
+                    require(std::memcmp(entry + sizeof(address), &stride, sizeof(stride)) == 0);
+                }
             }
         }
         require(std::memcmp(destination + weight_offset, expected_weights.data(), routes * sizeof(float)) == 0);
@@ -766,6 +816,83 @@ static void test_threaded_dynamic_reuse(bool reserve_at_startup, bool cuda) {
     }
     if (packing_threads != 1)
         throw std::runtime_error("expected one scatter worker to pack all dynamic generations");
+}
+
+static void test_async_scatter_lookup_retirement(bool fail) {
+    ProxyConfig c;
+    c.mock_mode = c.router_routing_enabled = c.router_dynamic_routing_enabled = true;
+    c.nvlink_forwarding_enabled = c.nvlink_forward_completion_notifications_enabled = true;
+    c.num_nodes = c.router_top_k = 1;
+    c.num_gpus_per_node = c.router_num_experts = 2;
+    c.num_tokens = 4;
+    c.expert_gemm_m_tile = 1;
+    c.token_dimension = c.expert_gemm_n_tile = c.expert_gemm_dimension = 1;
+    c.dtype = DataType::kBF16;
+    int32_t offsets[]{0, 1}, indices[]{3}, pairs[]{0, 0, 0, 1};
+    uint64_t bases[]{0x1000, 0x2000};
+    alignas(16) int64_t destination[]{-1, -1};
+    int64_t counts[]{-1, -1};
+    PackingGate gate;
+    CudaBuffers buffers(c);
+    ReleasePackingGate release_before_cleanup{gate};
+    buffers.initialize();
+    std::vector<RouterExpertMetadata> metadata(2);
+    for (int source = 0; source < 2; ++source) {
+        auto& m = metadata[source];
+        m.destination_node_rank = m.destination_gpu_index = m.source_node_rank = 0;
+        m.source_gpu_index = source;
+        m.num_nodes = m.experts_per_gpu = m.top_k = 1;
+        m.num_gpus_per_node = m.num_experts = 2;
+        m.num_tokens = c.num_tokens;
+        m.borrow_expert_lists(offsets, indices, 1);
+    }
+    buffers.install_iteration_expert_metadata(std::move(metadata), 0);
+    gate.arm();
+    CpuScatterTestAccess::set_lookup_hook(buffers, [&] {
+        gate();
+        if (fail) throw std::runtime_error("injected asynchronous lookup failure");
+    });
+    RdmaProxyCpuScatterConfig setup{sizeof(setup), 2, 2, c.num_tokens, 1, 0, 2,
+        reinterpret_cast<uintptr_t>(destination), pairs, bases, counts, nullptr};
+    buffers.configure_cpu_scatter_async(setup, 0, sizeof(destination));
+    gate.wait_entered();
+    if (fail) {
+        buffers.begin_router_notification_iteration(0);
+        buffers.synchronize_router_notification_publication();
+        gate.release();
+        try {
+            buffers.wait_cpu_scatter_ready(0, 1, 5000);
+            require(false);
+        } catch (const std::exception& e) {
+            require(std::string(e.what()) == "injected asynchronous lookup failure");
+        }
+        // The lookup failed with up already launched and no gather rows yet.
+        // A scatter error must leave both partial and final up publishes live.
+        auto& publication = buffers.router_notification_publication_buffers();
+        auto* ready = static_cast<int32_t*>(publication.device_ready_rows.ptr);
+        require(*ready == 0 && publication.table_rows == 2);
+        // Preparation joins the ready=0 GPU write even if the CPU lookup failed
+        // in the meantime. The transport must still submit its forward traffic.
+        buffers.synchronize_router_notification_stream();
+        buffers.process_router_notification_completion(0, 0, 0, 0, c.num_tokens);
+        require(*ready == 1);
+        buffers.process_router_notification_completion(0, 1, 0, 0, c.num_tokens);
+        require(*ready == 2 && buffers.router_computation_scheduler_state().final_ready_submitted);
+        rejects([&] { buffers.check_down_metadata_error(); });
+        require(publication.cpu_scatter_copy_count == 0);
+        buffers.stop_cpu_scatter_worker();
+        buffers.retire_borrowed_expert_metadata();
+    } else {
+        // Abort before iteration preparation. The exchange cannot recycle those
+        // borrowed source indices or the host result arrays until the lookup exits.
+        auto retire = std::async(std::launch::async, [&] { buffers.retire_borrowed_expert_metadata(); });
+        ReleasePackingGate release_before_future{gate};
+        require(retire.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+        gate.release();
+        retire.get();
+        require(counts[0] == 1 && counts[1] == 1);
+    }
+    require(destination[0] == -1 && destination[1] == -1);
 }
 
 static void test_down_wave_publication(bool cuda, bool inject_failure = false) {
@@ -898,8 +1025,11 @@ int main(int argc, char** argv) {
     run(false, 128, cuda, 1, 2, false, 0, true);
     test_threaded_dynamic_reuse(true, cuda);
     test_threaded_dynamic_reuse(false, cuda);
+    test_threaded_dynamic_reuse(true, cuda, true);
     test_down_wave_publication(cuda);
     if (!cuda) {
+        test_async_scatter_lookup_retirement(false);
+        test_async_scatter_lookup_retirement(true);
         test_down_wave_publication(false, true);
         run(false, 128, false, 1, 2, false, 1); // busy reset and worker failure
         run(false, 128, false, 1, 2, false, 2); // destructor joins a busy worker

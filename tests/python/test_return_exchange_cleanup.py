@@ -32,6 +32,7 @@ class CleanupTests(unittest.TestCase):
         export = SimpleNamespace(storage=storage, release=lambda: events.append("counter_released"))
         exchange.exports = [export]
         exchange.outputs = (storage,)
+        exchange.return_maps = SimpleNamespace(slab=storage, check=exchange.require)
         exchange.received = {0: storage}
         exchange.received_valid_rows = {0: 1}
         down = SimpleNamespace(return_exchange=exchange)

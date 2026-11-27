@@ -249,6 +249,20 @@ extern "C" int rdma_proxy_configure_cpu_scatter_threaded(RdmaProxyHandle* handle
     } catch (...) { return record_current_exception(); }
 }
 
+extern "C" int rdma_proxy_configure_cpu_scatter_async(
+    RdmaProxyHandle* handle, const RdmaProxyCpuScatterConfig* config, uintptr_t packed_weights,
+    uint64_t slab_bytes) {
+    clear_error();
+    try {
+        if (!handle || !config || !handle->initialized || handle->shut_down || handle->finished ||
+            slab_bytes > std::numeric_limits<std::size_t>::max())
+            throw std::runtime_error("invalid async CPU scatter configuration");
+        select_proxy_cuda_device(*handle);
+        handle->proxy.configure_cpu_scatter_async(*config, packed_weights, static_cast<std::size_t>(slab_bytes));
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
 extern "C" int rdma_proxy_wait_cpu_scatter_ready(
     RdmaProxyHandle* handle, uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms) {
     clear_error();
@@ -816,6 +830,45 @@ extern "C" int rdma_proxy_build_intra_node_combine_rows(
             throw std::runtime_error("combine row setup requires an initialized idle proxy");
         handle->proxy.build_intra_node_combine_rows(
             source_nodes, num_nodes, capacity, rows, row_elements, domain_counts);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
+extern "C" int rdma_proxy_configure_return_maps(
+    RdmaProxyHandle* handle, const int32_t* nodes, uint64_t num_nodes, uint64_t capacity,
+    uintptr_t device_slab, uint64_t words, int32_t include_inter) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || handle->finished ||
+            (include_inter != 0 && include_inter != 1))
+            throw std::runtime_error("invalid return map configuration");
+        select_proxy_cuda_device(*handle);
+        handle->proxy.configure_return_maps(nodes, num_nodes, capacity, device_slab, words, include_inter != 0);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
+extern "C" int rdma_proxy_start_return_maps(
+    RdmaProxyHandle* handle, uint64_t iteration, uint64_t* intra_counts,
+    uint64_t* outgoing_counts, uint64_t num_nodes) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || handle->finished ||
+            !intra_counts || !outgoing_counts || intra_counts == outgoing_counts)
+            throw std::runtime_error("invalid return map start arguments");
+        handle->proxy.start_return_maps(iteration, intra_counts, outgoing_counts, num_nodes);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
+extern "C" int rdma_proxy_wait_return_maps(
+    RdmaProxyHandle* handle, uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down)
+            throw std::runtime_error("invalid return map wait handle");
+        select_proxy_cuda_device(*handle);
+        handle->proxy.wait_return_maps(iteration, cuda_stream, timeout_ms);
         return 0;
     } catch (...) { return record_current_exception(); }
 }

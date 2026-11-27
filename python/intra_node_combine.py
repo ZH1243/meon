@@ -155,7 +155,9 @@ class IntraNodeCombine:
             raise ValueError("intra-node combine exceeds the kernel's int32 element-index range")
         active = self.entries if capacity is not None else [entry for entry in self.entries if entry[3].numel()]
         shape = (max(1, len(active)), max(1, self.capacity_rows) + (2 if capacity is not None else 0))
-        self.rows = torch.empty(shape, dtype=torch.int32, device=self.device)
+        maps = getattr(exchange, "return_maps", None)
+        self.rows = (maps.intra_rows if maps is not None
+                     else torch.empty(shape, dtype=torch.int32, device=self.device))
         self.output = torch.empty((self.capacity_rows * self.width,) if self.output_tile_n
                                   else (self.capacity_rows, self.width),
                                   dtype=exchange.outputs[0].dtype, device=self.device)
@@ -168,8 +170,12 @@ class IntraNodeCombine:
             self._build_rows.restype = ctypes.c_int
             self._source_nodes = (ctypes.c_int32 * len(self.nodes))(*self.nodes)
             self._domain_counts = (ctypes.c_uint64 * len(self.nodes))()
-            self.rows_host = torch.empty(shape, dtype=torch.int32, device="cpu", pin_memory=self.device.type == "cuda")
+            self.rows_host = torch.empty(shape, dtype=torch.int32, device="cpu",
+                                         pin_memory=maps is None and self.device.type == "cuda")
             self._update_native_rows()
+            if maps is not None:
+                # Generation zero is eager. Subsequent DMA uses native pinned storage.
+                self.rows_host = None
         return active
 
     def _update_native_rows(self):
@@ -179,7 +185,10 @@ class IntraNodeCombine:
             self.rows_host.numel(), self._domain_counts))
         # The blocking copy retires the DMA read before this buffer can be refilled.
         self.rows.copy_(self.rows_host)
-        self.domains = [(node, i * self.dynamic_capacity, self._domain_counts[i])
+        self._bind_domain_counts(self._domain_counts)
+
+    def _bind_domain_counts(self, counts):
+        self.domains = [(node, i * self.dynamic_capacity, counts[i])
                         for i, node in enumerate(self.nodes)]
         self._update_output_views()
 
@@ -244,6 +253,18 @@ class IntraNodeCombine:
             self.rdma_return.refresh(self)
         if self.inter_node_combine is not None:
             self.inter_node_combine.refresh_routes(self)
+
+    def bind_return_maps(self, iteration):
+        """Join this epoch's native DMA on both readers and rebind CPU view shapes."""
+        maps = self.exchange.return_maps
+        maps.wait(iteration, self.stream)
+        self._bind_domain_counts(maps.intra_counts)
+        if self.rdma_return is not None:
+            self.rdma_return.refresh(self, dict(zip(self.nodes, maps.outgoing_counts)))
+        inter = self.inter_node_combine
+        if inter is not None:
+            maps.wait(iteration, inter.stream)
+            inter.bind_return_views(self, maps.outgoing_counts)
 
     def _warmup(self):
         """Exercise the compiled callable before readiness-gated GPU work starts.
@@ -327,7 +348,7 @@ class IntraNodeCombine:
                 source = self.exchange.down.up.source_pairs.index((node, peer))
                 actual_count = int(self.exchange.down.combine_valid_rows[source].item())
                 actual_index = self.exchange.down.combine_output_to_input[source, :count]
-                torch.testing.assert_close(actual_index, index, rtol=0, atol=0)
+                torch.testing.assert_close(actual_index, index.to(actual_index.device), rtol=0, atol=0)
             else:
                 actual_count = self.exchange.received_valid_rows[peer, node]
             if count != actual_count:

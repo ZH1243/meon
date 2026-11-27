@@ -9,6 +9,52 @@ struct RdmaReturnsTestAccess {
     static void require(bool value, const char* message) {
         if (!value) throw std::runtime_error(message);
     }
+    static void failed_map_with_no_local_expert_work() {
+        ProxyConfig config;
+        config.mock_mode = config.router_routing_enabled = config.router_dynamic_routing_enabled = true;
+        config.router_local_input_staging_enabled = config.nvlink_forwarding_enabled = true;
+        config.nvlink_forward_completion_notifications_enabled = true;
+        config.num_nodes = config.num_gpus_per_node = config.router_num_experts = config.router_top_k = 1;
+        config.num_tokens = 2;
+        config.token_dimension = config.expert_gemm_dimension = config.expert_gemm_n_tile = 1;
+        int32_t maps[8]{}, duplicate_tokens[]{1, 1};
+        Proxy proxy(config);
+        auto& buffers = proxy.cuda_buffers_;
+        buffers.initialize();
+        RouterExpertMetadata empty;
+        empty.source_node_rank = empty.source_gpu_index = empty.destination_node_rank = empty.destination_gpu_index = 0;
+        empty.num_nodes = empty.num_gpus_per_node = empty.num_experts = empty.experts_per_gpu = 1;
+        empty.num_tokens = config.num_tokens;
+        empty.expert_offsets = {0, 0};
+        buffers.install_iteration_expert_metadata({empty}, 0);
+        buffers.configure_return_maps(1, true, reinterpret_cast<uintptr_t>(maps), 8);
+        buffers.start_return_maps(0, {{{nullptr, 0}}, {{duplicate_tokens, 2}}});
+        const auto expect_map_error = [](auto operation) {
+            try {
+                operation();
+            } catch (const std::runtime_error& e) {
+                if (std::string(e.what()).find("invalid original token") != std::string::npos) return;
+                throw;
+            }
+            throw std::runtime_error("lost the asynchronous return map failure");
+        };
+        expect_map_error([&] { buffers.wait_return_maps(0, 1, 5000); });
+        buffers.begin_router_notification_iteration(0);
+        buffers.synchronize_router_notification_stream();
+        require(buffers.router_computation_scheduler_state().final_ready_submitted, "zero-row gather did not finish");
+
+        // Empty local gather can finish before this proxy forwards any peer's data.
+        // Forwarding and mixed forward/return polls must still run. The return-only
+        // coordinator must then report the map failure without waiting for a prefix.
+        proxy.rdma_returns_ = std::make_unique<Proxy::RdmaReturnState>();
+        proxy.rdma_returns_->active = true;
+        proxy.rdma_returns_->complete = false;
+        proxy.rdma_returns_->groups = 1;
+        proxy.rdma_returns_->host_prefix = new int32_t(0);
+        proxy.check_forwarding_error();
+        proxy.service_rdma_returns();
+        expect_map_error([&] { proxy.finish_rdma_returns(); });
+    }
     static void exercise(bool empty, bool dual = false, bool dynamic = false) {
         ProxyConfig config;
         config.mock_mode = true;
@@ -127,6 +173,7 @@ struct RdmaReturnsTestAccess {
 };
 }
 int main() {
+    rdma_proxy::RdmaReturnsTestAccess::failed_map_with_no_local_expert_work();
     rdma_proxy::RdmaReturnsTestAccess::exercise(false);
     rdma_proxy::RdmaReturnsTestAccess::exercise(true);
     rdma_proxy::RdmaReturnsTestAccess::exercise(false, true);

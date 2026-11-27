@@ -165,6 +165,7 @@ void CudaBuffers::set_external_device_buffer_allocator(
 }
 
 CudaBuffers::~CudaBuffers() {
+    return_maps_.reset();  // Join before the publication stream and pinned allocation are released.
     try { stop_down_wave_worker(); }
     catch (const std::exception& error) {
         RDMA_PROXY_LOG_WARN("down wave worker cleanup failed: ", error.what());
@@ -268,6 +269,7 @@ CudaBuffers::~CudaBuffers() {
     free_pinned_buffer(cpu_route_weights_staging_);
     free_pinned_buffer(cpu_scatter_host_slab_);
     free_pinned_buffer(down_wave_.staging);
+    free_pinned_buffer(return_map_staging_);
 }
 
 void CudaBuffers::initialize() {
@@ -1190,8 +1192,8 @@ void CudaBuffers::reserve_threaded_cpu_scatter(std::size_t address_columns) {
     reserve_threaded_cpu_scatter_locked(address_columns);
 }
 
-void CudaBuffers::configure_cpu_scatter(const RdmaProxyCpuScatterConfig& c) {
-    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+CudaBuffers::CpuScatterLookupJob CudaBuffers::make_cpu_scatter_lookup_job(
+    const RdmaProxyCpuScatterConfig& c) const {
     if (c.struct_size != sizeof(c) || cpu_scatter_device_ ||
         !router_computation_scheduler_state_.initialized ||
         router_computation_scheduler_state_.iteration_initialized ||
@@ -1201,7 +1203,7 @@ void CudaBuffers::configure_cpu_scatter(const RdmaProxyCpuScatterConfig& c) {
     if (c.num_sources != router_computation_buffer_indices_.size() ||
         c.capacity != config_.num_tokens || c.width != config_.token_dimension ||
         c.element_bytes != dtype_size(config_.dtype) ||
-        !c.source_pairs || !c.output_bases || !c.counts || !c.output_to_input ||
+        !c.source_pairs || !c.output_bases || !c.counts ||
         !c.scatter_addresses || c.scatter_addresses % alignof(int64_t) ||
         (c.tile_n && (c.tile_n > c.width || c.width % c.tile_n)))
         throw std::runtime_error("invalid CPU scatter shape, layout, or pointers");
@@ -1214,12 +1216,25 @@ void CudaBuffers::configure_cpu_scatter(const RdmaProxyCpuScatterConfig& c) {
         c.capacity > std::numeric_limits<std::size_t>::max() / c.num_sources)
         throw std::runtime_error("invalid CPU scatter route count");
 
-    std::vector<std::vector<int64_t>> lookup(c.num_sources);
     for (std::size_t j = 0; j < c.num_sources; ++j) {
         const auto& source = nvlink_recv_buffers_[router_computation_buffer_indices_[j]];
         if (c.source_pairs[2*j] != source.source_node_rank ||
             c.source_pairs[2*j+1] != source.source_gpu_index || !c.output_bases[j])
             throw std::runtime_error("CPU scatter source order differs from gather order");
+        if (c.output_bases[j] > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            c.capacity > (std::numeric_limits<int64_t>::max() - c.output_bases[j]) /
+                             (c.width * c.element_bytes))
+            throw std::runtime_error("CPU scatter output address overflow");
+    }
+    return {c.capacity, c.width, c.tile_n, c.element_bytes,
+            {c.output_bases, c.output_bases + c.num_sources}, c.counts, c.output_to_input};
+}
+
+void CudaBuffers::build_cpu_scatter_lookup(const CpuScatterLookupJob& c) {
+    const std::size_t columns = c.tile_n ? 2 : 1;
+    std::vector<std::vector<int64_t>> lookup(c.output_bases.size());
+    for (std::size_t j = 0; j < lookup.size(); ++j) {
+        const auto& source = nvlink_recv_buffers_[router_computation_buffer_indices_[j]];
         const auto indices = source.expert_metadata.indices_view();
         std::vector<int64_t> compact(c.capacity, -1);
         for (auto row : indices) {
@@ -1227,21 +1242,18 @@ void CudaBuffers::configure_cpu_scatter(const RdmaProxyCpuScatterConfig& c) {
                 throw std::runtime_error("CPU scatter input row out of bounds");
             compact[row] = 0;
         }
-        auto* inverse = c.output_to_input + j*c.capacity;
-        std::fill(inverse, inverse + c.capacity, -1);
+        auto* inverse = c.output_to_input ? c.output_to_input + j*c.capacity : nullptr;
         int64_t count = 0;
         for (std::size_t row = 0; row < c.capacity; ++row) {
             if (compact[row] == 0) {
                 compact[row] = count;
-                inverse[count++] = static_cast<int64_t>(row);
+                if (inverse) inverse[count] = static_cast<int64_t>(row);
+                ++count;
             }
         }
+        if (inverse) std::fill(inverse + count, inverse + c.capacity, -1);
         c.counts[j] = count;
         const auto row_bytes = (c.tile_n ? c.tile_n : c.width) * c.element_bytes;
-        if (c.output_bases[j] > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
-            c.capacity > (std::numeric_limits<int64_t>::max() - c.output_bases[j]) /
-                             (c.width * c.element_bytes))
-            throw std::runtime_error("CPU scatter output address overflow");
         lookup[j].resize(indices.size() * columns);
         for (std::size_t i = 0; i < indices.size(); ++i) {
             lookup[j][i*columns] = static_cast<int64_t>(
@@ -1250,9 +1262,40 @@ void CudaBuffers::configure_cpu_scatter(const RdmaProxyCpuScatterConfig& c) {
         }
     }
     cpu_scatter_lookup_ = std::move(lookup);
-    cpu_scatter_columns_ = columns;
-    cpu_scatter_routes_ = routes;
+}
+
+void CudaBuffers::configure_cpu_scatter(const RdmaProxyCpuScatterConfig& c) {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    if (c.struct_size != sizeof(c) || !c.output_to_input)
+        throw std::runtime_error("CPU scatter requires host output-to-input storage");
+    build_cpu_scatter_lookup(make_cpu_scatter_lookup_job(c));
+    cpu_scatter_columns_ = c.tile_n ? 2 : 1;
+    cpu_scatter_routes_ = c.routes;
     cpu_scatter_device_ = c.scatter_addresses;
+}
+
+void CudaBuffers::configure_cpu_scatter_async(const RdmaProxyCpuScatterConfig& c,
+                                              uintptr_t packed_weights, std::size_t bytes) {
+    std::lock_guard<std::mutex> scheduler_lock(expert_token_heads_mutex_);
+    if (!config_.router_dynamic_routing_enabled || !metadata_generations_installed_ ||
+        (packed_weights != 0) != config_.router_weighted_contributions_enabled)
+        throw std::runtime_error("asynchronous CPU scatter requires an installed dynamic route and matching weights");
+    auto job = make_cpu_scatter_lookup_job(c);
+    cpu_scatter_columns_ = c.tile_n ? 2 : 1;
+    cpu_scatter_routes_ = c.routes;
+    cpu_scatter_device_ = c.scatter_addresses;
+    cpu_route_weights_device_ = packed_weights;
+    try {
+        configure_cpu_scatter_threaded_locked(bytes);
+        std::lock_guard<std::mutex> worker_lock(cpu_scatter_worker_mutex_);
+        if (cpu_scatter_worker_error_) std::rethrow_exception(cpu_scatter_worker_error_);
+        if (cpu_scatter_worker_stop_) throw std::runtime_error("CPU scatter worker is stopped");
+        cpu_scatter_pending_lookup_.emplace(std::move(job));
+        cpu_scatter_worker_cv_.notify_all();
+    } catch (...) {
+        clear_iteration_cpu_scatter();
+        throw;
+    }
 }
 
 void CudaBuffers::configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes) {
@@ -1274,11 +1317,15 @@ void CudaBuffers::configure_cpu_scatter_deferred(std::size_t bytes) {
 
 void CudaBuffers::configure_cpu_scatter_threaded(std::size_t bytes) {
     std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    configure_cpu_scatter_threaded_locked(bytes);
+}
+
+void CudaBuffers::configure_cpu_scatter_threaded_locked(std::size_t bytes) {
     const auto& publication = router_notification_publication_buffers_;
     const auto groups = publication.n_groups_per_m_cluster;
     if (!cpu_scatter_routes_ || !groups || !publication.table_rows ||
         publication.table_rows % groups ||
-        publication.table_width != 2 + 2 * cpu_scatter_lookup_.size() ||
+        publication.table_width != 2 + 2 * router_computation_buffer_indices_.size() ||
         publication.table_row_bytes != publication.table_width * sizeof(int32_t) ||
         !publication.host_table.ptr)
         throw std::runtime_error("threaded CPU scatter requires nonempty complete gather geometry");
@@ -1511,7 +1558,6 @@ void CudaBuffers::commit_cpu_scatter_prefix_locked() {
     // The caller has already enqueued this prefix's table and ready writes.
     // The state mutex provides release/acquire visibility of immutable host rows.
     std::lock_guard<std::mutex> lock(cpu_scatter_worker_mutex_);
-    if (cpu_scatter_worker_error_) std::rethrow_exception(cpu_scatter_worker_error_);
     if (cpu_scatter_worker_stop_)
         throw std::runtime_error("CPU scatter worker is stopped");
     const auto& scheduler = router_computation_scheduler_state_;
@@ -1540,13 +1586,26 @@ void CudaBuffers::cpu_scatter_worker_loop() noexcept {
         std::unique_lock<std::mutex> lock(cpu_scatter_worker_mutex_);
         for (;;) {
             cpu_scatter_worker_cv_.wait(lock, [&] {
-                return cpu_scatter_worker_stop_ ||
+                return cpu_scatter_worker_stop_ || cpu_scatter_pending_lookup_ ||
                     (cpu_scatter_worker_epoch_valid_ && !cpu_scatter_worker_cancelled_ &&
                      !cpu_scatter_worker_submitted_ &&
                      cpu_scatter_worker_committed_rows_ - cpu_scatter_worker_consumed_rows_ >=
                          publication.n_groups_per_m_cluster);
             });
             if (cpu_scatter_worker_stop_) return;
+            if (cpu_scatter_pending_lookup_) {
+                auto job = std::move(*cpu_scatter_pending_lookup_);
+                cpu_scatter_pending_lookup_.reset();
+                cpu_scatter_worker_busy_ = true;
+                lock.unlock();
+                if (cpu_scatter_lookup_test_hook_) cpu_scatter_lookup_test_hook_();
+                build_cpu_scatter_lookup(job);
+                lock.lock();
+                cpu_scatter_worker_busy_ = false;
+                cpu_scatter_worker_cv_.notify_all();
+                // Gather commits may have arrived while the lookup was being built.
+                continue;
+            }
             // Configuration validates the geometry before each threaded epoch is armed.
             const auto groups = publication.n_groups_per_m_cluster;
             const auto epoch = cpu_scatter_worker_epoch_;
@@ -1594,10 +1653,11 @@ void CudaBuffers::cpu_scatter_worker_loop() noexcept {
             cpu_scatter_worker_cv_.notify_all();
         }
     } catch (...) {
-        // Any failing pack, CUDA submission or device selection wakes waiters;
-        // subsequent producer commits/reset/synchronization also see the error.
+        // Any failing lookup, pack or CUDA submission wakes consumers. Keep
+        // the up publisher running independently until its final ready write.
         std::lock_guard<std::mutex> lock(cpu_scatter_worker_mutex_);
         cpu_scatter_worker_error_ = std::current_exception();
+        down_metadata_failed_.store(true, std::memory_order_release);
         cpu_scatter_worker_busy_ = false;
         cpu_scatter_worker_cv_.notify_all();
         cpu_scatter_worker_ready_cv_.notify_all();
@@ -1648,6 +1708,7 @@ void CudaBuffers::wait_threaded_cpu_scatter_ready(
 
 void CudaBuffers::quiesce_cpu_scatter_worker() {
     std::unique_lock<std::mutex> lock(cpu_scatter_worker_mutex_);
+    cpu_scatter_pending_lookup_.reset();  // A route may retire before begin_iteration.
     if (cpu_scatter_worker_epoch_valid_) {
         // Invalidate the route before waiting so the worker cannot take another
         // descriptor and old readiness waiters cannot accept the next event.
@@ -1670,6 +1731,7 @@ void CudaBuffers::stop_cpu_scatter_worker() {
         std::lock_guard<std::mutex> lock(cpu_scatter_worker_mutex_);
         cpu_scatter_worker_stop_ = true;
         cpu_scatter_worker_cancelled_ = true;
+        cpu_scatter_pending_lookup_.reset();
         cpu_scatter_worker_cv_.notify_all();
         cpu_scatter_worker_ready_cv_.notify_all();
     }
@@ -1741,6 +1803,60 @@ DownWaveLayout CudaBuffers::start_down_wave_schedule(
     return layout;
 }
 
+void CudaBuffers::configure_return_maps(
+    std::size_t nodes, bool include_inter, uintptr_t device_slab, std::size_t words) {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    const auto intra = intra_return_map_words(nodes, config_.num_tokens, config_.num_gpus_per_node);
+    const auto inter = include_inter ? inter_return_map_words(nodes, config_.num_tokens) : 0;
+    if (return_maps_ || !config_.router_dynamic_routing_enabled ||
+        !config_.nvlink_forward_completion_notifications_enabled ||
+        config_.nvlink_forward_notification_flush_only_enabled ||
+        !device_slab || device_slab % alignof(int32_t) ||
+        words > std::numeric_limits<std::size_t>::max() / sizeof(int32_t) ||
+        words < intra || words - intra != inter)
+        throw std::runtime_error("invalid packed return map reservation or publication mode");
+    select_cuda_device_for_thread(config_.cuda_device_id, config_.mock_mode);
+    try {
+        allocate_pinned_buffer(return_map_staging_, words * sizeof(int32_t));
+        return_maps_ = std::make_unique<ReturnMapWorker>(nodes, config_.num_tokens, config_.num_gpus_per_node,
+            config_.local_gpu_index, include_inter, static_cast<int32_t*>(return_map_staging_.ptr),
+            device_slab, words, config_.cuda_device_id, config_.mock_mode, router_notification_publication_stream_,
+            down_metadata_failed_);
+    } catch (...) {
+        free_pinned_buffer(return_map_staging_);
+        throw;
+    }
+}
+
+void CudaBuffers::start_return_maps(uint64_t iteration, ReturnMapRoute route) {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    if (!return_maps_ || !metadata_generations_installed_ || iteration != metadata_generations_installed_ - 1)
+        throw std::runtime_error("return map start requires a reserved slab and the installed iteration");
+    const auto& s = router_computation_scheduler_state_;
+    return_maps_->start(iteration, std::move(route), s.iteration_initialized && s.iteration == iteration &&
+                        s.final_ready_submitted);
+}
+
+void CudaBuffers::wait_return_maps(uint64_t iteration, uintptr_t consumer_stream, uint64_t timeout_ms) {
+    if (!return_maps_) throw std::runtime_error("return map upload was not configured");
+    return_maps_->wait(iteration, consumer_stream, timeout_ms);
+}
+
+void CudaBuffers::retire_return_maps() {
+    if (return_maps_) return_maps_->retire();
+}
+
+void CudaBuffers::check_down_metadata_error() const {
+    if (!down_metadata_failed_.load(std::memory_order_acquire)) return;
+    if (return_maps_) return_maps_->rethrow_error();
+    std::lock_guard<std::mutex> lock(cpu_scatter_worker_mutex_);
+    if (cpu_scatter_worker_error_) std::rethrow_exception(cpu_scatter_worker_error_);
+}
+
+void CudaBuffers::stop_return_map_worker() {
+    if (return_maps_) return_maps_->stop();
+}
+
 void CudaBuffers::commit_final_gather_locked() {
     if (config_.nvlink_forward_notification_flush_only_enabled) return;
     auto& scheduler = router_computation_scheduler_state_;
@@ -1748,6 +1864,7 @@ void CudaBuffers::commit_final_gather_locked() {
     // Called only after the final descriptor and ready write have been submitted
     // on the publication stream. A late schedule submission sees the same latch.
     scheduler.final_ready_submitted = true;
+    if (return_maps_) return_maps_->final_gather(scheduler.iteration);
     auto& w = down_wave_;
     if (!w.device) return;
     std::lock_guard<std::mutex> lock(w.mutex);
@@ -1879,9 +1996,11 @@ void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) 
         if (cpu_route_weights_device_ && !cpu_route_weights_staging_.ptr)
             allocate_pinned_buffer(cpu_route_weights_staging_, cpu_scatter_routes_ * sizeof(float));
     }
-    if (cpu_scatter_threaded_) quiesce_cpu_scatter_worker();
     const bool reset_existing_iteration = scheduler.iteration_initialized;
     if (reset_existing_iteration) {
+        // Dynamic route installation already retired the old worker. On first
+        // begin for a new route, let its CPU lookup overlap the gather reset.
+        if (cpu_scatter_threaded_) quiesce_cpu_scatter_worker();
         // A new arrival order can reuse every descriptor and packed index
         // slot differently. Retire all H2D reads before reusing pinned storage.
         synchronize_cuda_stream(
@@ -1987,8 +2106,12 @@ void CudaBuffers::synchronize_router_notification_publication() {
         if (cpu_scatter_worker_stop_ || cpu_scatter_worker_cancelled_ || cpu_scatter_worker_epoch_ != epoch)
             throw std::runtime_error("CPU scatter worker stopped or epoch changed during synchronization");
     }
-    synchronize_cuda_stream(
-        router_notification_publication_stream_, config_.mock_mode);
+    synchronize_router_notification_stream();
+}
+
+void CudaBuffers::synchronize_router_notification_stream() {
+    if (config_.router_routing_enabled && config_.nvlink_forward_completion_notifications_enabled)
+        synchronize_cuda_stream(router_notification_publication_stream_, config_.mock_mode);
 }
 
 void CudaBuffers::record_router_computation_end(

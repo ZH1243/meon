@@ -65,6 +65,50 @@ class MetadataSlabTests(unittest.TestCase):
             raise unittest.SkipTest("PyTorch is not installed")
         cls.torch = torch
 
+    def test_async_lookup_publishes_host_counts_to_return_owner(self):
+        torch = self.torch
+        for checked in (False, True):
+            with self.subTest(checked=checked):
+                opt = SimpleNamespace(cpu_scatter_preparation=True, cpu_scatter_publication="threaded",
+                                      check_intra_node_combine=checked, check_projections=False)
+                up = SimpleNamespace(torch=torch, source_pairs=[(0, 0), (0, 1)], output=torch.empty(0),
+                                     x_buffers=[torch.empty(3, 4)], cuda_device_id=0)
+                outputs = [torch.empty(3, 4) for _ in up.source_pairs]
+                down = worker.DownProjectionRunner.__new__(worker.DownProjectionRunner)
+                down.torch, down.up, down.combine_rows = torch, up, 3
+                down.combine_tile_n, down.routes = None, 2
+                down.inputs, down.registered_outputs = None, outputs
+                down.cpu_scatter_metadata = torch.empty(2 * 8, dtype=torch.uint8)
+                down.route_weights, down.cpu_scatter_publication = None, "threaded"
+                exchange = SimpleNamespace(rows_host=torch.full((2,), -1, dtype=torch.int64))
+                lib = SimpleNamespace(rdma_proxy_configure_cpu_scatter=mock.Mock(),
+                                      rdma_proxy_configure_cpu_scatter_threaded=mock.Mock(),
+                                      rdma_proxy_wait_cpu_scatter_ready=mock.Mock(return_value=0))
+                self.assertIsNone(worker.AsyncScatterLookup.reserve_if_supported(lib, down, opt, exchange))
+
+                def submit(handle, config, weights, slab_bytes):
+                    c = ctypes.cast(config, ctypes.POINTER(worker.CpuScatterConfig)).contents
+                    self.assertEqual((slab_bytes, weights, c.routes), (16, 0, 2))
+                    self.assertEqual(c.scatter_addresses, down.cpu_scatter_metadata.data_ptr())
+                    self.assertEqual([c.output_bases[i] for i in range(2)], [t.data_ptr() for t in outputs])
+                    self.assertEqual(ctypes.cast(c.counts, ctypes.c_void_p).value, exchange.rows_host.data_ptr())
+                    self.assertEqual(bool(c.output_to_input), checked)
+                    if checked:
+                        self.assertEqual(ctypes.cast(c.output_to_input, ctypes.c_void_p).value,
+                                         down.async_scatter.inverse.data_ptr())
+                    return 0
+
+                lib.rdma_proxy_configure_cpu_scatter_async = mock.Mock(side_effect=submit)
+                down.async_scatter = worker.AsyncScatterLookup.reserve_if_supported(lib, down, opt, exchange)
+                with mock.patch.object(torch.cuda, "synchronize", side_effect=AssertionError("unexpected CUDA wait")):
+                    down.configure_cpu_scatter(lib, 3)
+                self.assertIs(down.cpu_scatter_counts, exchange.rows_host)
+                self.assertEqual(exchange.rows_host.tolist(), [-1, -1])
+                lib.rdma_proxy_configure_cpu_scatter_async.assert_called_once()
+                lib.rdma_proxy_configure_cpu_scatter.assert_not_called()
+                lib.rdma_proxy_configure_cpu_scatter_threaded.assert_not_called()
+                lib.rdma_proxy_wait_cpu_scatter_ready.assert_not_called()
+
     def test_native_wave_slab_reuses_storage_with_exact_table_and_prefix_views(self):
         torch = self.torch
         device = torch.device("cpu")
@@ -493,9 +537,20 @@ class MetadataDependencyTests(unittest.TestCase):
 
         events = []
         runner = make_runner(events)
-        runner.launch(wait_for_metadata=lambda: events.append("metadata-wait"))
+        runner.launch(wait_for_metadata=lambda: events.append("metadata-wait"),
+                      before_combine=lambda: events.append("return-maps"))
         self.assertEqual(events, ["reset", "zero", "reset-end", "mapping", "metadata-wait", "counts",
-                                  "gemm", "combine-ready", "down", "combine", "done"])
+                                  "gemm", "combine-ready", "down", "done", "return-maps", "combine"])
+        events.clear()
+
+        def fail_map_upload():
+            events.append("return-maps-failed")
+            raise RuntimeError("return-map upload failed")
+
+        with self.assertRaisesRegex(RuntimeError, "return-map upload failed"):
+            make_runner(events).launch(wait_for_metadata=lambda: events.append("metadata-wait"),
+                                       before_combine=fail_map_upload)
+        self.assertEqual(events[-3:], ["down", "done", "return-maps-failed"])
         events.clear()
 
         def fail():

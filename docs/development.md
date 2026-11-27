@@ -330,7 +330,9 @@ The two-node launchers enable the QuACK down gather table, expert waves and read
 
 For iterations 1–4, identify the final up-table ready-row publication on the native publication stream and the subsequent packed down-schedule H2D. The CPU scatter upload has a separate event and can also appear on that stream. For the example counts below the schedule transfer is 385,936 bytes. Compare local staging gather completion to up-GEMM start (profile 15 median **6.68 ms**), gather completion to the first ready-row publication (**7.30 ms**), and full iteration time (**61.26 ms**). Also check whether any remaining setup extends past up completion. A two-node Hopper run is needed to measure the change.
 
-Local checks for this change used an Apple M1 Max on macOS 15.6.1 with CPU PyTorch 1.13.1. From the meon checkout:
+For comparison with report 17, rebuild the shared library and install the updated meon worker on both hosts. Use the same threaded scatter and dynamic routing flags. Check for `Native return maps reserved` on each participating rank. For iterations 1–4 of the 20,480-token two-node configuration, the publication stream should show one **2,785,424-byte** return-map H2D after the last up-gather ready write. Identify it separately from the down-wave and scatter uploads on that stream. Report 17’s median local gather completion to up-GEMM start was **5.24 ms**, its up-to-down handoff **21.1 µs**, and its complete iteration **59.60 ms**. Also compare when the first combine actually starts. Run a smaller two-node comparison with projection and combine checks enabled before collecting the timing run.
+
+The async scatter and return-map change passed 47 native tests and 102 Python tests on an Apple M1 Max with macOS 15.6.1 and CPU PyTorch 1.13.1. Six native tests and eight Python tests were skipped. The two-node Hopper numerical and timing runs remain outstanding. Reproduce the local checks from the meon checkout.
 
 ```bash
 OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python
@@ -338,7 +340,10 @@ cmake -S . -B build/mock -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/mock -j4
 ctest --test-dir build/mock --output-on-failure
 ctest --test-dir build/mock -R '^(test_down_wave_schedule|test_cpu_scatter)$' --repeat until-fail:10 --output-on-failure
+ctest --test-dir build/mock -R '^(test_async_return_maps|test_cpu_scatter|test_rdma_returns|test_c_api|test_benchmark_routing)$' --repeat until-fail:5 --output-on-failure
 ctest --test-dir build/exchange-host --output-on-failure
+ctest --test-dir build/exchange-cpu --output-on-failure
+ROUTER_METADATA_BENCH_LIBRARY="$PWD/build/exchange-cpu/librouter_metadata_bench.dylib" PYTHONDONTWRITEBYTECODE=1 /Users/zhuhao/opt/anaconda3/bin/python3 -m unittest discover -s benchmarks/router_metadata_exchange -p test_benchmark.py -v
 (cd ../quack_for_communication_overlap && PYTHONDONTWRITEBYTECODE=1 /Users/zhuhao/opt/anaconda3/bin/python3 -m pytest --noconftest -q tests/test_wave_ready_prefix.py -p no:cacheprovider)
 ```
 
@@ -348,6 +353,9 @@ The native lifecycle regression also passed with ThreadSanitizer on this host. T
 cmake -S . -B /private/tmp/meon-down-wave-thread-sanitizer -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS=-fsanitize=thread
 cmake --build /private/tmp/meon-down-wave-thread-sanitizer --target test_cpu_scatter -j6
 ctest --test-dir /private/tmp/meon-down-wave-thread-sanitizer -R '^test_cpu_scatter$' --output-on-failure
+cmake -S . -B build/return-maps-tsan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS=-fsanitize=thread
+cmake --build build/return-maps-tsan --target test_async_return_maps test_cpu_scatter test_benchmark_routing test_c_api test_rdma_returns -j4
+ctest --test-dir build/return-maps-tsan -R '^(test_async_return_maps|test_cpu_scatter|test_rdma_returns|test_c_api|test_benchmark_routing)$' --output-on-failure
 c++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -g -O1 -fsanitize=undefined,address -fno-omit-frame-pointer -I native/include native/src/down_wave_schedule.cpp tests/native/test_down_wave_schedule.cpp -o /private/tmp/meon_down_wave_asan
 /private/tmp/meon_down_wave_asan
 ```
@@ -355,7 +363,7 @@ c++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -g -O1 -fsanitize=undefined,addr
 On a single Hopper GPU with `QUACK_ROOT` set and the CUDA Debug build available, these regressions exercise packed-slab reuse, GPU event ordering, weighted down output and final combine.
 
 ```bash
-ctest --test-dir "${RDMA_PROXY_BUILD_DIR:-build-hopper}" -R '^test_cpu_scatter_cuda$' --output-on-failure
+ctest --test-dir "${RDMA_PROXY_BUILD_DIR:-build-hopper}" -R '^(test_async_return_maps|test_cpu_scatter)_cuda$' --output-on-failure
 PYTHONPATH=tests/python python -m unittest -v \
   test_worker_composition.CompositionCudaTests.test_hopper_reuses_packed_down_wave_schedule
 ```

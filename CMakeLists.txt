@@ -49,6 +49,7 @@ set(RDMA_PROXY_SOURCES
   native/src/cpu_affinity.cpp
   native/src/cuda_buffers.cpp
   native/src/down_wave_schedule.cpp
+  native/src/return_map_worker.cpp
   native/src/logging.cpp
   native/src/protocol.cpp
   native/src/proxy.cpp
@@ -184,6 +185,13 @@ if(RDMA_PROXY_BUILD_TESTS)
   add_executable(test_down_wave_schedule tests/native/test_down_wave_schedule.cpp)
   target_link_libraries(test_down_wave_schedule PRIVATE rdma_cpu_proxy_lib)
   add_test(NAME test_down_wave_schedule COMMAND test_down_wave_schedule)
+
+  add_executable(test_async_return_maps tests/native/test_async_return_maps.cpp)
+  target_link_libraries(test_async_return_maps PRIVATE rdma_cpu_proxy_lib)
+  add_test(NAME test_async_return_maps COMMAND test_async_return_maps)
+  add_test(NAME test_async_return_maps_cuda COMMAND test_async_return_maps --cuda)
+  set_tests_properties(test_async_return_maps PROPERTIES TIMEOUT 30)
+  set_tests_properties(test_async_return_maps_cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 
   add_executable(test_cpu_scatter tests/native/test_cpu_scatter.cpp)
   target_link_libraries(test_cpu_scatter PRIVATE rdma_cpu_proxy_lib)

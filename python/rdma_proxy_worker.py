@@ -945,11 +945,46 @@ class EmptyDownInputs:
             buffer.zero_()
 
 
+class CpuScatterConfig(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in
+                ("struct_size", "num_sources", "routes", "capacity", "width",
+                 "tile_n", "element_bytes")] + [
+        ("scatter_addresses", ctypes.c_size_t),
+        ("source_pairs", ctypes.POINTER(ctypes.c_int32)),
+        ("output_bases", ctypes.POINTER(ctypes.c_uint64)),
+        ("counts", ctypes.POINTER(ctypes.c_int64)),
+        ("output_to_input", ctypes.POINTER(ctypes.c_int64))]
+
+
+class AsyncScatterLookup:
+    """Stable host destinations written by the native scatter thread on refreshed routes."""
+
+    @classmethod
+    def reserve_if_supported(cls, library, down, options, exchange):
+        configure = getattr(library, "rdma_proxy_configure_cpu_scatter_async", None)
+        if configure is None or not options.cpu_scatter_preparation or options.cpu_scatter_publication != "threaded":
+            return None
+        configure.argtypes = [ctypes.c_void_p, ctypes.POINTER(CpuScatterConfig),
+                              ctypes.c_size_t, ctypes.c_uint64]
+        configure.restype = ctypes.c_int
+        torch = down.torch
+        sources = len(down.up.source_pairs)
+        lookup = cls()
+        lookup.configure = configure
+        # NVLink return copies read this same pointer after the scatter event and arm.
+        lookup.counts = (exchange.rows_host if exchange is not None
+                         else torch.empty(sources, dtype=torch.int64, device="cpu"))
+        lookup.inverse = (torch.empty((sources, down.combine_rows), dtype=torch.int64, device="cpu")
+                          if options.check_projections or options.check_intra_node_combine else None)
+        print("Native threaded scatter lookup enabled", flush=True)
+        return lookup
+
+
 class DownProjectionRunner:
     """Compose QuACK's existing plain grouped-GEMM runner with the up output."""
 
     def __init__(self, torch, up, counts, options, trace_configure=None, previous=None, *,
-                 defer_wave_schedule=False, external_wave_schedule=None):
+                 defer_wave_schedule=False, external_wave_schedule=None, async_scatter=None):
         # GroupedGemmRunner has already inserted the selected QuACK checkout.
         from run import hopper_pregather_gemm as pregather
 
@@ -979,7 +1014,8 @@ class DownProjectionRunner:
         self._cpu_scatter_wait = None
         self.cpu_scatter_timeout_ms = (max(1, math.ceil(options.return_token_timeout * 1000))
                                        if self.cpu_scatter else 0)
-        self.cpu_scatter_counts = None
+        self.async_scatter = async_scatter
+        self.cpu_scatter_counts = async_scatter.counts if async_scatter is not None else None
         self.up = up
         self.torch = torch
         self.routes = routes
@@ -1033,10 +1069,19 @@ class DownProjectionRunner:
                 outputs = previous.inputs.output_buffers()
                 self.combine_addresses = previous.combine_addresses
             self.combine_rows = rows
-            self.combine_valid_rows = torch.zeros(
-                len(outputs), dtype=torch.int64, device=up.output.device)
-            self.combine_output_to_input = torch.full(
-                (len(outputs), rows), -1, dtype=torch.int64, device=up.output.device)
+            if async_scatter is None:
+                self.combine_valid_rows = torch.zeros(
+                    len(outputs), dtype=torch.int64, device=up.output.device)
+                self.combine_output_to_input = torch.full(
+                    (len(outputs), rows), -1, dtype=torch.int64, device=up.output.device)
+            else:
+                self.combine_valid_rows = async_scatter.counts
+                self.combine_output_to_input = async_scatter.inverse
+                if not routes:
+                    # No scatter worker job for a rank with zero local work.
+                    self.combine_valid_rows.zero_()
+                    if self.combine_output_to_input is not None:
+                        self.combine_output_to_input.fill_(-1)
             self.registered_outputs = outputs
             external["output_buffers"] = outputs
             if (previous is not None and self.cpu_scatter and self.cpu_scatter_publication == "threaded"
@@ -1219,41 +1264,39 @@ class DownProjectionRunner:
 
     def configure_cpu_scatter(self, library, handle):
         """Bind the current route's compact maps before native iteration preparation."""
-        class Config(ctypes.Structure):
-            _fields_ = [(name, ctypes.c_uint64) for name in
-                        ("struct_size", "num_sources", "routes", "capacity", "width",
-                         "tile_n", "element_bytes")] + [
-                ("scatter_addresses", ctypes.c_size_t),
-                ("source_pairs", ctypes.POINTER(ctypes.c_int32)),
-                ("output_bases", ctypes.POINTER(ctypes.c_uint64)),
-                ("counts", ctypes.POINTER(ctypes.c_int64)),
-                ("output_to_input", ctypes.POINTER(ctypes.c_int64))]
-
-        try:
-            configure = library.rdma_proxy_configure_cpu_scatter
-        except AttributeError as error:
-            raise RuntimeError("--cpu-scatter-preparation requires rebuilding librdma_cpu_proxy") from error
-        configure.argtypes = [ctypes.c_void_p, ctypes.POINTER(Config)]
-        configure.restype = ctypes.c_int
         torch = self.up.torch
         sources = len(self.up.source_pairs)
         pairs = (ctypes.c_int32 * (2 * sources))(
             *(value for pair in self.up.source_pairs for value in pair))
         bases = (ctypes.c_uint64 * sources)(
             *(buffer.data_ptr() for buffer in self.output_buffers()))
-        counts = torch.empty(sources, dtype=torch.int64)
-        inverse = torch.empty((sources, self.combine_rows), dtype=torch.int64)
+        lookup = getattr(self, "async_scatter", None)
+        counts = lookup.counts if lookup is not None else torch.empty(sources, dtype=torch.int64)
+        inverse = lookup.inverse if lookup is not None else torch.empty((sources, self.combine_rows), dtype=torch.int64)
         # On a deferred refresh the address view starts at byte zero of the slab.
         addresses = self.cpu_scatter_metadata if self.inputs is None else self.inputs.scatter_row_addresses
-        config = Config(ctypes.sizeof(Config), sources, self.routes, self.combine_rows,
-                        int(self.up.x_buffers[0].shape[1]), self.combine_tile_n or 0,
-                        self.up.output.element_size(), addresses.data_ptr(),
-                        pairs, bases,
-                        ctypes.cast(counts.data_ptr(), ctypes.POINTER(ctypes.c_int64)),
-                        ctypes.cast(inverse.data_ptr(), ctypes.POINTER(ctypes.c_int64)))
-        require_proxy_success(library, configure(handle, ctypes.byref(config)),
-                              "configuring CPU scatter preparation")
-        if self.route_weights is not None:
+        index_ptr = ctypes.POINTER(ctypes.c_int64)
+        config = CpuScatterConfig(
+            ctypes.sizeof(CpuScatterConfig), sources, self.routes, self.combine_rows,
+            int(self.up.x_buffers[0].shape[1]), self.combine_tile_n or 0,
+            self.up.output.element_size(), addresses.data_ptr(), pairs, bases,
+            ctypes.cast(counts.data_ptr(), index_ptr),
+            ctypes.cast(inverse.data_ptr(), index_ptr) if inverse is not None else None)
+        if lookup is not None:
+            packed_weights = self.route_weights.data_ptr() if self.route_weights is not None else 0
+            require_proxy_success(library, lookup.configure(handle, ctypes.byref(config), packed_weights,
+                                                             self.cpu_scatter_metadata.numel()),
+                                  "starting native scatter lookup")
+        else:
+            try:
+                configure = library.rdma_proxy_configure_cpu_scatter
+            except AttributeError as error:
+                raise RuntimeError("--cpu-scatter-preparation requires rebuilding librdma_cpu_proxy") from error
+            configure.argtypes = [ctypes.c_void_p, ctypes.POINTER(CpuScatterConfig)]
+            configure.restype = ctypes.c_int
+            require_proxy_success(library, configure(handle, ctypes.byref(config)),
+                                  "configuring CPU scatter preparation")
+        if self.route_weights is not None and lookup is None:
             try:
                 configure_weights = library.rdma_proxy_configure_cpu_route_weights
             except AttributeError as error:
@@ -1265,25 +1308,28 @@ class DownProjectionRunner:
                 "configuring CPU packed routing weights")
         if self.cpu_scatter_publication in ("deferred", "threaded"):
             try:
-                configure_publication = getattr(
-                    library, f"rdma_proxy_configure_cpu_scatter_{self.cpu_scatter_publication}")
                 wait_ready = library.rdma_proxy_wait_cpu_scatter_ready
+                if lookup is None:
+                    configure_publication = getattr(
+                        library, f"rdma_proxy_configure_cpu_scatter_{self.cpu_scatter_publication}")
             except AttributeError as error:
                 raise RuntimeError(
                     f"{self.cpu_scatter_publication} CPU scatter requires rebuilding librdma_cpu_proxy") from error
-            configure_publication.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
-            configure_publication.restype = ctypes.c_int
             wait_ready.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t, ctypes.c_uint64]
             wait_ready.restype = ctypes.c_int
-            require_proxy_success(library, configure_publication(handle, self.cpu_scatter_metadata.numel()),
-                                  f"configuring {self.cpu_scatter_publication} CPU scatter publication")
+            if lookup is None:
+                configure_publication.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+                configure_publication.restype = ctypes.c_int
+                require_proxy_success(library, configure_publication(handle, self.cpu_scatter_metadata.numel()),
+                                      f"configuring {self.cpu_scatter_publication} CPU scatter publication")
             self._cpu_scatter_wait = wait_ready
             self._cpu_scatter_library, self._cpu_scatter_handle = library, handle
-        with torch.inference_mode():
-            self.combine_valid_rows.copy_(counts)
-            self.combine_output_to_input.copy_(inverse)
+        if lookup is None:
+            with torch.inference_mode():
+                self.combine_valid_rows.copy_(counts)
+                self.combine_output_to_input.copy_(inverse)
+            torch.cuda.synchronize(self.up.cuda_device_id)
         self.cpu_scatter_counts = counts
-        torch.cuda.synchronize(self.up.cuda_device_id)
         if self.cpu_scatter_publication == "threaded":
             policy = ("dedicated CPU scatter thread; "
                       f"one {self.cpu_scatter_metadata.numel()}-byte metadata H2D after final gather publication")
@@ -1359,7 +1405,7 @@ class DownProjectionRunner:
             self.reset_outputs()
             self.reset_end.synchronize()
 
-    def launch(self, wait_for_metadata=None, wait_for_wave_schedule=None):
+    def launch(self, wait_for_metadata=None, wait_for_wave_schedule=None, before_combine=None):
         # QuACK prepares output and metadata tensors under inference_mode.
         # Keep their resets and in-place updates in the same mode.
         with self.up.torch.inference_mode():
@@ -1391,9 +1437,15 @@ class DownProjectionRunner:
             self._log_combine_startup("down GEMM launch begin")
             self.launch_gemm()
             self._log_combine_startup("down GEMM launch returned")
+            if before_combine is not None:
+                # The host may wait for map submission after down has already finished.
+                self.end.record()
             if self.intra_node_combine is not None:
+                if before_combine is not None:
+                    before_combine()
                 self.intra_node_combine.launch()
-            self.end.record()
+            if before_combine is None:
+                self.end.record()
             self._trace_first_combine_launch = False
 
     def collected_combine_outputs(self):
@@ -2020,6 +2072,8 @@ def run_proxy_with_concurrent_kernel(
     kernel_stream = None
     down = None
     down_schedule = None
+    async_scatter = None
+    return_maps = None
     try:
         device_buffers = install_python_device_buffers(
             library,
@@ -2125,20 +2179,28 @@ def run_proxy_with_concurrent_kernel(
                 return_exchange = ReturnExchange(
                     torch, library, handle, down, down_options,
                     node_rank, local_gpu_index, cuda_device_id, num_iterations.value)
-                if down_options.intra_node_combine:
-                    from intra_node_combine import IntraNodeCombine
+            if dynamic and num_iterations.value > 1:
+                async_scatter = AsyncScatterLookup.reserve_if_supported(library, down, down_options, return_exchange)
+            if return_exchange is not None and down_options.intra_node_combine:
+                from intra_node_combine import IntraNodeCombine
+                if async_scatter is not None:
+                    from return_maps import ReturnMaps
+                    return_maps = ReturnMaps.reserve_if_supported(
+                        return_exchange, down.combine_rows, down_options.inter_node_combine,
+                        down_options.return_token_timeout)
+                    return_exchange.return_maps = return_maps
+                if down_options.trace_down_ready:
+                    print(f"[gpu={cuda_device_id}] Intra-node combine setup/compilation begin",
+                          flush=True)
+                down.intra_node_combine = IntraNodeCombine(
+                    return_exchange, down_options, dynamic_capacity=down.combine_rows if dynamic else None)
+                if down_options.inter_node_combine:
+                    from inter_node_combine import InterNodeCombine
                     if down_options.trace_down_ready:
-                        print(f"[gpu={cuda_device_id}] Intra-node combine setup/compilation begin",
+                        print(f"[gpu={cuda_device_id}] Inter-node combine setup/compilation begin",
                               flush=True)
-                    down.intra_node_combine = IntraNodeCombine(
-                        return_exchange, down_options, dynamic_capacity=down.combine_rows if dynamic else None)
-                    if down_options.inter_node_combine:
-                        from inter_node_combine import InterNodeCombine
-                        if down_options.trace_down_ready:
-                            print(f"[gpu={cuda_device_id}] Inter-node combine setup/compilation begin",
-                                  flush=True)
-                        down.intra_node_combine.inter_node_combine = InterNodeCombine(
-                            down.intra_node_combine, down_options)
+                    down.intra_node_combine.inter_node_combine = InterNodeCombine(
+                        down.intra_node_combine, down_options)
             if (down_options.check_projections and down.route_weights is not None
                     and return_exchange is not None):
                 from projection_validation import configure_original_reference
@@ -2190,6 +2252,10 @@ def run_proxy_with_concurrent_kernel(
                 torch.cuda.synchronize(cuda_device_id)
                 extents, elapsed = prepare_epoch(iteration)
                 routing_times_ns.append(elapsed)
+                if return_maps is not None:
+                    # Remote contributions can require both maps even when this
+                    # computing rank has no expert work this epoch.
+                    return_maps.start(iteration)
                 counts = get_expert_counts(library, handle)
                 computation_tokens.value = sum(counts)
                 if down_schedule is not None and computation_tokens.value:
@@ -2200,7 +2266,7 @@ def run_proxy_with_concurrent_kernel(
                     down = DownProjectionRunner(torch, grouped_gemm, counts, down_options,
                                                 trace_configure=trace.configure if trace else None,
                                                 previous=previous, defer_wave_schedule=True,
-                                                external_wave_schedule=wave_views)
+                                                external_wave_schedule=wave_views, async_scatter=async_scatter)
                     if down.cpu_scatter:
                         down.configure_cpu_scatter(library, handle)
                     if down.output_reset_policy == "end-of-iteration" and not down.combine:
@@ -2214,7 +2280,7 @@ def run_proxy_with_concurrent_kernel(
                                                          num_experts=num_experts, iteration=iteration)
                             reference_setup_ns = time.perf_counter_ns() - reference_begin
                     del previous
-                # Publish early scatter bindings and combine maps before the native coordinator starts.
+                # Finish any local torch setup. Async metadata publication is gated by final gather.
                 torch.cuda.synchronize(cuda_device_id)
 
             def log_startup(message):
@@ -2252,6 +2318,7 @@ def run_proxy_with_concurrent_kernel(
                     f"recording GroupedGEMM end for iteration {iteration}",
                 )
                 with torch.cuda.stream(kernel_stream):
+                    async_returns = iteration != 0 and return_maps is not None
                     if down is not None:
                         needs_metadata_wait = (down.cpu_scatter and
                                                down.cpu_scatter_publication in ("deferred", "threaded"))
@@ -2259,8 +2326,10 @@ def run_proxy_with_concurrent_kernel(
                             wait_for_metadata=partial(down.wait_cpu_scatter_ready, iteration)
                             if needs_metadata_wait else None,
                             wait_for_wave_schedule=partial(down_schedule.wait, iteration, kernel_stream)
-                            if wave_views is not None else None)
-                    if return_exchange is not None:
+                            if wave_views is not None else None,
+                            before_combine=partial(return_exchange.arm_and_bind_maps, iteration)
+                            if async_returns else None)
+                    if return_exchange is not None and not async_returns:
                         return_exchange.arm(iteration)
                     kernel_finished.record(kernel_stream)
             except BaseException as error:

@@ -97,7 +97,8 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
         self.assertEqual(buffers.benchmark_staging_buffers(), (source, destination))
 
     def run_worker(self, *, compute=False, fail_epoch=None, scatter_publication=None,
-                   tile_major=True, has_reservation_api=True, rows_per_epoch=(1, 0), down_factory=None):
+                   tile_major=True, has_reservation_api=True, rows_per_epoch=(1, 0), down_factory=None,
+                   native_returns=False):
         events, output = [], io.StringIO()
 
         def status(name):
@@ -171,7 +172,9 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                                   cpu_scatter_publication=scatter_publication, down_n_tile_major_output=tile_major,
                                   down_pingpong=None, down_gather_table_wave_barrier=True,
                                   down_gather_table=True, down_gather_table_expert_waves=True,
-                                  down_gather_table_publish_ready=True, return_token_results=False,
+                                  down_gather_table_publish_ready=True, return_token_results=native_returns,
+                                  intra_node_combine=native_returns, inter_node_combine=False,
+                                  return_token_timeout=2,
                                   benchmark_ready_up_gemm=False, check_projections=False, trace_down_ready=False)
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.dict(sys.modules, benchmark_metadata_backend=SimpleNamespace(
@@ -183,6 +186,17 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                                              side_effect=([rows] for rows in rows_per_epoch)))
             if down_factory is not None:
                 stack.enter_context(patch.object(worker, "DownProjectionRunner", down_factory(events)))
+            if native_returns:
+                maps, exchange, intra = Mock(), Mock(), Mock(inter_node_combine=None)
+                maps.start.side_effect = lambda epoch: events.append(("start-maps", epoch))
+                exchange.arm_and_bind_maps.side_effect = lambda epoch: events.append(("arm-maps", epoch))
+                exchange.arm.side_effect = lambda epoch: events.append(("arm", epoch))
+                exchange.bind_down.side_effect = lambda down: setattr(down, "intra_node_combine", intra)
+                stack.enter_context(patch.object(worker, "DownReadyTrace"))
+                stack.enter_context(patch.object(worker.AsyncScatterLookup, "reserve_if_supported", return_value=Mock()))
+                stack.enter_context(patch("return_maps.ReturnMaps.reserve_if_supported", return_value=maps))
+                stack.enter_context(patch("rdma_return_exchange.ReturnExchange", return_value=exchange))
+                stack.enter_context(patch("intra_node_combine.IntraNodeCombine", return_value=intra))
             stack.enter_context(contextlib.redirect_stdout(output))
             if fail_epoch is not None:
                 stack.enter_context(self.assertRaisesRegex(RuntimeError, "injected exchange failure"))
@@ -231,7 +245,8 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                 clock = Mock()
                 clock.elapsed_time.return_value = 1.0
                 down = SimpleNamespace(
-                    cpu_scatter=bool(rows), cpu_scatter_publication="threaded", combine=True, route_weights=None,
+                    cpu_scatter=bool(rows), cpu_scatter_publication="threaded", combine=True, combine_rows=4,
+                    route_weights=None,
                     output_reset_policy="before-down", intra_node_combine=None, flops=2 * rows,
                     reset_start=clock, reset_end=clock, mapping_start=clock, gemm_start=clock, end=clock,
                     warmup=lambda: None,
@@ -241,7 +256,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                 if not defer_wave_schedule:
                     events.append(("schedule", rows))
 
-                def launch(wait_for_metadata, wait_for_wave_schedule):
+                def launch(wait_for_metadata, wait_for_wave_schedule, before_combine):
                     if wait_for_metadata:
                         wait_for_metadata()
                     if defer_wave_schedule and rows and external_wave_schedule is None:
@@ -250,14 +265,17 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                         self.assertEqual(external_wave_schedule, ("table", rows))
                         wait_for_wave_schedule()
                     events.append(("down", rows))
+                    if before_combine is not None:
+                        before_combine()
+                        events.append(("combine", rows))
 
                 down.launch = launch
                 return down
             return create
 
         rows_per_epoch = (1, 3, 0, 2)
-        for native in (False, True):
-            with self.subTest(native=native):
+        for native, native_returns in ((False, False), (True, False), (True, True)):
+            with self.subTest(native=native, native_returns=native_returns):
                 def factory(events):
                     def submit(epoch, counts):
                         events.append(("schedule", counts[0]))
@@ -271,10 +289,23 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                 with patch("down_wave_schedule.DownWaveSchedule.reserve_if_supported",
                            return_value=fake if native else None) as reserve:
                     events, _ = self.run_worker(compute=True, scatter_publication="threaded",
-                                                rows_per_epoch=rows_per_epoch, down_factory=factory)
+                                                rows_per_epoch=rows_per_epoch, down_factory=factory,
+                                                native_returns=native_returns)
                 reserve.assert_called_once()
                 for epoch, rows in enumerate(rows_per_epoch):
                     start = events.index(("install", epoch))
+                    if native_returns and epoch:
+                        map_start = events.index(("start-maps", epoch))
+                        down = events.index(("down", rows))
+                        map_wait = events.index(("arm-maps", epoch))
+                        self.assertLess(start, map_start)
+                        self.assertLess(map_start, events.index(("prepare", epoch)))
+                        self.assertLess(down, map_wait)
+                        self.assertLess(map_wait, events.index(("combine", rows)))
+                        self.assertNotIn(("arm", epoch), events)
+                    elif native_returns:
+                        self.assertNotIn(("start-maps", epoch), events)
+                        self.assertIn(("arm", epoch), events)
                     if not rows:
                         self.assertNotIn(("schedule", 0), events)
                         self.assertNotIn(("wait-schedule", epoch, 42), events)

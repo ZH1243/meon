@@ -34,6 +34,7 @@ struct Rank {
     std::array<int32_t, tokens * experts_per_gpu> source_r{};
     std::array<int32_t, nodes * gpus * combine_row_stride> combine_rows{};
     std::array<int32_t, nodes * (tokens + 2)> inter_rows{};
+    std::array<int32_t, nodes * gpus * combine_row_stride + nodes * (tokens + 2)> packed_maps{};
     std::unique_ptr<Proxy> proxy;
 
     std::array<uintptr_t, nodes*gpus> index_addresses() const {
@@ -438,7 +439,21 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch) {
                 throw std::runtime_error("incorrect combine input stride or domain count");
         }
     }
+    if (!epoch) {
+        rank.proxy->configure_return_maps(domain_nodes.data(), nodes, tokens,
+            reinterpret_cast<uintptr_t>(rank.packed_maps.data()), rank.packed_maps.size(), true);
+    }
+    std::array<uint64_t, nodes> mask_counts{}, token_counts{};
+    rank.proxy->start_return_maps(epoch, mask_counts.data(), token_counts.data(), nodes);
+    for (int domain = 0; domain < nodes; ++domain) {
+        if (mask_counts[domain] != domain_counts[domain] || token_counts[domain] != rows[domain_nodes[domain]].size())
+            throw std::runtime_error("incorrect async return map extents");
+    }
     rank.proxy->run_iteration_step(epoch);
+    rank.proxy->wait_return_maps(epoch, 1, 5000);
+    if (!std::equal(rank.combine_rows.begin(), rank.combine_rows.end(), rank.packed_maps.begin()) ||
+        !std::equal(rank.inter_rows.begin(), rank.inter_rows.end(), rank.packed_maps.begin() + rank.combine_rows.size()))
+        throw std::runtime_error("async return map disagrees with original-token/compact-row lookup");
     if (epoch == 1) {
         // A completed payload alone cannot authorize either install path to
         // replace expert records while the producer still has an active lease.

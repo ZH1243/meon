@@ -59,6 +59,8 @@ public:
     DownWaveLayout start_down_wave_schedule(uint64_t iteration, const uint64_t* counts, uint64_t num_experts);
     void wait_down_wave_schedule(uint64_t iteration, uintptr_t stream, uint64_t timeout_ms);
     void configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config);
+    void configure_cpu_scatter_async(const RdmaProxyCpuScatterConfig& config,
+                                     uintptr_t packed_weights, std::size_t slab_bytes);
     void configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes);
     void configure_cpu_scatter_deferred(std::size_t bytes);
     void configure_cpu_scatter_threaded(std::size_t bytes);
@@ -78,6 +80,10 @@ public:
                                 std::size_t element_bytes, bool per_group, uintptr_t down_done);
     void arm_return_copies(uint64_t iteration);
     std::vector<uint8_t> intra_node_source_masks(int source_node) const;
+    void configure_return_maps(const int32_t* nodes, uint64_t num_nodes, uint64_t capacity,
+                               uintptr_t device_slab, uint64_t words, bool include_inter);
+    void start_return_maps(uint64_t iteration, uint64_t* intra_counts, uint64_t* outgoing_counts, uint64_t num_nodes);
+    void wait_return_maps(uint64_t iteration, uintptr_t consumer_stream, uint64_t timeout_ms);
     void build_intra_node_combine_rows(const int32_t* source_nodes, uint64_t num_nodes,
         uint64_t capacity, int32_t* rows, uint64_t row_elements, uint64_t* domain_counts) const;
     void build_inter_node_combine_rows(const int32_t* destination_nodes, uint64_t num_nodes,
@@ -346,6 +352,7 @@ private:
                                   const RdmaProxyBenchmarkDeviceIndices* device_indices = nullptr);
     std::shared_lock<std::shared_mutex> lock_forwarding_routes() const;
     std::shared_lock<std::shared_mutex> lock_installed_combine_route() const;
+    void require_installed_combine_route() const;
     void prepare_forwarding_destinations();
     void publish_local_nvlink_receive_buffers();
     ForwardDestinationState load_forward_destination(int dst_gpu);
@@ -407,6 +414,8 @@ private:
 
     ProxyConfig config_;
     CudaBuffers cuda_buffers_;
+    std::vector<int32_t> return_map_nodes_;
+    bool return_map_inter_{false};
     RouterRouting router_routing_;
     std::unique_ptr<IterationRouting> iteration_routing_;
     std::unique_ptr<RouterRouting> iteration_source_;

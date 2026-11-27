@@ -66,16 +66,20 @@ class NetworkReturn:
         print(f"RDMA returns: registered combine outputs, peers={list(self.received)}, "
               f"groups={combine.num_groups}, chunk_bytes={options.rdma_return_chunk_bytes}", flush=True)
 
-    def refresh(self, combine):
+    def refresh(self, combine, outgoing_counts=None):
         for peer, storage in self.receive_storage.items():
-            rows = ctypes.c_uint64()
-            self.exchange.require(self.exchange.library.rdma_proxy_get_rdma_return_receive_rows(
-                self.exchange.handle, peer, ctypes.byref(rows)))
-            if rows.value > combine.dynamic_capacity:
+            if outgoing_counts is None:
+                count = ctypes.c_uint64()
+                self.exchange.require(self.exchange.library.rdma_proxy_get_rdma_return_receive_rows(
+                    self.exchange.handle, peer, ctypes.byref(count)))
+                rows = count.value
+            else:
+                rows = outgoing_counts[peer]
+            if rows > combine.dynamic_capacity:
                 raise ValueError("reverse RDMA return exceeds its registered capacity")
             self.sources[peer] = combine.outputs[peer]
-            self.received[peer] = storage[:rows.value * combine.width].view(
-                combine.width // combine.tile, rows.value, combine.tile)
+            self.received[peer] = storage[:rows * combine.width].view(
+                combine.width // combine.tile, rows, combine.tile)
 
     @staticmethod
     def digest(tensor):

@@ -187,10 +187,13 @@ class InterNodeCombine(TokenOrderCombine):
         self._build_rows.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_uint64,
                                      ctypes.c_uint64, ctypes.POINTER(ctypes.c_int32), ctypes.c_uint64]
         self._build_rows.restype = ctypes.c_int
+        maps = getattr(self._exchange, "return_maps", None)
         self.rows_host = torch.empty((len(self._nodes), num_tokens + 2), dtype=torch.int32,
-                                     device="cpu", pin_memory=device.type == "cuda")
-        rows = torch.empty_like(self.rows_host, device=device)
+                                     device="cpu", pin_memory=maps is None and device.type == "cuda")
+        rows = maps.inter_rows if maps is not None else torch.empty_like(self.rows_host, device=device)
         self._upload_native_rows(inputs, rows, num_tokens)
+        if maps is not None:
+            self.rows_host = None
         return inputs, None, num_tokens, rows
 
     def _upload_native_rows(self, inputs, rows, num_tokens):
@@ -235,6 +238,12 @@ class InterNodeCombine(TokenOrderCombine):
         if num_tokens != self.num_tokens:
             raise ValueError("original token capacity changed during dynamic routing")
         self.bind_routes(inputs, token_lists)
+
+    def bind_return_views(self, combine, outgoing_counts):
+        inputs = self._live_inputs(combine)
+        if [t.shape[1] for t in inputs] != list(outgoing_counts):
+            raise ValueError("outgoing x3 lengths disagree with inter-node input views")
+        self.inputs, self.token_lists = inputs, None
 
     def check(self):
         # Fetch original x3 independently for the numerical reference after the kernel finishes.

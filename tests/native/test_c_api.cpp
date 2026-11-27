@@ -52,7 +52,13 @@ void check_dynamic_rank(int gpu, const std::string& run_id, const std::string& p
         if (!success) throw std::runtime_error(std::string("dynamic routing ABI: ") + rdma_proxy_last_error());
     };
     // Outlive the proxy, including teardown on a failed assertion.
+    constexpr uint64_t capacity = 32, world = 2, stride = capacity + 2;
     std::vector<int32_t> down_schedule;
+    const auto map_words = world * stride + (gpu == 0 ? stride : 0);
+    std::vector<int32_t> return_maps(map_words + 1, -99);
+    alignas(16) std::array<int64_t, world * capacity * 2 * 2> scatter;
+    std::array<int64_t, world> scatter_counts;
+    std::array<int64_t, world * capacity> inverse;
     std::unique_ptr<RdmaProxyHandle, decltype(&rdma_proxy_destroy)> owner(
         rdma_proxy_create(sizeof(args) / sizeof(args[0]), args), rdma_proxy_destroy);
     auto* handle = owner.get();
@@ -74,8 +80,11 @@ void check_dynamic_rank(int gpu, const std::string& run_id, const std::string& p
     require(rdma_proxy_reserve_threaded_cpu_scatter(handle, address_columns) == 0 && !*rdma_proxy_last_error());
     uint64_t indices = 0, table_rows = 0, count = 0, tokens = 0, top_k = 0;
     require(rdma_proxy_get_routing_extents(handle, &indices, &table_rows) != 0);
-    constexpr uint64_t capacity = 32, world = 2, stride = capacity + 2;
     const int32_t source_node = 0;
+    auto configure_maps = [&](uint64_t size, int inter) {
+        return rdma_proxy_configure_return_maps(handle, &source_node, 1, capacity,
+            reinterpret_cast<uintptr_t>(return_maps.data()), size, inter);
+    };
     std::array<int32_t, world * stride> combine_rows;
     combine_rows.fill(-2);
     uint64_t domain_count = UINT64_MAX;
@@ -97,7 +106,13 @@ void check_dynamic_rank(int gpu, const std::string& run_id, const std::string& p
         if (!i) {
             require(rdma_proxy_configure_down_wave_schedule(handle, &geometry, slab, words - 1) != 0);
             require(rdma_proxy_configure_down_wave_schedule(handle, &geometry, slab, words) == 0);
+            require(configure_maps(map_words, 2) != 0);
+            require(configure_maps(map_words - 1, gpu == 0) != 0);
+            require(configure_maps(map_words, gpu == 0) == 0);
         }
+        uint64_t mask_rows = UINT64_MAX, token_rows = UINT64_MAX;
+        require(rdma_proxy_start_return_maps(handle, i + 1, &mask_rows, &token_rows, 1) != 0);
+        require(rdma_proxy_start_return_maps(handle, i, &mask_rows, &token_rows, 1) == 0);
         std::array<uint64_t, 2> down_counts{};
         uint64_t num_local_experts = 0, down_rows = 0, prefix_entries = 0;
         require(rdma_proxy_get_computation_expert_counts(handle, down_counts.data(), down_counts.size(),
@@ -107,6 +122,17 @@ void check_dynamic_rank(int gpu, const std::string& run_id, const std::string& p
         require(rdma_proxy_start_down_wave_schedule(handle, i, down_counts.data(), num_local_experts,
                                                     &down_rows, &prefix_entries) == 0);
         require(down_rows && prefix_entries && 4 * down_rows + prefix_entries <= words);
+        const std::array<int32_t, world * 2> source_pairs{0, 0, 0, 1};
+        const std::array<uint64_t, world> bases{0x10000, 0x20000};  // Mock output addresses.
+        const auto routes = down_counts[0] + down_counts[1];
+        const auto scatter_bytes = routes * address_columns * sizeof(int64_t);
+        require(scatter_bytes <= sizeof(scatter));
+        RdmaProxyCpuScatterConfig config{sizeof(RdmaProxyCpuScatterConfig), world, routes, capacity, 8,
+            gpu ? 4u : 0u, 2, reinterpret_cast<uintptr_t>(scatter.data()), source_pairs.data(),
+            bases.data(), scatter_counts.data(), i ? inverse.data() : nullptr};
+        scatter_counts.fill(-1);
+        require(rdma_proxy_configure_cpu_scatter_async(handle, nullptr, 0, scatter_bytes) != 0);
+        require(rdma_proxy_configure_cpu_scatter_async(handle, &config, 0, scatter_bytes) == 0);
         require(rdma_proxy_reserve_threaded_cpu_scatter(handle, address_columns) != 0 && *rdma_proxy_last_error());
         require(rdma_proxy_get_routing_extents(handle, &indices, &table_rows) == 0 && indices && table_rows);
         std::vector<int32_t> experts(2 * capacity);
@@ -150,6 +176,7 @@ void check_dynamic_rank(int gpu, const std::string& run_id, const std::string& p
         expected_inter[capacity + 1] = 0;
         require(inter_rows == expected_inter);
         require(build_rows(handle) == 0 && !*rdma_proxy_last_error());
+        require(mask_rows == domain_count && token_rows == outgoing_rows);
         std::array<uint8_t, capacity> masks{};
         uint64_t mask_count = 0;
         require(rdma_proxy_get_intra_node_source_masks(handle, source_node, masks.data(),
@@ -167,6 +194,20 @@ void check_dynamic_rank(int gpu, const std::string& run_id, const std::string& p
         require(rdma_proxy_prepare_iteration(handle, i) == 0);
         require(build_rows(handle) != 0 && build_inter(handle) != 0);
         require(rdma_proxy_run_iteration(handle, i) == 0);
+        require(rdma_proxy_wait_cpu_scatter_ready(handle, i, 1, 5000) == 0);
+        const auto local_count = std::count_if(masks.begin(), masks.end(),
+                                               [gpu](uint8_t mask) { return mask & (1u << gpu); });
+        require(scatter_counts[gpu] == local_count);
+        if (i) {
+            auto slots = inverse.begin() + gpu * capacity;
+            for (std::size_t row = 0; row < capacity; ++row)
+                if (masks[row] & (1u << gpu)) require(*slots++ == static_cast<int64_t>(row));
+        }
+        require(rdma_proxy_wait_return_maps(handle, i, 1, 5000) == 0);
+        require(std::equal(combine_rows.begin(), combine_rows.end(), return_maps.begin()));
+        if (gpu == 0)
+            require(std::equal(expected_inter.begin(), expected_inter.end(), return_maps.begin() + world * stride));
+        require(return_maps.back() == -99);
         require(rdma_proxy_wait_down_wave_schedule(handle, i, 1, 5000) == 0);
         require(down_schedule[4 * down_rows + prefix_entries - 1] == 3 && down_schedule.back() == -99);
         require(build_rows(handle) != 0 && build_inter(handle) != 0);  // Completed generation.

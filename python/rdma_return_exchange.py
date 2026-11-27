@@ -45,6 +45,7 @@ class ReturnExchange:
         self.cuda = CudaCopies()
         self.outputs = down.inputs.output_buffers()
         self.check_enabled = options.check_return_token_results
+        self.return_maps = None
         self.received = {}
         self.received_valid_rows = {}
         self.rows_host = torch.empty(len(self.outputs), dtype=torch.int64, pin_memory=True)
@@ -168,9 +169,9 @@ class ReturnExchange:
         down.return_exchange = self
         down.intra_node_combine = self.down.intra_node_combine
         self.down = down
-        if down.cpu_scatter_counts is not None:
+        if down.cpu_scatter_counts is not None and down.cpu_scatter_counts is not self.rows_host:
             self.rows_host.copy_(down.cpu_scatter_counts)
-        if down.intra_node_combine is not None:
+        if down.intra_node_combine is not None and getattr(self, "return_maps", None) is None:
             down.intra_node_combine.refresh_routes()
 
     def publish_counts(self):
@@ -183,6 +184,12 @@ class ReturnExchange:
         # The event must be recorded before C++ may query this generation.
         self.down_done.record()
         self.require(self.arm_fn(self.handle, iteration))
+
+    def arm_and_bind_maps(self, iteration):
+        # The down launch is on this stream, and scatter's host counts are ready.
+        # Return copies can progress while the independent map upload is joined.
+        self.arm(iteration)
+        self.down.intra_node_combine.bind_return_maps(iteration)
 
     def finish_iteration(self, iteration):
         # Caller already waited for native outgoing-return completion. The
@@ -241,6 +248,7 @@ class ReturnExchange:
             # Break down -> exchange -> down so they are reclaimed before
             # PyTorch's CUDA IPC globals are destroyed at interpreter shutdown.
             self.network_return = None
+            self.return_maps = None
             self.down.intra_node_combine = None
             self.down.return_exchange = None
             self.down = None

@@ -68,6 +68,12 @@ For refreshed dynamic routes with threaded CPU scatter and down expert-wave read
 
 ## Return, reduce and retire
 
+On a refreshed dynamic route with threaded CPU scatter, the scatter worker can build the compact destination lookup from the installed expert indices while the gather publisher feeds up-GEMM. The worker then packs all committed gather ranges, including any that arrived during lookup construction. The host counts become visible before NVLink return copies are armed.
+
+A separate return-map worker builds the intra-node map from source masks and the optional inter-node map from outgoing token indices. Only their domain lengths are needed to bind the current views. The maps share one pinned allocation and one fixed-address device allocation across iterations. After both construction and the last up-gather ready submission, one H2D and an event on the publication stream make both maps available. The combine readers wait for this iteration’s event in addition to their existing data readiness dependencies. An empty local expert route still needs maps for any contributions from other GPUs. [Worker ABI](../include/rdma_proxy_c_api.h)
+
+Before up-GEMM, iteration preparation still resets readiness counters and prepares the per-peer RDMA return chunks from their live row counts. These chunk descriptors tell the transport which ranges to send. [RDMA return preparation](../native/src/rdma_return.cpp)
+
 | Stage | Producer, consumer and completion evidence |
 | --- | --- |
 | Down → same-node returns | The worker schedules valid counts before down, or reuses the fixed CPU counts. Whole-buffer return waits for the recorded down-done event. Per-group return can start from the mapped, system-release down prefix. Return copies run on a dedicated stream. Each logical producer visits peers cyclically starting at its successor, keeping all source-node spans for a destination together. |

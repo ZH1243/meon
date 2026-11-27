@@ -107,6 +107,16 @@ RDMA_PROXY_C_API int rdma_proxy_configure_cpu_scatter_deferred(
  * Native shutdown joins the worker and retires its DMA before returning. */
 RDMA_PROXY_C_API int rdma_proxy_configure_cpu_scatter_threaded(
     RdmaProxyHandle* handle, uint64_t bytes);
+/* Combined threaded configuration for a freshly installed nonempty dynamic route.
+ * The worker builds the compact address lookup and then packs published gather rows.
+ * The call consumes source_pairs and output_bases synchronously. counts and the
+ * optional output_to_input are writable HOST buffers borrowed until a successful
+ * wait_cpu_scatter_ready for this epoch, route retirement, or shutdown. Read them
+ * only after that synchronization. Device destinations follow the threaded slab
+ * layout above. Pass packed_weights=0 for an unweighted route. */
+RDMA_PROXY_C_API int rdma_proxy_configure_cpu_scatter_async(
+    RdmaProxyHandle* handle, const RdmaProxyCpuScatterConfig* config,
+    uintptr_t packed_weights, uint64_t slab_bytes);
 /* Host-wait, bounded by timeout_ms > 0, until this prepared iteration's event
  * RECORD is submitted, then enqueue cudaStreamWaitEvent on a nonzero caller
  * stream. Supports deferred and threaded modes; worker errors are reported.
@@ -114,6 +124,28 @@ RDMA_PROXY_C_API int rdma_proxy_configure_cpu_scatter_threaded(
  * another host thread must continue driving notification/communication work.
  * Join compute consumers before preparing the next iteration or shutting down. */
 RDMA_PROXY_C_API int rdma_proxy_wait_cpu_scatter_ready(
+    RdmaProxyHandle* handle, uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms);
+
+/* Reserve once during dynamic route setup. nodes lists N source/destination
+ * nodes in combine order, G is the number of local GPUs, C is num_tokens.
+ * device_slab is borrowed until shutdown. Its int32 layout is the intra-node
+ * rows [N*G, N*C+2], then inter-node rows [N, C+2] if include_inter is 1.
+ * words is the exact combined element count. The worker owns pinned staging. */
+RDMA_PROXY_C_API int rdma_proxy_configure_return_maps(
+    RdmaProxyHandle* handle, const int32_t* nodes, uint64_t num_nodes,
+    uint64_t capacity, uintptr_t device_slab, uint64_t words, int32_t include_inter);
+/* Call once for a refreshed route before prepare_iteration, even when this GPU
+ * has zero expert work. The two host outputs (num_nodes each, in nodes order)
+ * are filled synchronously from installed route extents. The worker builds
+ * the maps in parallel and uploads them after final up-gather submission. */
+RDMA_PROXY_C_API int rdma_proxy_start_return_maps(
+    RdmaProxyHandle* handle, uint64_t iteration, uint64_t* intra_counts,
+    uint64_t* outgoing_counts, uint64_t num_nodes);
+/* Wait for the current generation's event record, then order the nonzero
+ * consumer stream after its upload. Host wait is bounded by timeout_ms > 0.
+ * Preserve the combine's data readiness waits. Join GPU readers before the
+ * next route installation or shutdown. */
+RDMA_PROXY_C_API int rdma_proxy_wait_return_maps(
     RdmaProxyHandle* handle, uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms);
 
 /* Original source [num_tokens,top_k] assignments, before destination row mapping.

@@ -97,7 +97,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
         self.assertEqual(buffers.benchmark_staging_buffers(), (source, destination))
 
     def run_worker(self, *, compute=False, fail_epoch=None, scatter_publication=None,
-                   tile_major=True, has_reservation_api=True):
+                   tile_major=True, has_reservation_api=True, rows_per_epoch=(1, 0), down_factory=None):
         events, output = [], io.StringIO()
 
         def status(name):
@@ -115,7 +115,8 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
         library = SimpleNamespace(
             rdma_proxy_create=lambda *args: 99, rdma_proxy_initialize=status("init"),
             rdma_proxy_benchmark_metadata_enabled=write(True),
-            rdma_proxy_get_num_iterations=write(2), rdma_proxy_get_computation_num_tokens=write(1),
+            rdma_proxy_get_num_iterations=write(len(rows_per_epoch)),
+            rdma_proxy_get_computation_num_tokens=write(rows_per_epoch[0]),
             rdma_proxy_prepare_iteration=status("prepare"), rdma_proxy_run_iteration=status("payload"),
             rdma_proxy_record_computation_end=status("up_end"), rdma_proxy_get_computation_elapsed_ms=write(1.0),
             rdma_proxy_finish=status("finish"), rdma_proxy_shutdown=status("shutdown"), rdma_proxy_destroy=status("destroy"),
@@ -140,7 +141,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                                        r_ready_to_install_elapsed_ns=5000, retire_elapsed_ns=100,
                                        reuse_barrier_ns=0, release_barrier_ns=0, source_route="receiver",
                                        source_route_storage="borrowed", a_idx_storage="exchange_device")
-                return ((1, 1 - epoch) if compute_extents else None), 6000
+                return ((1, rows_per_epoch[epoch]) if compute_extents else None), 6000
 
             def close(self, *, clean):
                 events.append(("close", clean))
@@ -169,6 +170,8 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                                   cpu_scatter_preparation=scatter_publication is not None,
                                   cpu_scatter_publication=scatter_publication, down_n_tile_major_output=tile_major,
                                   down_pingpong=None, down_gather_table_wave_barrier=True,
+                                  down_gather_table=True, down_gather_table_expert_waves=True,
+                                  down_gather_table_publish_ready=True, return_token_results=False,
                                   benchmark_ready_up_gemm=False, check_projections=False, trace_down_ready=False)
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.dict(sys.modules, benchmark_metadata_backend=SimpleNamespace(
@@ -176,7 +179,10 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
             stack.enter_context(patch.object(worker, "install_python_device_buffers", return_value=buffers))
             stack.enter_context(patch.object(worker, "import_torch_for_proxy", return_value=torch))
             stack.enter_context(patch.object(worker, "GroupedGemmRunner", Up))
-            stack.enter_context(patch.object(worker, "get_expert_counts", return_value=[0]))
+            stack.enter_context(patch.object(worker, "get_expert_counts",
+                                             side_effect=([rows] for rows in rows_per_epoch)))
+            if down_factory is not None:
+                stack.enter_context(patch.object(worker, "DownProjectionRunner", down_factory(events)))
             stack.enter_context(contextlib.redirect_stdout(output))
             if fail_epoch is not None:
                 stack.enter_context(self.assertRaisesRegex(RuntimeError, "injected exchange failure"))
@@ -217,6 +223,83 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
         records = [line for line in result.splitlines() if line.strip().startswith("benchmark_metadata ")]
         self.assertIn("r_ready_to_up_submit_us=", records[0])
         self.assertNotIn("r_ready_to_up_submit_us=", records[1])
+
+    def test_steady_down_schedule_orders_construction_publication_and_consumption(self):
+        def down_factory(events):
+            def create(torch, up, counts, options, *, defer_wave_schedule=False, external_wave_schedule=None, **kwargs):
+                rows, = counts
+                clock = Mock()
+                clock.elapsed_time.return_value = 1.0
+                down = SimpleNamespace(
+                    cpu_scatter=bool(rows), cpu_scatter_publication="threaded", combine=True, route_weights=None,
+                    output_reset_policy="before-down", intra_node_combine=None, flops=2 * rows,
+                    reset_start=clock, reset_end=clock, mapping_start=clock, gemm_start=clock, end=clock,
+                    warmup=lambda: None,
+                    configure_cpu_scatter=lambda *_: events.append(("scatter", rows)),
+                    wait_cpu_scatter_ready=lambda epoch: events.append(("wait-scatter", epoch)),
+                )
+                if not defer_wave_schedule:
+                    events.append(("schedule", rows))
+
+                def launch(wait_for_metadata, wait_for_wave_schedule):
+                    if wait_for_metadata:
+                        wait_for_metadata()
+                    if defer_wave_schedule and rows and external_wave_schedule is None:
+                        events.append(("schedule", rows))
+                    if wait_for_wave_schedule:
+                        self.assertEqual(external_wave_schedule, ("table", rows))
+                        wait_for_wave_schedule()
+                    events.append(("down", rows))
+
+                down.launch = launch
+                return down
+            return create
+
+        rows_per_epoch = (1, 3, 0, 2)
+        for native in (False, True):
+            with self.subTest(native=native):
+                def factory(events):
+                    def submit(epoch, counts):
+                        events.append(("schedule", counts[0]))
+                        return ("table", counts[0])
+
+                    fake.start = submit
+                    fake.wait = lambda epoch, stream: events.append(("wait-schedule", epoch, stream.cuda_stream))
+                    return down_factory(events)
+
+                fake = SimpleNamespace()
+                with patch("down_wave_schedule.DownWaveSchedule.reserve_if_supported",
+                           return_value=fake if native else None) as reserve:
+                    events, _ = self.run_worker(compute=True, scatter_publication="threaded",
+                                                rows_per_epoch=rows_per_epoch, down_factory=factory)
+                reserve.assert_called_once()
+                for epoch, rows in enumerate(rows_per_epoch):
+                    start = events.index(("install", epoch))
+                    if not rows:
+                        self.assertNotIn(("schedule", 0), events)
+                        self.assertNotIn(("wait-schedule", epoch, 42), events)
+                        continue
+                    up = events.index(("up",), start)
+                    schedule = events.index(("schedule", rows))
+                    prepared = events.index(("prepare", epoch))
+                    self.assertLess(events.index(("scatter", rows)), prepared)
+                    self.assertLess(prepared, up)
+                    wait = events.index(("wait-scatter", epoch))
+                    self.assertEqual(events.count(("wait-scatter", epoch)), 1)
+                    self.assertLess(up, wait)
+                    consumed = events.index(("down", rows))
+                    if native and epoch:
+                        self.assertLess(start, schedule)
+                        self.assertLess(schedule, events.index(("bind", rows)))
+                        self.assertLess(schedule, events.index(("scatter", rows)))
+                        join = events.index(("wait-schedule", epoch, 42))
+                        self.assertLess(wait, join)
+                        self.assertLess(join, consumed)
+                    elif epoch:
+                        self.assertLess(wait, schedule)
+                    else:
+                        self.assertLess(schedule, up)
+                    self.assertLess(schedule, consumed)
 
     def test_partial_exchange_failure_stops_before_payload_and_closes_provider(self):
         events, _ = self.run_worker(fail_epoch=1)

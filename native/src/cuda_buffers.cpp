@@ -165,6 +165,10 @@ void CudaBuffers::set_external_device_buffer_allocator(
 }
 
 CudaBuffers::~CudaBuffers() {
+    try { stop_down_wave_worker(); }
+    catch (const std::exception& error) {
+        RDMA_PROXY_LOG_WARN("down wave worker cleanup failed: ", error.what());
+    }
     try { stop_cpu_scatter_worker(); }
     catch (const std::exception& error) {
         RDMA_PROXY_LOG_WARN("CPU scatter worker cleanup failed: ", error.what());
@@ -215,6 +219,11 @@ CudaBuffers::~CudaBuffers() {
 #endif
     }
 #if RDMA_PROXY_HAVE_CUDA
+    if (down_wave_.event) {
+        const auto status = cudaEventDestroy(reinterpret_cast<cudaEvent_t>(down_wave_.event));
+        if (status != cudaSuccess)
+            RDMA_PROXY_LOG_WARN("cudaEventDestroy(down wave) failed: ", cudaGetErrorString(status));
+    }
     if (!config_.mock_mode && cpu_scatter_ready_event_) {
         const auto status = cudaEventDestroy(reinterpret_cast<cudaEvent_t>(cpu_scatter_ready_event_));
         if (status != cudaSuccess)
@@ -258,6 +267,7 @@ CudaBuffers::~CudaBuffers() {
     free_pinned_buffer(cpu_scatter_staging_);
     free_pinned_buffer(cpu_route_weights_staging_);
     free_pinned_buffer(cpu_scatter_host_slab_);
+    free_pinned_buffer(down_wave_.staging);
 }
 
 void CudaBuffers::initialize() {
@@ -757,10 +767,10 @@ void CudaBuffers::install_iteration_expert_metadata(
 
     std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
     if (metadata_generations_installed_ && config_.nvlink_forward_completion_notifications_enabled) {
-        if (cpu_scatter_threaded_) {
-            quiesce_cpu_scatter_worker();
+        quiesce_down_wave_worker();
+        if (cpu_scatter_threaded_) quiesce_cpu_scatter_worker();
+        if (cpu_scatter_threaded_ || down_wave_.device)
             select_cuda_device_for_thread(config_.cuda_device_id, config_.mock_mode);
-        }
         // Retire descriptor and scatter DMA before replacing the old route.
         synchronize_cuda_stream(router_notification_publication_stream_, config_.mock_mode);
     }
@@ -777,6 +787,7 @@ void CudaBuffers::install_iteration_expert_metadata(
 
 void CudaBuffers::retire_borrowed_expert_metadata() {
     std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    quiesce_down_wave_worker();
     if (cpu_scatter_threaded_ && cpu_scatter_worker_thread_.joinable())
         quiesce_cpu_scatter_worker();
     // A failed installation can leave index copies or the tail-clear kernel in
@@ -1138,10 +1149,7 @@ void CudaBuffers::initialize_router_computation_scheduler_locked(const RdmaProxy
         " a_idx_capacity=", a_idx_capacity);
 }
 
-void CudaBuffers::reserve_threaded_cpu_scatter_locked(std::size_t address_columns) {
-    if (address_columns != 1 && address_columns != 2)
-        throw std::runtime_error("threaded CPU scatter requires one or two address columns");
-    if (address_columns <= cpu_scatter_reserved_columns_) return;
+std::size_t CudaBuffers::dynamic_computation_route_capacity() const {
     // Receive slots exist before generation zero, even if its route has no work.
     const auto sources = static_cast<std::size_t>(std::count_if(
         nvlink_recv_buffers_.begin(), nvlink_recv_buffers_.end(),
@@ -1149,12 +1157,19 @@ void CudaBuffers::reserve_threaded_cpu_scatter_locked(std::size_t address_column
     if (!sources || !config_.router_dynamic_routing_enabled ||
         !config_.nvlink_forward_completion_notifications_enabled ||
         config_.nvlink_forward_notification_flush_only_enabled)
-        throw std::runtime_error("threaded CPU scatter reservation requires dynamic routed inputs");
+        throw std::runtime_error("metadata reservation requires dynamic routed inputs");
     const auto local_experts = config_.router_num_experts / nvlink_recv_buffers_.size();
     const auto per_source = dynamic_indices_per_source(config_, local_experts);
     if (!per_source || per_source > std::numeric_limits<std::size_t>::max() / sources)
-        throw std::runtime_error("threaded CPU scatter route capacity is out of range");
-    const auto layout = scatter_slab_layout(per_source * sources, address_columns,
+        throw std::runtime_error("dynamic computation route capacity is out of range");
+    return per_source * sources;
+}
+
+void CudaBuffers::reserve_threaded_cpu_scatter_locked(std::size_t address_columns) {
+    if (address_columns != 1 && address_columns != 2)
+        throw std::runtime_error("threaded CPU scatter requires one or two address columns");
+    if (address_columns <= cpu_scatter_reserved_columns_) return;
+    const auto layout = scatter_slab_layout(dynamic_computation_route_capacity(), address_columns,
                                             config_.router_weighted_contributions_enabled);
     reserve_cpu_scatter_slab_locked(layout.total_bytes);
     cpu_scatter_reserved_columns_ = address_columns;
@@ -1665,6 +1680,188 @@ void CudaBuffers::stop_cpu_scatter_worker() {
     synchronize_cuda_stream(router_notification_publication_stream_, config_.mock_mode);
 }
 
+void CudaBuffers::configure_down_wave_schedule(
+    uintptr_t device_slab, std::size_t capacity_words, const DownWaveGeometry& geometry) {
+    std::lock_guard<std::mutex> scheduler_lock(expert_token_heads_mutex_);
+    auto& w = down_wave_;
+    std::lock_guard<std::mutex> lock(w.mutex);
+    if (w.device || w.stop || !router_notification_publication_buffers_.host_ready_rows.ptr ||
+        !config_.router_dynamic_routing_enabled || config_.nvlink_forward_notification_flush_only_enabled)
+        throw std::runtime_error("down wave reservation requires an initialized dynamic notification publisher");
+    if (!device_slab || device_slab % alignof(int32_t) || !capacity_words ||
+        capacity_words > std::numeric_limits<std::size_t>::max() / sizeof(int32_t))
+        throw std::runtime_error("invalid down wave device slab address or size");
+    down_wave_layout(geometry, {});  // Validate geometry before acquiring resources.
+    select_cuda_device_for_thread(config_.cuda_device_id, config_.mock_mode);
+    try {
+        allocate_pinned_buffer(w.staging, capacity_words * sizeof(int32_t));
+#if RDMA_PROXY_HAVE_CUDA
+        if (!config_.mock_mode) {
+            cudaEvent_t event = nullptr;
+            check_cuda(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "create down wave ready event");
+            w.event = event;
+        }
+#endif
+        w.geometry = geometry;
+        w.thread = std::thread(&CudaBuffers::down_wave_worker_loop, this);
+        w.device = device_slab;
+    } catch (...) {
+#if RDMA_PROXY_HAVE_CUDA
+        if (w.event) cudaEventDestroy(reinterpret_cast<cudaEvent_t>(w.event));
+#endif
+        w.event = nullptr;
+        free_pinned_buffer(w.staging);
+        throw;
+    }
+}
+
+DownWaveLayout CudaBuffers::start_down_wave_schedule(
+    uint64_t iteration, const std::vector<std::size_t>& counts) {
+    std::lock_guard<std::mutex> scheduler_lock(expert_token_heads_mutex_);
+    const auto& scheduler = router_computation_scheduler_state_;
+    auto& w = down_wave_;
+    std::lock_guard<std::mutex> lock(w.mutex);
+    if (w.error) std::rethrow_exception(w.error);
+    if (!w.device || w.stop || w.phase != WavePhase::idle || (w.started && iteration <= w.iteration) ||
+        !metadata_generations_installed_ ||
+        iteration != metadata_generations_installed_ - 1 || !scheduler.initialized ||
+        counts != scheduler.expert_total_tokens)
+        throw std::runtime_error("invalid down wave reservation, iteration, or per-expert counts");
+    const auto layout = down_wave_layout(w.geometry, counts);
+    if (layout.bytes > w.staging.bytes)
+        throw std::runtime_error("down wave schedule exceeds reserved slab capacity");
+    w.counts = counts;
+    w.layout = layout;
+    w.iteration = iteration;
+    w.started = true;
+    w.final_gather = scheduler.iteration_initialized && scheduler.iteration == iteration &&
+                     scheduler.final_ready_submitted;
+    w.phase = WavePhase::build;
+    w.changed.notify_all();
+    return layout;
+}
+
+void CudaBuffers::commit_final_gather_locked() {
+    if (config_.nvlink_forward_notification_flush_only_enabled) return;
+    auto& scheduler = router_computation_scheduler_state_;
+    if (!scheduler.iteration_initialized || scheduler.final_ready_submitted) return;
+    // Called only after the final descriptor and ready write have been submitted
+    // on the publication stream. A late schedule submission sees the same latch.
+    scheduler.final_ready_submitted = true;
+    auto& w = down_wave_;
+    if (!w.device) return;
+    std::lock_guard<std::mutex> lock(w.mutex);
+    if (w.phase != WavePhase::idle && w.iteration == scheduler.iteration) {
+        w.final_gather = true;
+        w.changed.notify_all();
+    }
+}
+
+void CudaBuffers::down_wave_worker_loop() noexcept {
+    auto& w = down_wave_;
+    try {
+#if defined(__linux__)
+        pthread_setname_np(pthread_self(), "rdma-down-wave");
+#elif defined(__APPLE__)
+        pthread_setname_np("rdma-down-wave");
+#endif
+        select_cuda_device_for_thread(config_.cuda_device_id, config_.mock_mode);
+        std::unique_lock<std::mutex> lock(w.mutex);
+        for (;;) {
+            w.changed.wait(lock, [&] {
+                return w.stop || w.phase == WavePhase::build ||
+                       (w.phase == WavePhase::packed && w.final_gather);
+            });
+            if (w.stop) return;
+            const bool build = w.phase == WavePhase::build;
+            w.busy = true;
+            lock.unlock();
+            if (build) {
+                build_down_wave_schedule(w.geometry, w.counts, static_cast<int32_t*>(w.staging.ptr),
+                                         w.staging.bytes);
+            } else if (config_.mock_mode) {
+                if (w.layout.bytes)
+                    std::memcpy(reinterpret_cast<void*>(w.device), w.staging.ptr, w.layout.bytes);
+            } else {
+#if RDMA_PROXY_HAVE_CUDA
+                auto stream = reinterpret_cast<cudaStream_t>(router_notification_publication_stream_);
+                if (w.layout.bytes)
+                    check_cuda(cudaMemcpyAsync(reinterpret_cast<void*>(w.device), w.staging.ptr,
+                        w.layout.bytes, cudaMemcpyHostToDevice, stream), "upload packed down wave schedule");
+                check_cuda(cudaEventRecord(reinterpret_cast<cudaEvent_t>(w.event), stream),
+                           "record down wave ready event");
+#endif
+            }
+            lock.lock();
+            if (!build && w.layout.bytes) {
+                ++router_notification_publication_buffers_.down_wave_copy_count;
+                router_notification_publication_buffers_.down_wave_copy_bytes += w.layout.bytes;
+            }
+            // Retirement can invalidate the epoch while packing or submitting.
+            // Its caller drains this section and fences DMA before slab reuse.
+            if (w.phase != WavePhase::idle)
+                w.phase = build ? WavePhase::packed : WavePhase::submitted;
+            w.busy = false;
+            w.changed.notify_all();
+        }
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(w.mutex);
+        w.error = std::current_exception();
+        w.busy = false;
+        w.changed.notify_all();
+    }
+}
+
+void CudaBuffers::wait_down_wave_schedule(uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms) {
+    auto& w = down_wave_;
+    std::unique_lock<std::mutex> lock(w.mutex);
+    const auto current = [&] { return !w.stop && w.phase != WavePhase::idle && w.iteration == iteration; };
+    if (w.error) std::rethrow_exception(w.error);
+    const auto max_wait = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::time_point::max() - std::chrono::steady_clock::now()).count();
+    if (!current() || !cuda_stream || !timeout_ms || timeout_ms > static_cast<uint64_t>(max_wait))
+        throw std::runtime_error("invalid down wave wait stream, timeout, or iteration");
+    if (!w.changed.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
+            return w.error || !current() || w.phase == WavePhase::submitted;
+        }))
+        throw std::runtime_error("timed out waiting for down wave submission iteration=" + std::to_string(iteration));
+    if (w.error) std::rethrow_exception(w.error);
+    if (!current()) throw std::runtime_error("down wave iteration retired during wait");
+#if RDMA_PROXY_HAVE_CUDA
+    if (!config_.mock_mode) {
+        select_cuda_device_for_thread(config_.cuda_device_id, false);
+        // Recording has returned for this epoch. Keep the mutex through enqueue
+        // so retirement cannot re-record this event for another iteration.
+        check_cuda(cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(cuda_stream),
+            reinterpret_cast<cudaEvent_t>(w.event), 0), "wait for down wave schedule");
+    }
+#endif
+}
+
+void CudaBuffers::quiesce_down_wave_worker() {
+    auto& w = down_wave_;
+    if (!w.device) return;
+    std::unique_lock<std::mutex> lock(w.mutex);
+    w.phase = WavePhase::idle;
+    w.changed.notify_all();
+    w.changed.wait(lock, [&] { return !w.busy; });
+    if (w.error && !w.stop) std::rethrow_exception(w.error);
+}
+
+void CudaBuffers::stop_down_wave_worker() {
+    auto& w = down_wave_;
+    if (!w.device) return;
+    {
+        std::lock_guard<std::mutex> lock(w.mutex);
+        w.stop = true;
+        w.phase = WavePhase::idle;
+        w.changed.notify_all();
+    }
+    if (w.thread.joinable()) w.thread.join();
+    select_cuda_device_for_thread(config_.cuda_device_id, config_.mock_mode);
+    synchronize_cuda_stream(router_notification_publication_stream_, config_.mock_mode);
+}
+
 void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) {
     auto& scheduler = router_computation_scheduler_state_;
     if (!scheduler.initialized) {
@@ -1706,6 +1903,7 @@ void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) 
               scheduler.expert_num_notified_batches.end(), std::size_t{0});
     scheduler.iteration_initialized = true;
     scheduler.iteration = iteration;
+    scheduler.final_ready_submitted = false;
     scheduler.published_batches = 0;
     scheduler.published_rows = 0;
     scheduler.scheduling_passes = 0;
@@ -2321,42 +2519,41 @@ void CudaBuffers::flush_router_notification_publication_range(
             publication.device_ready_rows.ptr,
             ready_rows_memcpy_source,
             publication.host_ready_rows.bytes);
-        if (table_bytes != 0) ++publication.table_flush_count;
-        ++publication.ready_rows_publication_count;
-        publish_deferred_cpu_scatter_locked();
-        return;
-    }
-#if RDMA_PROXY_HAVE_CUDA
-    auto stream = reinterpret_cast<cudaStream_t>(
-        router_notification_publication_stream_);
-    if (config_.nvlink_forward_notification_flag_update_mode ==
-        NvlinkForwardNotificationFlagUpdateMode::kMemcpy) {
-        check_cuda(cudaMemcpyAsync(
-            publication.device_ready_rows.ptr,
-            ready_rows_memcpy_source,
-            sizeof(int32_t),
-            cudaMemcpyHostToDevice,
-            stream),
-            "cudaMemcpyAsync H2D QuACK gather ready rows");
     } else {
-        // A stream memory write is host-asynchronous, writes the aligned flag
-        // as one 32-bit value, and (without NO_MEMORY_BARRIER) performs a
-        // system-wide fence after the preceding table copy and before
-        // publishing ready rows.
-        check_cuda_driver(cuStreamWriteValue32(
-            reinterpret_cast<CUstream>(stream),
-            reinterpret_cast<CUdeviceptr>(publication.device_ready_rows.ptr),
-            static_cast<cuuint32_t>(ready_rows),
-            CU_STREAM_WRITE_VALUE_DEFAULT),
-            "cuStreamWriteValue32 QuACK gather ready rows");
+#if RDMA_PROXY_HAVE_CUDA
+        auto stream = reinterpret_cast<cudaStream_t>(
+            router_notification_publication_stream_);
+        if (config_.nvlink_forward_notification_flag_update_mode ==
+            NvlinkForwardNotificationFlagUpdateMode::kMemcpy) {
+            check_cuda(cudaMemcpyAsync(
+                publication.device_ready_rows.ptr,
+                ready_rows_memcpy_source,
+                sizeof(int32_t),
+                cudaMemcpyHostToDevice,
+                stream),
+                "cudaMemcpyAsync H2D QuACK gather ready rows");
+        } else {
+            // A stream memory write is host-asynchronous, writes the aligned flag
+            // as one 32-bit value, and (without NO_MEMORY_BARRIER) performs a
+            // system-wide fence after the preceding table copy and before
+            // publishing ready rows.
+            check_cuda_driver(cuStreamWriteValue32(
+                reinterpret_cast<CUstream>(stream),
+                reinterpret_cast<CUdeviceptr>(publication.device_ready_rows.ptr),
+                static_cast<cuuint32_t>(ready_rows),
+                CU_STREAM_WRITE_VALUE_DEFAULT),
+                "cuStreamWriteValue32 QuACK gather ready rows");
+        }
+#else
+        throw std::runtime_error(
+            "CUDA router notification publication requested but CUDA support was not built");
+#endif
     }
     if (table_bytes != 0) ++publication.table_flush_count;
     ++publication.ready_rows_publication_count;
+    if (static_cast<std::size_t>(ready_rows) == publication.table_rows)
+        commit_final_gather_locked();
     publish_deferred_cpu_scatter_locked();
-#else
-    throw std::runtime_error(
-        "CUDA router notification publication requested but CUDA support was not built");
-#endif
 }
 
 std::size_t CudaBuffers::token_buffer_bytes() const {

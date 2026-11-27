@@ -163,7 +163,7 @@ class ReturnExchange:
 
     def bind_down(self, down):
         """Keep IPC bases and the pinned count pointer while replacing epoch metadata."""
-        if tuple(t.data_ptr() for t in down.inputs.output_buffers()) != tuple(t.data_ptr() for t in self.outputs):
+        if tuple(t.data_ptr() for t in down.output_buffers()) != tuple(t.data_ptr() for t in self.outputs):
             raise ValueError("routing refresh changed a registered return-copy source")
         down.return_exchange = self
         down.intra_node_combine = self.down.intra_node_combine

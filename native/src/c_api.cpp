@@ -37,6 +37,12 @@ void clear_error() {
     last_error.clear();
 }
 
+rdma_proxy::DownWaveGeometry down_wave_geometry(const RdmaProxyDownWaveGeometry* geometry) {
+    if (!geometry || geometry->struct_size != sizeof(*geometry))
+        throw std::runtime_error("invalid down wave geometry descriptor");
+    return {geometry->cluster_rows, geometry->num_groups, geometry->group_size, geometry->max_wave_work_ids};
+}
+
 int record_current_exception() noexcept {
     try {
         throw;
@@ -124,6 +130,57 @@ RdmaProxyDeviceBufferRequest make_c_device_buffer_request(
 
 extern "C" int rdma_proxy_abi_version(void) {
     return 1;
+}
+
+extern "C" int rdma_proxy_get_down_wave_capacity(
+    RdmaProxyHandle* handle, const RdmaProxyDownWaveGeometry* geometry, uint64_t* capacity_words) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || handle->finished || !capacity_words)
+            throw std::runtime_error("invalid down wave capacity query");
+        *capacity_words = handle->proxy.down_wave_capacity_words(down_wave_geometry(geometry));
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
+extern "C" int rdma_proxy_configure_down_wave_schedule(
+    RdmaProxyHandle* handle, const RdmaProxyDownWaveGeometry* geometry, uintptr_t device_slab,
+    uint64_t capacity_words) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->finished || handle->shut_down)
+            throw std::runtime_error("invalid down wave configuration handle");
+        select_proxy_cuda_device(*handle);
+        handle->proxy.configure_down_wave_schedule(down_wave_geometry(geometry), device_slab, capacity_words);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
+extern "C" int rdma_proxy_start_down_wave_schedule(
+    RdmaProxyHandle* handle, uint64_t iteration, const uint64_t* counts, uint64_t num_experts,
+    uint64_t* table_rows, uint64_t* prefix_entries) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->finished || handle->shut_down || !table_rows ||
+            !prefix_entries || table_rows == prefix_entries)
+            throw std::runtime_error("invalid down wave start arguments");
+        const auto layout = handle->proxy.start_down_wave_schedule(iteration, counts, num_experts);
+        *table_rows = layout.table_rows;
+        *prefix_entries = layout.prefix_entries;
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
+extern "C" int rdma_proxy_wait_down_wave_schedule(
+    RdmaProxyHandle* handle, uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down)
+            throw std::runtime_error("invalid down wave wait handle");
+        select_proxy_cuda_device(*handle);
+        handle->proxy.wait_down_wave_schedule(iteration, cuda_stream, timeout_ms);
+        return 0;
+    } catch (...) { return record_current_exception(); }
 }
 
 extern "C" int rdma_proxy_reserve_threaded_cpu_scatter(

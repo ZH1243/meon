@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "down_wave_schedule.hpp"
 #include "protocol.hpp"
 #include "rdma_proxy_c_api.h"
 
@@ -106,6 +107,8 @@ struct RouterNotificationPublicationBuffers {
     std::atomic<uint64_t> cpu_scatter_pack_ready_publication_count{0};
     std::atomic<uint64_t> cpu_scatter_copy_count{0};
     std::atomic<uint64_t> cpu_scatter_copy_bytes{0};
+    std::atomic<uint64_t> down_wave_copy_count{0};
+    std::atomic<uint64_t> down_wave_copy_bytes{0};
 };
 
 struct PeerGpuBuffers {
@@ -128,6 +131,7 @@ struct RouterExpertTokenHeadState {
 struct RouterComputationSchedulerState {
     bool initialized{false};
     bool iteration_initialized{false};
+    bool final_ready_submitted{false};
     uint64_t iteration{0};
     // M-clusters whose input ranges have been assigned.
     std::size_t published_batches{0};
@@ -255,12 +259,18 @@ public:
     float router_computation_elapsed_ms(uint64_t iteration);
     std::size_t router_computation_num_tokens() const;
     void reserve_threaded_cpu_scatter(std::size_t address_columns);
+    std::size_t dynamic_computation_route_capacity() const;
     void configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config);
     void configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes);
     void configure_cpu_scatter_deferred(std::size_t bytes);
     void configure_cpu_scatter_threaded(std::size_t bytes);
     void stop_cpu_scatter_worker();
     void wait_cpu_scatter_ready(uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms);
+    void configure_down_wave_schedule(uintptr_t device_slab, std::size_t capacity_words,
+                                      const DownWaveGeometry& geometry);
+    DownWaveLayout start_down_wave_schedule(uint64_t iteration, const std::vector<std::size_t>& counts);
+    void wait_down_wave_schedule(uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms);
+    void stop_down_wave_worker();
     void update_expert_token_heads(
         int source_node_rank,
         int source_gpu_index,
@@ -347,6 +357,28 @@ private:
 
     ProxyConfig config_;
     friend struct CpuScatterTestAccess;
+    void down_wave_worker_loop() noexcept;
+    void quiesce_down_wave_worker();
+    void commit_final_gather_locked();
+    // Scheduler/route mutations take expert_token_heads_mutex_ first. The worker
+    // never needs that mutex and builds/copies with its own mutex released.
+    enum class WavePhase { idle, build, packed, submitted };
+    struct {
+        CpuPinnedBuffer staging;
+        uintptr_t device{0};
+        void* event{nullptr};
+        DownWaveGeometry geometry{};
+        std::vector<std::size_t> counts;
+        DownWaveLayout layout{};
+        std::thread thread;
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::exception_ptr error;
+        WavePhase phase{WavePhase::idle};
+        uint64_t iteration{0};
+        bool started{false};
+        bool final_gather{false}, busy{false}, stop{false};
+    } down_wave_;
     void reserve_threaded_cpu_scatter_locked(std::size_t address_columns);
     void reserve_cpu_scatter_slab_locked(std::size_t capacity);
     void configure_cpu_scatter_slab_locked(std::size_t bytes, bool threaded);

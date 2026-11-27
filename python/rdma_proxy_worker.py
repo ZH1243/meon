@@ -948,7 +948,8 @@ class EmptyDownInputs:
 class DownProjectionRunner:
     """Compose QuACK's existing plain grouped-GEMM runner with the up output."""
 
-    def __init__(self, torch, up, counts, options, trace_configure=None, previous=None):
+    def __init__(self, torch, up, counts, options, trace_configure=None, previous=None, *,
+                 defer_wave_schedule=False, external_wave_schedule=None):
         # GroupedGemmRunner has already inserted the selected QuACK checkout.
         from run import hopper_pregather_gemm as pregather
 
@@ -980,6 +981,7 @@ class DownProjectionRunner:
                                        if self.cpu_scatter else 0)
         self.cpu_scatter_counts = None
         self.up = up
+        self.torch = torch
         self.routes = routes
         self.route_weights = None
         weighted = getattr(options, "weighted_contributions", False)
@@ -1035,6 +1037,7 @@ class DownProjectionRunner:
                 len(outputs), dtype=torch.int64, device=up.output.device)
             self.combine_output_to_input = torch.full(
                 (len(outputs), rows), -1, dtype=torch.int64, device=up.output.device)
+            self.registered_outputs = outputs
             external["output_buffers"] = outputs
             if (previous is not None and self.cpu_scatter and self.cpu_scatter_publication == "threaded"
                     and "scatter_row_addresses" in inspect.signature(pregather.prepare_grouped_inputs).parameters):
@@ -1049,33 +1052,27 @@ class DownProjectionRunner:
             if self.route_weights is None:
                 self.route_weights = torch.zeros(routes, dtype=torch.float32, device=up.output.device)
             external["route_weights"] = self.route_weights
-        if routes:
-            self.inputs = pregather.prepare_grouped_inputs(
-                args, up.output[:routes], self.weights, counts, **external)
+        needs_ready_address = options.trace_down_ready or options.return_token_results
+        if needs_ready_address and trace_configure is None:
+            raise ValueError("down readiness requires the proxy trace allocator")
+        self.inputs = None
+        self._pending_wave_schedule = None
+        self._ready_host_address = None
+        if (defer_wave_schedule and args.gather_table_publish_ready
+                and "scatter_row_addresses" in external):
+            if external_wave_schedule is not None:
+                external["external_wave_schedule"] = external_wave_schedule
+            # These destinations are already bound independently of QuACK's down inputs.
+            # Only the registered host flag address is invariant across routing epochs.
+            if needs_ready_address:
+                self.trace_groups = previous.trace_groups
+                self._ready_host_address = previous.inputs.wave_ready_host_address
+            self._setup_stream = torch.cuda.current_stream(up.cuda_device_id)
+            self._pending_wave_schedule = (args, list(counts), external)
         else:
-            self.inputs = EmptyDownInputs(torch, args, up.output, external.get("output_buffers"))
-        if (self.cpu_scatter and self.cpu_scatter_metadata is None
-                and self.cpu_scatter_publication in ("deferred", "threaded")):
-            (self.cpu_scatter_metadata, self.inputs.scatter_row_addresses,
-             self.route_weights) = make_cpu_scatter_metadata_storage(
-                torch, self.inputs.scatter_row_addresses, self.route_weights)
-            self.inputs.route_weights = self.route_weights
-        if options.trace_down_ready or options.return_token_results:
-            if trace_configure is None:
-                raise ValueError("down readiness requires the proxy trace allocator")
-            self.trace_groups = int(self.inputs.wave_ready_prefix[-1].item())
-            address = trace_configure(self.trace_groups)
-            self.inputs.wave_ready_host_address = torch.tensor(
-                [address], dtype=torch.int64, device=up.output.device)
-        if routes:
-            self.launch_gemm = pregather.make_launch(args, self.inputs)
-        else:
-            self.publish_empty_down = None
-            if self.inputs.wave_ready_host_address is not None:
-                from empty_down import prepare_empty_down_publisher
-                self.publish_empty_down = prepare_empty_down_publisher(
-                    self.inputs.wave_ready_host_address, self.inputs.groups, torch.cuda.current_stream(up.cuda_device_id))
-            self.launch_gemm = self._complete_empty_down
+            if external_wave_schedule is not None:
+                raise ValueError("external down waves require deferred QuACK setup and threaded CPU scatter")
+            self._prepare_gemm(args, counts, external, trace_configure if needs_ready_address else None)
         self.combine_tile_n = args.tile_n if self.combine and args.n_tile_major_output else None
         self.return_exchange = None
         self.intra_node_combine = None
@@ -1106,6 +1103,65 @@ class DownProjectionRunner:
                   "positions=compact prefixes in input-row order; "
                   f"routing_weights={'FP32' if self.route_weights is not None else 'disabled'}",
                   flush=True)
+
+    def output_buffers(self):
+        # IPC and native scatter bind their fixed output bases before wave construction.
+        if self.inputs is None:
+            return self.registered_outputs
+        return self.inputs.output_buffers()
+
+    def _prepare_gemm(self, args, counts, external, trace_configure=None):
+        from run import hopper_pregather_gemm as pregather
+
+        up, torch = self.up, self.torch
+        if self.routes:
+            inputs = pregather.prepare_grouped_inputs(
+                args, up.output[:self.routes], self.weights, counts, **external)
+        else:
+            inputs = EmptyDownInputs(torch, args, up.output, external.get("output_buffers"))
+        if (self.cpu_scatter and self.cpu_scatter_metadata is None
+                and self.cpu_scatter_publication in ("deferred", "threaded")):
+            (self.cpu_scatter_metadata, inputs.scatter_row_addresses,
+             self.route_weights) = make_cpu_scatter_metadata_storage(
+                torch, inputs.scatter_row_addresses, self.route_weights)
+            inputs.route_weights = self.route_weights
+        if self._ready_host_address is not None:
+            inputs.wave_ready_host_address = self._ready_host_address
+        elif trace_configure is not None:
+            self.trace_groups = int(inputs.wave_ready_prefix[-1].item())
+            address = trace_configure(self.trace_groups)
+            inputs.wave_ready_host_address = torch.tensor(
+                [address], dtype=torch.int64, device=up.output.device)
+        if self.routes:
+            self.launch_gemm = pregather.make_launch(args, inputs)
+        else:
+            self.publish_empty_down = None
+            if inputs.wave_ready_host_address is not None:
+                from empty_down import prepare_empty_down_publisher
+                self.publish_empty_down = prepare_empty_down_publisher(
+                    inputs.wave_ready_host_address, inputs.groups, torch.cuda.current_stream(up.cuda_device_id))
+            self.launch_gemm = self._complete_empty_down
+        self.inputs = inputs
+
+    def finish_wave_schedule(self, wait_for_metadata):
+        """Order scatter readiness and finish any deferred work before down reads it."""
+        # A QuACK allocation can synchronize the device. First let the native
+        # publisher submit every ready row that the resident up kernel can wait on.
+        # The scatter event is recorded after the last such submission.
+        if wait_for_metadata is not None:
+            wait_for_metadata()
+        if self.inputs is not None:
+            return
+        if wait_for_metadata is None:
+            raise RuntimeError("deferred down-wave setup requires the current scatter publication")
+        compute_stream = self.torch.cuda.current_stream(self.up.cuda_device_id)
+        try:
+            with self.torch.cuda.stream(self._setup_stream):
+                self._prepare_gemm(*self._pending_wave_schedule)
+        finally:
+            # Include partially submitted setup work in compute-stream teardown, too.
+            compute_stream.wait_stream(self._setup_stream)
+        self._pending_wave_schedule = None
 
     def warmup(self):
         """Initialize the down CUDA path before any readiness-gated up launch."""
@@ -1184,12 +1240,14 @@ class DownProjectionRunner:
         pairs = (ctypes.c_int32 * (2 * sources))(
             *(value for pair in self.up.source_pairs for value in pair))
         bases = (ctypes.c_uint64 * sources)(
-            *(buffer.data_ptr() for buffer in self.inputs.output_buffers()))
+            *(buffer.data_ptr() for buffer in self.output_buffers()))
         counts = torch.empty(sources, dtype=torch.int64)
         inverse = torch.empty((sources, self.combine_rows), dtype=torch.int64)
+        # On a deferred refresh the address view starts at byte zero of the slab.
+        addresses = self.cpu_scatter_metadata if self.inputs is None else self.inputs.scatter_row_addresses
         config = Config(ctypes.sizeof(Config), sources, self.routes, self.combine_rows,
                         int(self.up.x_buffers[0].shape[1]), self.combine_tile_n or 0,
-                        self.up.output.element_size(), self.inputs.scatter_row_addresses.data_ptr(),
+                        self.up.output.element_size(), addresses.data_ptr(),
                         pairs, bases,
                         ctypes.cast(counts.data_ptr(), ctypes.POINTER(ctypes.c_int64)),
                         ctypes.cast(inverse.data_ptr(), ctypes.POINTER(ctypes.c_int64)))
@@ -1234,7 +1292,9 @@ class DownProjectionRunner:
                       "metadata H2D after final gather publication")
         else:
             policy = "scatter batches published before gather readiness"
-        print(f"CPU scatter preparation enabled: compact metadata bound to current routing; {policy}", flush=True)
+        wave_setup = " quack_down_setup=after_up_submit" if self.inputs is None else ""
+        print(f"CPU scatter preparation enabled: compact metadata bound to current routing; {policy}{wave_setup}",
+              flush=True)
 
     def wait_cpu_scatter_ready(self, iteration):
         """Join the current native upload after its event record has been submitted.
@@ -1280,7 +1340,12 @@ class DownProjectionRunner:
         """Clear only down destinations on the caller's stream, with independent timing."""
         with self.up.torch.inference_mode():
             self.reset_start.record()
-            self.inputs.zero_up_output()
+            if self.inputs is None:
+                # The deferred path owns fixed, full-capacity scatter destinations.
+                for output in self.registered_outputs:
+                    output.zero_()
+            else:
+                self.inputs.zero_up_output()
             self.reset_end.record()
 
     def finish_iteration(self):
@@ -1294,7 +1359,7 @@ class DownProjectionRunner:
             self.reset_outputs()
             self.reset_end.synchronize()
 
-    def launch(self, wait_for_metadata=None):
+    def launch(self, wait_for_metadata=None, wait_for_wave_schedule=None):
         # QuACK prepares output and metadata tensors under inference_mode.
         # Keep their resets and in-place updates in the same mode.
         with self.up.torch.inference_mode():
@@ -1302,10 +1367,11 @@ class DownProjectionRunner:
                 self._log_combine_startup("reset begin")
                 self.reset_outputs()
             self.mapping_start.record()
-            if wait_for_metadata is not None:
-                # Include an exposed upload/wakeup gap in mapping_ms. CPU packing
-                # that overlaps dispatch/up remains outside that GPU interval.
-                wait_for_metadata()
+            self.finish_wave_schedule(wait_for_metadata)
+            if wait_for_wave_schedule is not None:
+                # QuACK setup inspected only the views' layout. Join the native
+                # upload on this compute stream before down uses their contents.
+                wait_for_wave_schedule()
             if self.combine and not self.cpu_scatter and not isinstance(self.inputs, EmptyDownInputs):
                 self._log_combine_startup("route mapping begin")
                 self._prepare_combine(self.up.work_table, self.up.a_idx)
@@ -1953,6 +2019,7 @@ def run_proxy_with_concurrent_kernel(
     success = False
     kernel_stream = None
     down = None
+    down_schedule = None
     try:
         device_buffers = install_python_device_buffers(
             library,
@@ -2045,6 +2112,10 @@ def run_proxy_with_concurrent_kernel(
             down = DownProjectionRunner(
                 torch, grouped_gemm, counts, down_options,
                 trace_configure=trace.configure if trace is not None else None)
+            if dynamic and num_iterations.value > 1:
+                from down_wave_schedule import DownWaveSchedule
+                down_schedule = DownWaveSchedule.reserve_if_supported(
+                    torch, library, handle, grouped_gemm, down_options, partial(require_proxy_success, library))
             with torch.cuda.stream(kernel_stream):
                 down.warmup()
             if down.cpu_scatter:
@@ -2112,20 +2183,24 @@ def run_proxy_with_concurrent_kernel(
         for iteration in range(num_iterations.value):
             pipeline_started_ns = time.perf_counter_ns()
             reference_setup_ns = 0
+            wave_views = None
             if dynamic and iteration:
                 # All GPU and peer readers of the previous generation have retired.
                 # Finish Python's optional checks before the native thread reuses A_idx.
                 torch.cuda.synchronize(cuda_device_id)
                 extents, elapsed = prepare_epoch(iteration)
                 routing_times_ns.append(elapsed)
-                grouped_gemm.bind_routing(*extents)
                 counts = get_expert_counts(library, handle)
                 computation_tokens.value = sum(counts)
+                if down_schedule is not None and computation_tokens.value:
+                    wave_views = down_schedule.start(iteration, counts)
+                grouped_gemm.bind_routing(*extents)
                 if down is not None:
                     previous = down
                     down = DownProjectionRunner(torch, grouped_gemm, counts, down_options,
                                                 trace_configure=trace.configure if trace else None,
-                                                previous=previous)
+                                                previous=previous, defer_wave_schedule=True,
+                                                external_wave_schedule=wave_views)
                     if down.cpu_scatter:
                         down.configure_cpu_scatter(library, handle)
                     if down.output_reset_policy == "end-of-iteration" and not down.combine:
@@ -2139,7 +2214,7 @@ def run_proxy_with_concurrent_kernel(
                                                          num_experts=num_experts, iteration=iteration)
                             reference_setup_ns = time.perf_counter_ns() - reference_begin
                     del previous
-                # All route-dependent setup, including inverse maps, precedes every private stream.
+                # Publish early scatter bindings and combine maps before the native coordinator starts.
                 torch.cuda.synchronize(cuda_device_id)
 
             def log_startup(message):
@@ -2180,8 +2255,11 @@ def run_proxy_with_concurrent_kernel(
                     if down is not None:
                         needs_metadata_wait = (down.cpu_scatter and
                                                down.cpu_scatter_publication in ("deferred", "threaded"))
-                        down.launch(wait_for_metadata=(lambda: down.wait_cpu_scatter_ready(iteration))
-                                    if needs_metadata_wait else None)
+                        down.launch(
+                            wait_for_metadata=partial(down.wait_cpu_scatter_ready, iteration)
+                            if needs_metadata_wait else None,
+                            wait_for_wave_schedule=partial(down_schedule.wait, iteration, kernel_stream)
+                            if wave_views is not None else None)
                     if return_exchange is not None:
                         return_exchange.arm(iteration)
                     kernel_finished.record(kernel_stream)

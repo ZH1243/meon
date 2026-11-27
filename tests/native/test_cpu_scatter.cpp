@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <condition_variable>
@@ -28,6 +29,26 @@ struct alignas(16) SlabBlock { unsigned char bytes[16]; };
 // Test-only access: production exposes no callbacks or thread-control API.
 namespace rdma_proxy {
 struct CpuScatterTestAccess {
+    static void wait_wave_packed(CudaBuffers& buffers) {
+        auto& wave = buffers.down_wave_;
+        std::unique_lock<std::mutex> lock(wave.mutex);
+        require(wave.changed.wait_for(lock, std::chrono::seconds(5), [&] {
+            return wave.error || wave.phase == CudaBuffers::WavePhase::packed;
+        }));
+        if (wave.error) std::rethrow_exception(wave.error);
+    }
+    static void fail_parked_wave_build(CudaBuffers& buffers) {
+        // Feed invalid counts to the worker itself to exercise its catch path.
+        // It is parked with no outstanding DMA and no final gather for this epoch.
+        wait_wave_packed(buffers);
+        auto& wave = buffers.down_wave_;
+        std::unique_lock<std::mutex> lock(wave.mutex);
+        require(!wave.final_gather && !wave.busy);
+        wave.counts.front() = std::numeric_limits<std::size_t>::max();
+        wave.phase = CudaBuffers::WavePhase::build;
+        wave.changed.notify_all();
+        require(wave.changed.wait_for(lock, std::chrono::seconds(5), [&] { return bool(wave.error); }));
+    }
     static void require_no_batch_staging(const CudaBuffers& buffers) {
         require(!buffers.cpu_scatter_staging_.ptr && !buffers.cpu_route_weights_staging_.ptr);
     }
@@ -747,6 +768,116 @@ static void test_threaded_dynamic_reuse(bool reserve_at_startup, bool cuda) {
         throw std::runtime_error("expected one scatter worker to pack all dynamic generations");
 }
 
+static void test_down_wave_publication(bool cuda, bool inject_failure = false) {
+    ProxyConfig c;
+    c.mock_mode = !cuda;
+    c.router_routing_enabled = c.router_dynamic_routing_enabled = c.nvlink_forwarding_enabled = true;
+    c.nvlink_forward_completion_notifications_enabled = true;
+    c.num_nodes = 1;
+    c.num_gpus_per_node = c.router_num_experts = 2;
+    c.router_top_k = 1;
+    c.num_tokens = c.expert_gemm_m_tile = 4;
+    c.token_dimension = c.expert_gemm_dimension = c.expert_gemm_n_tile = 1;
+    c.dtype = DataType::kBF16;
+    const auto destroy = [&](void* stream) { destroy_cuda_stream(stream, c.mock_mode); };
+    std::unique_ptr<void, decltype(destroy)> consumer(create_cuda_stream(0, true, c.mock_mode), destroy);
+    const auto stream = cuda ? reinterpret_cast<uintptr_t>(consumer.get()) : uintptr_t{1};
+    constexpr std::size_t words = 64;
+    int32_t mock[words];
+    auto* destination = mock;
+#if RDMA_PROXY_HAVE_CUDA
+    std::unique_ptr<void, decltype(&cudaFree)> managed(nullptr, cudaFree);
+    if (cuda) {
+        void* allocation = nullptr;
+        require(cudaMallocManaged(&allocation, sizeof(mock)) == cudaSuccess);
+        managed.reset(allocation);
+        destination = static_cast<int32_t*>(allocation);
+    }
+#endif
+    const DownWaveGeometry geometry{2, 2, 1, 3};
+    CudaBuffers buffers(c);
+    buffers.initialize();
+    const auto install = [&](uint64_t epoch, std::size_t per_source) {
+        std::vector<RouterExpertMetadata> metadata;
+        for (int source = 0; source < 2; ++source) {
+            auto& m = metadata.emplace_back();
+            m.destination_node_rank = m.destination_gpu_index = m.source_node_rank = 0;
+            m.source_gpu_index = source;
+            m.num_nodes = m.experts_per_gpu = m.top_k = 1;
+            m.num_gpus_per_node = m.num_experts = 2;
+            m.num_tokens = c.num_tokens;
+            for (std::size_t i = 0; i < per_source; ++i) m.expert_token_indices.push_back(i);
+            m.expert_offsets = {0, static_cast<int32_t>(per_source)};
+        }
+        buffers.install_iteration_expert_metadata(std::move(metadata), epoch);
+    };
+    const auto verify = [&](std::size_t total) {
+        std::vector<int32_t> expected(words, -1);
+        build_down_wave_schedule(geometry, {total}, expected.data(), sizeof(mock));
+        synchronize_cuda_stream(consumer.get(), c.mock_mode);
+        require(std::equal(expected.begin(), expected.end(), destination));
+    };
+    auto& stats = buffers.router_notification_publication_buffers();
+    install(0, 4);
+    const auto reserve = [&] {
+        buffers.configure_down_wave_schedule(reinterpret_cast<uintptr_t>(destination), words, geometry);
+    };
+    reserve();
+    rejects(reserve);
+    std::fill_n(destination, words, -1);
+    rejects([&] { buffers.start_down_wave_schedule(0, {7}); });
+    const auto first = buffers.start_down_wave_schedule(0, {8});
+    rejects([&] { buffers.start_down_wave_schedule(0, {8}); });
+    CpuScatterTestAccess::wait_wave_packed(buffers);
+    buffers.begin_router_notification_iteration(0);
+    buffers.process_router_notification_completion(0, 0, 0, 0, 4);
+    require(buffers.router_computation_scheduler_state().published_rows == 1);
+    rejects([&] { buffers.wait_down_wave_schedule(0, stream, 1); });
+    require(stats.down_wave_copy_count == 0);
+    buffers.process_router_notification_completion(0, 1, 0, 0, 4);
+    buffers.wait_down_wave_schedule(0, stream, 5000);
+    verify(8);
+    buffers.flush_router_notification_publication();  // Repeating the final prefix cannot rearm DMA.
+    require(stats.down_wave_copy_count == 1 && stats.down_wave_copy_bytes == first.bytes);
+
+    install(1, 0);
+    rejects([&] { buffers.wait_down_wave_schedule(0, stream, 10); });
+    require(buffers.start_down_wave_schedule(1, {0}).bytes == 0);
+    buffers.begin_router_notification_iteration(1);
+    buffers.wait_down_wave_schedule(1, stream, 5000);
+    require(stats.down_wave_copy_count == 1);
+
+    install(2, 1);
+    buffers.start_down_wave_schedule(2, {2});
+    CpuScatterTestAccess::wait_wave_packed(buffers);
+    auto waiter = std::async(std::launch::async, [&] {
+        rejects([&] { buffers.wait_down_wave_schedule(2, stream, 5000); });
+    });
+    install(3, 2);  // Cancel a packed schedule before final gather submission.
+    waiter.get();
+    std::fill_n(destination, words, -1);
+    buffers.begin_router_notification_iteration(3);
+    for (int source = 0; source < 2; ++source)
+        buffers.process_router_notification_completion(0, source, 3, 0, 4);
+    const auto late = buffers.start_down_wave_schedule(3, {4});
+    buffers.wait_down_wave_schedule(3, stream, 5000);
+    verify(4);
+    require(stats.down_wave_copy_count == 2 && stats.down_wave_copy_bytes == first.bytes + late.bytes);
+
+    install(4, 1);
+    buffers.start_down_wave_schedule(4, {2});
+    if (inject_failure) {
+        CpuScatterTestAccess::fail_parked_wave_build(buffers);
+        rejects([&] { buffers.wait_down_wave_schedule(4, stream, 10); });
+        rejects([&] { buffers.start_down_wave_schedule(4, {2}); });
+        rejects([&] { buffers.retire_borrowed_expert_metadata(); });
+    }
+    buffers.stop_down_wave_worker();
+    buffers.retire_borrowed_expert_metadata();  // Shutdown must retire borrowed metadata after a failure.
+    rejects([&] { buffers.wait_down_wave_schedule(4, stream, 10); });
+    require(stats.down_wave_copy_count == 2);
+}
+
 int main(int argc, char** argv) {
     const bool cuda = argc == 2 && std::string(argv[1]) == "--cuda";
     if (cuda) {
@@ -767,7 +898,9 @@ int main(int argc, char** argv) {
     run(false, 128, cuda, 1, 2, false, 0, true);
     test_threaded_dynamic_reuse(true, cuda);
     test_threaded_dynamic_reuse(false, cuda);
+    test_down_wave_publication(cuda);
     if (!cuda) {
+        test_down_wave_publication(false, true);
         run(false, 128, false, 1, 2, false, 1); // busy reset and worker failure
         run(false, 128, false, 1, 2, false, 2); // destructor joins a busy worker
     }

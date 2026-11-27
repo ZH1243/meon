@@ -14,12 +14,14 @@ checks, then prevent additive results leaking into the next iteration.
 
 import argparse
 import importlib.util
+import inspect
 import math
 import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 
 PYTHON_DIR = Path(__file__).resolve().parents[2] / "python"
@@ -194,9 +196,21 @@ class CompositionCudaTests(unittest.TestCase):
     def test_end_of_iteration_reset_preserves_unweighted_composition(self):
         self._composition(128, 4, output_reset="end-of-iteration")
 
+    def test_hopper_down_wave_schedule_after_up_submission(self):
+        if self.arch != 9:
+            self.skipTest("requires Hopper")
+        self._composition(128, 4, policy="distinct", preparation="threaded",
+                          output_reset="end-of-iteration", defer_wave_schedule=True)
+
+    def test_hopper_reuses_packed_down_wave_schedule(self):
+        if self.arch != 9:
+            self.skipTest("requires Hopper")
+        self._composition(128, 4, policy="distinct", preparation="threaded",
+                          output_reset="end-of-iteration", defer_wave_schedule=True, external_waves=True)
+
     def _composition(self, tile_m, sm_count, policy=None, preparation="gpu",
                      publication_default=False, up_sm_counts=None, output_reset="before-down",
-                     pooled=False):
+                     pooled=False, defer_wave_schedule=False, external_waves=False):
         torch = self.torch
         single_upload = preparation in ("deferred", "threaded")
         root = Path(os.environ.get("QUACK_ROOT", PYTHON_DIR.parents[1] / "quack_for_communication_overlap"))
@@ -205,6 +219,10 @@ class CompositionCudaTests(unittest.TestCase):
         from quack.cute_dsl_utils import get_max_active_clusters
         from run.final_combine import FinalCombine
         import cuda.bindings.driver as cuda
+        if external_waves:
+            from run.hopper_pregather_gemm import prepare_grouped_inputs
+            if "external_wave_schedule" not in inspect.signature(prepare_grouped_inputs).parameters:
+                self.skipTest("requires QuACK external_wave_schedule support")
 
         torch.manual_seed(134)
         tile_n, cluster_m, hidden, intermediate = 128, 2, 384, 256
@@ -330,7 +348,7 @@ class CompositionCudaTests(unittest.TestCase):
         # Keep the warmup runner as an independent GPU producer of reference
         # addresses. Only the refreshed runner consumes the threaded upload.
         reference_down = down
-        if preparation == "threaded":
+        if preparation == "threaded" and not defer_wave_schedule:
             down = worker.DownProjectionRunner(torch, up, expert_counts, options,
                                                trace_configure=configure_trace, previous=reference_down)
         combine = FinalCombine(compact, indices, input_rows, hidden, tile_n=tile_n, num_ctas=2,
@@ -353,8 +371,20 @@ class CompositionCudaTests(unittest.TestCase):
         pinned_metadata = None
         publication_up_done = None
         metadata_ready = torch.cuda.Event()
+        published_epoch = None
+        wave_views = None
+        if external_waves:
+            # The eager QuACK table is an independent oracle. Exercise one upload
+            # from pinned storage after final gather publication on each refresh.
+            work, prefix = down.inputs.gather_work_table, down.inputs.wave_ready_prefix
+            pinned_wave = torch.cat((work.flatten().cpu(), prefix.cpu())).pin_memory()
+            wave_slab = torch.empty_like(pinned_wave, device=up.output.device)
+            wave_views = (wave_slab[:work.numel()].view_as(work), wave_slab[work.numel():])
+            gather_flushed, wave_ready = torch.cuda.Event(), torch.cuda.Event()
+            wave_stream = torch.cuda.Stream()
 
-        def publish():
+        def publish(iteration=None):
+            nonlocal published_epoch
             # H2D copies use copy engines: a spinning full-SM up GEMM cannot
             # starve a CUDA fill kernel needed to publish its own readiness.
             with torch.inference_mode(), torch.cuda.stream(publication):
@@ -380,6 +410,12 @@ class CompositionCudaTests(unittest.TestCase):
                                                                           non_blocking=True)
                     table[index:index + 1].copy_(pinned_table[index:index + 1], non_blocking=True)
                     ready.copy_(count, non_blocking=True)
+                if external_waves and iteration is not None:
+                    gather_flushed.record(publication)
+                    with torch.cuda.stream(wave_stream):
+                        wave_stream.wait_event(gather_flushed)
+                        wave_slab.copy_(pinned_wave, non_blocking=True)
+                        wave_ready.record(wave_stream)
                 if pinned_metadata is not None:
                     # Intentionally defer metadata beyond ALL up computation.
                     # Gathering readiness can no longer imply metadata visibility.
@@ -388,10 +424,20 @@ class CompositionCudaTests(unittest.TestCase):
                     # Recording is submitted before the consumer stream waits;
                     # otherwise a reused event could observe a previous iteration.
                     metadata_ready.record(publication)
+                    published_epoch = iteration
+
+        def wait_for_scatter(iteration, *, stream):
+            self.assertEqual(published_epoch, iteration)
+            stream.wait_event(metadata_ready)
 
         publish()
         publication.synchronize()
         for iteration in range(3):
+            if defer_wave_schedule:
+                down = worker.DownProjectionRunner(torch, up, expert_counts, options,
+                                                   trace_configure=configure_trace, previous=down,
+                                                   defer_wave_schedule=True, external_wave_schedule=wave_views)
+                self.assertIsNone(down.inputs)
             if up_sm_counts is not None:
                 up.sm_count = up_sm_counts[iteration]
                 self.assertEqual(options.down_sm_count, sm_count)
@@ -420,8 +466,6 @@ class CompositionCudaTests(unittest.TestCase):
                     pinned_route_weights = torch.tensor(expected_values, dtype=torch.float32).pin_memory()
                 if single_upload:
                     pinned_metadata = reference_down.cpu_scatter_metadata.cpu().pin_memory()
-                    self.assertEqual(down.inputs.scatter_row_addresses.data_ptr(),
-                                     down.cpu_scatter_metadata.data_ptr())
                     if pinned_route_weights is not None:
                         offset = down.route_weights.data_ptr() - down.cpu_scatter_metadata.data_ptr()
                         self.assertEqual(offset % 16, 0)
@@ -433,10 +477,13 @@ class CompositionCudaTests(unittest.TestCase):
                 up.output.fill_(float("nan"))
                 table.fill_(-1)
                 ready.zero_()
-                down.inputs.wave_store_workspace.zero_()
-                combine.output.fill_(float("nan"))
+                if down.inputs is not None:
+                    down.inputs.wave_store_workspace.zero_()
+                    combine.output.fill_(float("nan"))
                 if down.route_weights is not None:
                     down.route_weights.fill_(float("nan"))
+                if external_waves:
+                    wave_slab.fill_(-1)
                 if single_upload:
                     # Includes invalid addresses and NaN weights. Only the
                     # current-generation slab upload can make down safe to run.
@@ -448,12 +495,29 @@ class CompositionCudaTests(unittest.TestCase):
                 if single_upload:
                     publication_up_done = torch.cuda.Event()
                     publication_up_done.record(producer)
-            publish()
+            publish(iteration)
             with torch.cuda.stream(producer):
                 if single_upload:
-                    down.launch(wait_for_metadata=lambda: producer.wait_event(metadata_ready))
+                    wait = mock.Mock(side_effect=lambda: wait_for_scatter(iteration, stream=producer))
+                    down.launch(wait_for_metadata=wait,
+                                wait_for_wave_schedule=(lambda: producer.wait_event(wave_ready))
+                                if external_waves else None)
+                    wait.assert_called_once_with()
+                    self.assertEqual(down.inputs.scatter_row_addresses.data_ptr(),
+                                     down.cpu_scatter_metadata.data_ptr())
+                    if external_waves:
+                        self.assertEqual(down.inputs.gather_work_table.data_ptr(), wave_views[0].data_ptr())
+                        self.assertEqual(down.inputs.wave_ready_prefix.data_ptr(), wave_views[1].data_ptr())
                 else:
                     down.launch()
+            if defer_wave_schedule:
+                # FinalCombine captures the ready-prefix pointer at construction.
+                # Each refreshed down runner owns a fresh GPU workspace.
+                combine = FinalCombine(compact, indices, input_rows, hidden, tile_n=tile_n, num_ctas=2,
+                                       register_prefetch=True, ready_groups=down.inputs.ready_groups)
+                with torch.inference_mode():
+                    combine.output.fill_(float("nan"))
+                consumer.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(consumer):
                 combine()  # Acquires GPU ready prefixes while down stores continue.
             producer.synchronize()

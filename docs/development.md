@@ -326,7 +326,39 @@ ctest --test-dir build/mock --output-on-failure
 ctest --test-dir build/mock -R '^test_iteration_control$' --repeat until-fail:10 --output-on-failure
 ```
 
-The two-node launchers enable the QuACK down gather table, expert waves and ready publication. With dynamic routing, the worker builds a fresh down schedule from the current expert counts before submitting up-GEMM. Set `QUACK_ROOT` on both hosts to the checkout containing `run.wave_ready.build_expert_wave_schedule`. It packs the four integers in each descriptor into a CPU tensor and tracks each column group's last wave as it orders the descriptors. This work falls within `r_ready_to_up_submit_us`, after local route installation.
+The two-node launchers enable the QuACK down gather table, expert waves and ready publication. Rebuild the meon shared library and set `QUACK_ROOT` to the updated checkout on both hosts. For the profile 15 arguments, look for `Native down-wave schedule reserved` during initialization. With an older native library or QuACK helper, the worker uses the previous schedule path.
+
+For iterations 1–4, identify the final up-table ready-row publication on the native publication stream and the subsequent packed down-schedule H2D. The CPU scatter upload has a separate event and can also appear on that stream. For the example counts below the schedule transfer is 385,936 bytes. Compare local staging gather completion to up-GEMM start (profile 15 median **6.68 ms**), gather completion to the first ready-row publication (**7.30 ms**), and full iteration time (**61.26 ms**). Also check whether any remaining setup extends past up completion. A two-node Hopper run is needed to measure the change.
+
+Local checks for this change used an Apple M1 Max on macOS 15.6.1 with CPU PyTorch 1.13.1. From the meon checkout:
+
+```bash
+OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python
+cmake -S . -B build/mock -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/mock -j4
+ctest --test-dir build/mock --output-on-failure
+ctest --test-dir build/mock -R '^(test_down_wave_schedule|test_cpu_scatter)$' --repeat until-fail:10 --output-on-failure
+ctest --test-dir build/exchange-host --output-on-failure
+(cd ../quack_for_communication_overlap && PYTHONDONTWRITEBYTECODE=1 /Users/zhuhao/opt/anaconda3/bin/python3 -m pytest --noconftest -q tests/test_wave_ready_prefix.py -p no:cacheprovider)
+```
+
+The native lifecycle regression also passed with ThreadSanitizer on this host. The builder regression passed with AddressSanitizer and UndefinedBehaviorSanitizer.
+
+```bash
+cmake -S . -B /private/tmp/meon-down-wave-thread-sanitizer -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS=-fsanitize=thread
+cmake --build /private/tmp/meon-down-wave-thread-sanitizer --target test_cpu_scatter -j6
+ctest --test-dir /private/tmp/meon-down-wave-thread-sanitizer -R '^test_cpu_scatter$' --output-on-failure
+c++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -g -O1 -fsanitize=undefined,address -fno-omit-frame-pointer -I native/include native/src/down_wave_schedule.cpp tests/native/test_down_wave_schedule.cpp -o /private/tmp/meon_down_wave_asan
+/private/tmp/meon_down_wave_asan
+```
+
+On a single Hopper GPU with `QUACK_ROOT` set and the CUDA Debug build available, these regressions exercise packed-slab reuse, GPU event ordering, weighted down output and final combine.
+
+```bash
+ctest --test-dir "${RDMA_PROXY_BUILD_DIR:-build-hopper}" -R '^test_cpu_scatter_cuda$' --output-on-failure
+PYTHONPATH=tests/python python -m unittest -v \
+  test_worker_composition.CompositionCudaTests.test_hopper_reuses_packed_down_wave_schedule
+```
 
 These commands check the schedule on CPU and time construction for node 0, GPU 0 of the 20,480-token H800 run.
 

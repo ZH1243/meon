@@ -148,9 +148,10 @@ class DynamicRoutingTests(unittest.TestCase):
         seen = []
         exchange.down = SimpleNamespace(intra_node_combine=SimpleNamespace(
             refresh_routes=lambda: seen.append(exchange.down.cpu_scatter_counts.tolist())))
-        inputs = SimpleNamespace(output_buffers=lambda: exchange.outputs)
         for counts in ([2, 0], [0, 1]):
-            down = SimpleNamespace(inputs=inputs, cpu_scatter_counts=torch.tensor(counts))
+            # A deferred down runner exposes its registered outputs before QuACK builds its inputs.
+            down = SimpleNamespace(inputs=None, output_buffers=lambda: exchange.outputs,
+                                   cpu_scatter_counts=torch.tensor(counts))
             exchange.bind_down(down)
             self.assertIs(exchange.down, down)
             self.assertEqual(exchange.rows_host.tolist(), counts)

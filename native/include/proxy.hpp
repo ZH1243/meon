@@ -54,6 +54,10 @@ public:
     float router_computation_elapsed_ms(uint64_t iteration);
     std::size_t router_computation_num_tokens() const;
     void reserve_threaded_cpu_scatter(std::size_t address_columns);
+    std::size_t down_wave_capacity_words(const DownWaveGeometry& geometry) const;
+    void configure_down_wave_schedule(const DownWaveGeometry& geometry, uintptr_t slab, uint64_t words);
+    DownWaveLayout start_down_wave_schedule(uint64_t iteration, const uint64_t* counts, uint64_t num_experts);
+    void wait_down_wave_schedule(uint64_t iteration, uintptr_t stream, uint64_t timeout_ms);
     void configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config);
     void configure_cpu_route_weights(uintptr_t packed_weights, std::size_t routes);
     void configure_cpu_scatter_deferred(std::size_t bytes);

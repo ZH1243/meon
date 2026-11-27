@@ -42,6 +42,34 @@ typedef struct RdmaProxyCpuScatterConfig {
  */
 typedef struct RdmaProxyHandle RdmaProxyHandle;
 
+/* Optional expert-wave schedule for dynamic routing with gather-ready publication.
+ * Geometry matches the down kernel: M rows per cluster, N column groups, work
+ * IDs per group, and maximum resident cluster count (including the SM budget).
+ * During startup, query the capacity in int32 words, then configure once on an
+ * idle handle with generation zero installed. The caller owns the contiguous
+ * device allocation through shutdown. The proxy owns the pinned staging slab. */
+typedef struct RdmaProxyDownWaveGeometry {
+    uint64_t struct_size, cluster_rows, num_groups, group_size, max_wave_work_ids;
+} RdmaProxyDownWaveGeometry;
+RDMA_PROXY_C_API int rdma_proxy_get_down_wave_capacity(
+    RdmaProxyHandle* handle, const RdmaProxyDownWaveGeometry* geometry, uint64_t* capacity_words);
+RDMA_PROXY_C_API int rdma_proxy_configure_down_wave_schedule(
+    RdmaProxyHandle* handle, const RdmaProxyDownWaveGeometry* geometry, uintptr_t device_slab,
+    uint64_t capacity_words);
+/* Start after installing this route and before prepare_iteration. The call
+ * copies the counts synchronously. The allocation contains int32[table_rows,4] followed
+ * immediately by int32[prefix_entries]. Empty routes return two zero lengths.
+ * After the final up-gather publication is enqueued, the native worker submits
+ * one H2D transfer of the live payload and records this generation's event. */
+RDMA_PROXY_C_API int rdma_proxy_start_down_wave_schedule(
+    RdmaProxyHandle* handle, uint64_t iteration, const uint64_t* counts, uint64_t num_experts,
+    uint64_t* table_rows, uint64_t* prefix_entries);
+/* Wait on the host for this iteration's event record (timeout_ms > 0), then
+ * enqueue a wait on the nonzero consumer stream. Keep the publisher running.
+ * Join all device readers before replacing the route or releasing the slab. */
+RDMA_PROXY_C_API int rdma_proxy_wait_down_wave_schedule(
+    RdmaProxyHandle* handle, uint64_t iteration, uintptr_t cuda_stream, uint64_t timeout_ms);
+
 /* Optional startup reservation for threaded CPU scatter with dynamic routing.
  * Call on an initialized handle before preparing or installing generation zero.
  * address_columns is 1 for row-major output and 2 for N-tile-major output.

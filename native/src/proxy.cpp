@@ -879,6 +879,40 @@ void Proxy::reserve_threaded_cpu_scatter(std::size_t address_columns) {
     cuda_buffers_.reserve_threaded_cpu_scatter(address_columns);
 }
 
+std::size_t Proxy::down_wave_capacity_words(const DownWaveGeometry& geometry) const {
+    if (!initialized_) throw std::runtime_error("down wave sizing requires an initialized proxy");
+    const auto routes = cuda_buffers_.dynamic_computation_route_capacity();
+    const auto experts = config_.router_num_experts / (config_.num_nodes * config_.num_gpus_per_node);
+    return down_wave_capacity(geometry, routes, experts).bytes / sizeof(int32_t);
+}
+
+void Proxy::configure_down_wave_schedule(const DownWaveGeometry& geometry, uintptr_t slab, uint64_t words) {
+    if (iteration_prepared_ || words > std::numeric_limits<std::size_t>::max() / sizeof(int32_t) ||
+        words < down_wave_capacity_words(geometry))
+        throw std::runtime_error("down wave reservation requires an idle proxy and a full-capacity slab");
+    cuda_buffers_.configure_down_wave_schedule(slab, static_cast<std::size_t>(words), geometry);
+}
+
+DownWaveLayout Proxy::start_down_wave_schedule(uint64_t iteration, const uint64_t* counts, uint64_t num_experts) {
+    auto lock = lock_forwarding_routes();
+    const auto experts = config_.router_num_experts / (config_.num_nodes * config_.num_gpus_per_node);
+    if (!initialized_ || !counts || num_experts != static_cast<uint64_t>(experts) || iteration_prepared_ ||
+        routing_failed_ || routing_iteration_ != iteration || iteration != completed_routing_iterations_.load())
+        throw std::runtime_error("down wave start requires the current idle route and its local expert counts");
+    std::vector<std::size_t> snapshot;
+    snapshot.reserve(num_experts);
+    for (std::size_t i = 0; i < num_experts; ++i) {
+        if (counts[i] > std::numeric_limits<int32_t>::max())
+            throw std::runtime_error("down wave expert count exceeds the descriptor range");
+        snapshot.push_back(static_cast<std::size_t>(counts[i]));
+    }
+    return cuda_buffers_.start_down_wave_schedule(iteration, snapshot);
+}
+
+void Proxy::wait_down_wave_schedule(uint64_t iteration, uintptr_t stream, uint64_t timeout_ms) {
+    cuda_buffers_.wait_down_wave_schedule(iteration, stream, timeout_ms);
+}
+
 void Proxy::configure_cpu_scatter(const RdmaProxyCpuScatterConfig& config) {
     if (!initialized_ || iteration_prepared_)
         throw std::runtime_error("CPU scatter requires initialized idle proxy");
@@ -1195,11 +1229,18 @@ void Proxy::shutdown() {
         stop_forwarding_thread();
     } catch (...) {
         // Forwarding producers have already joined before fallible CUDA/IPC
-        // cleanup. Honor borrowed scatter-buffer lifetime even on that error.
+        // cleanup. Drain writes to borrowed metadata even on that error.
         try { cuda_buffers_.stop_cpu_scatter_worker(); } catch (...) {}
+        try { cuda_buffers_.stop_down_wave_worker(); } catch (...) {}
         throw;
     }
-    cuda_buffers_.stop_cpu_scatter_worker();
+    try {
+        cuda_buffers_.stop_cpu_scatter_worker();
+    } catch (...) {
+        try { cuda_buffers_.stop_down_wave_worker(); } catch (...) {}
+        throw;
+    }
+    cuda_buffers_.stop_down_wave_worker();
     if (benchmark_expert_lists_borrowed_) {
         cuda_buffers_.retire_borrowed_expert_metadata();
         benchmark_expert_lists_borrowed_ = false;

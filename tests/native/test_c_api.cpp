@@ -51,12 +51,23 @@ void check_dynamic_rank(int gpu, const std::string& run_id, const std::string& p
     auto require = [](bool success) {
         if (!success) throw std::runtime_error(std::string("dynamic routing ABI: ") + rdma_proxy_last_error());
     };
+    // Outlive the proxy, including teardown on a failed assertion.
+    std::vector<int32_t> down_schedule;
     std::unique_ptr<RdmaProxyHandle, decltype(&rdma_proxy_destroy)> owner(
         rdma_proxy_create(sizeof(args) / sizeof(args[0]), args), rdma_proxy_destroy);
     auto* handle = owner.get();
     int32_t enabled = 0;
     require(handle && rdma_proxy_dynamic_routing_enabled(handle, &enabled) == 0 && enabled == 1);
     require(rdma_proxy_initialize(handle) == 0);
+    RdmaProxyDownWaveGeometry geometry{sizeof(RdmaProxyDownWaveGeometry), 7, 3, 2, 8};
+    uint64_t words = 0;
+    require(rdma_proxy_get_down_wave_capacity(handle, nullptr, &words) != 0);
+    --geometry.struct_size;
+    require(rdma_proxy_get_down_wave_capacity(handle, &geometry, &words) != 0);
+    ++geometry.struct_size;
+    require(rdma_proxy_get_down_wave_capacity(handle, &geometry, &words) == 0 && words);
+    down_schedule.assign(words + 1, -99);
+    const auto slab = reinterpret_cast<uintptr_t>(down_schedule.data());
     const int32_t address_columns = gpu + 1;  // Exercise both supported layouts.
     require(rdma_proxy_reserve_threaded_cpu_scatter(handle, 0) != 0 && *rdma_proxy_last_error());
     require(rdma_proxy_reserve_threaded_cpu_scatter(handle, 3) != 0 && *rdma_proxy_last_error());
@@ -83,6 +94,19 @@ void check_dynamic_rank(int gpu, const std::string& run_id, const std::string& p
     for (uint64_t i = 0; i < 3; ++i) {
         require(rdma_proxy_prepare_routing(handle, i + 1) != 0);
         require(rdma_proxy_prepare_routing(handle, i) == 0 && rdma_proxy_prepare_routing(handle, i) == 0);
+        if (!i) {
+            require(rdma_proxy_configure_down_wave_schedule(handle, &geometry, slab, words - 1) != 0);
+            require(rdma_proxy_configure_down_wave_schedule(handle, &geometry, slab, words) == 0);
+        }
+        std::array<uint64_t, 2> down_counts{};
+        uint64_t num_local_experts = 0, down_rows = 0, prefix_entries = 0;
+        require(rdma_proxy_get_computation_expert_counts(handle, down_counts.data(), down_counts.size(),
+                                                        &num_local_experts) == 0 && num_local_experts == 2);
+        require(rdma_proxy_start_down_wave_schedule(handle, i + 1, down_counts.data(), num_local_experts,
+                                                    &down_rows, &prefix_entries) != 0);
+        require(rdma_proxy_start_down_wave_schedule(handle, i, down_counts.data(), num_local_experts,
+                                                    &down_rows, &prefix_entries) == 0);
+        require(down_rows && prefix_entries && 4 * down_rows + prefix_entries <= words);
         require(rdma_proxy_reserve_threaded_cpu_scatter(handle, address_columns) != 0 && *rdma_proxy_last_error());
         require(rdma_proxy_get_routing_extents(handle, &indices, &table_rows) == 0 && indices && table_rows);
         std::vector<int32_t> experts(2 * capacity);
@@ -143,6 +167,8 @@ void check_dynamic_rank(int gpu, const std::string& run_id, const std::string& p
         require(rdma_proxy_prepare_iteration(handle, i) == 0);
         require(build_rows(handle) != 0 && build_inter(handle) != 0);
         require(rdma_proxy_run_iteration(handle, i) == 0);
+        require(rdma_proxy_wait_down_wave_schedule(handle, i, 1, 5000) == 0);
+        require(down_schedule[4 * down_rows + prefix_entries - 1] == 3 && down_schedule.back() == -99);
         require(build_rows(handle) != 0 && build_inter(handle) != 0);  // Completed generation.
     }
     require(rdma_proxy_finish(handle) == 0 && rdma_proxy_shutdown(handle) == 0);

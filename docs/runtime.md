@@ -1951,6 +1951,8 @@ warmup uses its synthetic destinations. This optimization requires the
 `run.hopper_pregather_gemm.prepare_grouped_inputs`. With an older checkout,
 meon uses the existing scatter-mapping setup.
 
+With the `external_wave_schedule` QuACK keyword and the optional native down-wave functions, the worker also reserves an int32 slab on the GPU and a matching pinned host slab for the down work table and wave-ready prefixes. This applies to refreshed nonempty dynamic routes with threaded scatter and down ready publication. Each iteration packs four int32 values per table row and one int32 per wave prefix. The prefix starts immediately after the live table, so one asynchronous copy transfers both arrays. For the 20,480-token H800 configuration with eight local experts, 192 M rows per cluster, 28 N groups and 124 resident clusters, each capacity allocation is 6,144,808 bytes per proxy. The mutable wave counters have separate storage. [Down-wave API and lifetimes](../include/rdma_proxy_c_api.h)
+
 With dynamic routing and threaded publication, the torchrun worker reserves one
 pinned host buffer during setup, even when the first generation has zero routes.
 Its maximum assignment count is `active_sources * num_tokens * min(top_k, experts_per_gpu)`.

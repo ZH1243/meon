@@ -52,6 +52,8 @@ public:
     bool prepare_early_up(uint64_t iteration, uintptr_t stream);
     void cancel_early_up(uint64_t iteration) { cuda_buffers_.cancel_early_up(iteration); }
     void prepare_local_publication(uint64_t iteration);
+    void bind_native_local_publication(uintptr_t stream, const RdmaProxyCpuScatterConfig* scatter, std::size_t bytes);
+    int native_local_publication_state(uint64_t iteration) const;
     void prepare_iteration_step(uint64_t iteration);
     void run_iteration_step(uint64_t iteration);
     void record_router_computation_end(uint64_t iteration, uintptr_t cuda_stream);
@@ -356,6 +358,8 @@ private:
     void install_iteration_routing(uint64_t iteration, IterationRouteData route,
                                   const RdmaProxyBenchmarkDeviceIndices* device_indices = nullptr,
                                   bool defer_transport = false);
+    bool native_local_publication_supported() const;
+    void try_native_local_publication(uint64_t iteration);
     void prepare_gather_inputs(uint64_t iteration, bool require_early_up);
     bool has_pending_benchmark_transport(uint64_t iteration) const;
     void finish_benchmark_transport(uint64_t iteration);
@@ -434,6 +438,14 @@ private:
     // The exchange's remote x3/x4 are call-scoped. The coordinator owns this
     // snapshot for the one remote peer until it installs the transport tables.
     std::optional<std::vector<std::size_t>> pending_benchmark_receive_indices_;
+    struct LocalPublicationBinding {
+        int state{RDMA_PROXY_LOCAL_INACTIVE};
+        uintptr_t stream{};
+        std::size_t slab_bytes{};
+        RdmaProxyCpuScatterConfig scatter{};
+        std::vector<int32_t> sources;
+        std::vector<uint64_t> bases;
+    } local_publication_binding_;
     std::atomic<uint64_t> completed_routing_iterations_{0};
     bool benchmark_expert_lists_borrowed_{false};
     bool routing_failed_{false};

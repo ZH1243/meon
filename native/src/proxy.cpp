@@ -617,6 +617,7 @@ void Proxy::install_borrowed_benchmark_route_views(uint64_t iteration, const Rdm
         config_.router_local_input_early_ready_enabled && config_.num_nodes == 2 &&
         config_.num_gpus_per_node == 8;
     install_benchmark_routing_impl(iteration, handoff, BenchmarkBorrow::RouteViews, &host_route, device_indices, split);
+    if (split && local_publication_binding_.stream) try_native_local_publication(iteration);
 }
 
 void Proxy::install_benchmark_routing_impl(uint64_t iteration, const RdmaProxyBenchmarkRouting& handoff,
@@ -848,6 +849,80 @@ bool Proxy::prepare_early_up(uint64_t iteration, uintptr_t stream) {
         config_.router_pooled_up_gemm_enabled)
         return false;
     return cuda_buffers_.prepare_early_up(iteration, stream);
+}
+
+bool Proxy::native_local_publication_supported() const {
+    return config_.router_benchmark_metadata_enabled && config_.router_local_input_early_ready_enabled &&
+        config_.expert_gemm_device_capacity == 9 && !config_.router_pooled_up_gemm_enabled &&
+        !config_.router_weighted_contributions_enabled;
+}
+
+int Proxy::native_local_publication_state(uint64_t iteration) const {
+    cuda_buffers_.check_early_up_cancelled();
+    if (!initialized_ || routing_failed_ || routing_iteration_ != iteration)
+        throw std::runtime_error("native local publication requires the installed route");
+    if (!local_publication_binding_.stream)
+        return native_local_publication_supported() ? RDMA_PROXY_LOCAL_UNBOUND : RDMA_PROXY_LOCAL_INACTIVE;
+    return has_pending_benchmark_transport(iteration) ? local_publication_binding_.state : RDMA_PROXY_LOCAL_INACTIVE;
+}
+
+void Proxy::bind_native_local_publication(uintptr_t stream, const RdmaProxyCpuScatterConfig* scatter,
+                                          std::size_t bytes) {
+    cuda_buffers_.check_early_up_cancelled();
+    if (!initialized_ || routing_failed_ || iteration_prepared_ || !stream ||
+        !native_local_publication_supported() ||
+        (scatter != nullptr) != (bytes != 0))
+        throw std::runtime_error("invalid native local-publication binding");
+    if (routing_iteration_ && has_pending_benchmark_transport(*routing_iteration_) &&
+        local_router_input_early_ready_requested_.load(std::memory_order_acquire) == *routing_iteration_ + 1)
+        throw std::runtime_error("cannot replace an active local-publication binding");
+    LocalPublicationBinding next;
+    next.stream = stream;
+    next.slab_bytes = bytes;
+    if (scatter) {
+        if (scatter->struct_size != sizeof(*scatter) || scatter->num_sources == 0 ||
+            scatter->num_sources > static_cast<uint64_t>(config_.num_nodes) * config_.num_gpus_per_node ||
+            !scatter->source_pairs || !scatter->output_bases || !scatter->counts ||
+            !scatter->scatter_addresses || scatter->scatter_addresses % 16 ||
+            bytes > std::numeric_limits<uintptr_t>::max() - scatter->scatter_addresses)
+            throw std::runtime_error("invalid persistent scatter slab or source geometry");
+        next.scatter = *scatter;
+        next.sources.assign(scatter->source_pairs, scatter->source_pairs + 2 * scatter->num_sources);
+        next.bases.assign(scatter->output_bases, scatter->output_bases + scatter->num_sources);
+        next.scatter.source_pairs = nullptr;
+        next.scatter.output_bases = nullptr;
+    }
+    local_publication_binding_ = std::move(next);
+    if (routing_iteration_ && has_pending_benchmark_transport(*routing_iteration_))
+        try_native_local_publication(*routing_iteration_);
+}
+
+void Proxy::try_native_local_publication(uint64_t iteration) {
+    auto& binding = local_publication_binding_;
+    binding.state = RDMA_PROXY_LOCAL_INACTIVE;
+    if (!cuda_buffers_.router_notification_publication_buffers().table_rows) return;
+    if (!local_router_input_staged_) throw std::runtime_error("local benchmark staging is incomplete");
+    try {
+        auto scatter = binding.scatter;
+        const auto row_bytes = (scatter.tile_n ? 2 : 1) * sizeof(int64_t);
+        if (binding.slab_bytes) {
+            scatter.source_pairs = binding.sources.data();
+            scatter.output_bases = binding.bases.data();
+            scatter.routes = cuda_buffers_.router_computation_num_tokens();
+            if (scatter.routes > binding.slab_bytes / row_bytes) {
+                binding.state = RDMA_PROXY_LOCAL_NEEDS_STORAGE;
+                return;
+            }
+        }
+        if (!prepare_early_up(iteration, binding.stream)) return;
+        if (binding.slab_bytes)
+            configure_cpu_scatter_async(scatter, 0, scatter.routes * row_bytes);
+        prepare_local_publication(iteration);
+        binding.state = RDMA_PROXY_LOCAL_REQUESTED;
+    } catch (...) {
+        routing_failed_ = true;
+        throw;
+    }
 }
 
 void Proxy::prepare_gather_inputs(uint64_t iteration, bool require_early_up) {
@@ -1398,6 +1473,7 @@ void Proxy::shutdown() {
         routing_iteration_.reset();
         pending_benchmark_receive_indices_.reset();
     }
+    local_publication_binding_ = {};
     completed_routing_iterations_ = 0;
     dynamic_payload_active_.store(false);
     routing_failed_ = false;

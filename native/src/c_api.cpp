@@ -717,6 +717,28 @@ extern "C" int rdma_proxy_prepare_local_publication(RdmaProxyHandle* handle, uin
     } catch (...) { return record_current_exception(); }
 }
 
+extern "C" int rdma_proxy_bind_native_local_publication(RdmaProxyHandle* handle, uintptr_t stream,
+                                                         const RdmaProxyCpuScatterConfig* scatter, size_t bytes) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || handle->finished)
+            throw std::runtime_error("native local-publication binding requires an initialized proxy");
+        select_proxy_cuda_device(*handle);
+        handle->proxy.bind_native_local_publication(stream, scatter, bytes);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
+extern "C" int rdma_proxy_get_native_local_publication(RdmaProxyHandle* handle, uint64_t iteration, int32_t* state) {
+    clear_error();
+    try {
+        if (!handle || !state || handle->shut_down || handle->finished || iteration != handle->next_iteration)
+            throw std::runtime_error("native local-publication query requires the next unfinished iteration");
+        *state = handle->proxy.native_local_publication_state(iteration);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
 extern "C" int rdma_proxy_cancel_early_up(RdmaProxyHandle* handle, uint64_t iteration) {
     clear_error();
     try {

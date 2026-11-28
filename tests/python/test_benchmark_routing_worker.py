@@ -99,7 +99,8 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
 
     def run_worker(self, *, compute=False, fail_epoch=None, scatter_publication=None,
                    tile_major=True, has_reservation_api=True, rows_per_epoch=(1, 0), down_factory=None,
-                   native_returns=False, early=False, concurrent_publication=False, fail_prepare=False, fail_up=False, fail_local=False):
+                   native_returns=False, early=False, concurrent_publication=False, native_publication=False,
+                   fail_prepare=False, fail_up=False, fail_local=False):
         events, output = [], io.StringIO()
 
         def status(name):
@@ -149,6 +150,33 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
 
             library.rdma_proxy_prepare_local_publication = publish
             library.rdma_proxy_cancel_early_up = cancel
+        bound_bytes = epoch_installed = 0
+        native_state = worker.LOCAL_UNBOUND
+        if native_publication:
+            def bind(handle, stream, scatter, size):
+                nonlocal bound_bytes, native_state
+                test.assertEqual(stream, 42)
+                if scatter is not None:
+                    test.assertEqual(scatter._obj.scatter_addresses, 4096)
+                events.append(("bind-publication", size))
+                bound_bytes = size
+                if native_state == worker.LOCAL_NEEDS_STORAGE:
+                    test.assertGreaterEqual(size, rows_per_epoch[epoch_installed] * 16)
+                    events.append(("native-request", epoch_installed))
+                    native_state = worker.LOCAL_REQUESTED
+                return 0
+
+            def query(handle, epoch, state):
+                test.assertEqual(epoch_installed, epoch)
+                state._obj.value = native_state
+                return 0
+
+            def unexpected_request(*args):
+                test.fail("coordinator issued a duplicate publication request")
+
+            library.rdma_proxy_bind_native_local_publication = bind
+            library.rdma_proxy_get_native_local_publication = query
+            library.rdma_proxy_prepare_local_publication = unexpected_request
         if fail_prepare:
             def prepare(handle, epoch):
                 events.append(("prepare", epoch))
@@ -164,13 +192,22 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
 
         class Provider:
             def __init__(self, lib, handle, torch, device_buffers, *, concurrent_compute):
+                self.device_indices = object() if native_publication else None
                 test.assertIs(device_buffers, buffers)
                 test.assertEqual(concurrent_compute, compute)
                 events.append(("provider",))
 
             def prepare(self, epoch, *, compute_extents=True):
+                nonlocal epoch_installed, native_state
+                epoch_installed = epoch
                 test.assertEqual(compute_extents, compute)
                 events.append(("install", epoch))
+                if native_publication and epoch and rows_per_epoch[epoch]:
+                    if native_returns and bound_bytes < rows_per_epoch[epoch] * 16:
+                        native_state = worker.LOCAL_NEEDS_STORAGE
+                    else:
+                        native_state = worker.LOCAL_REQUESTED
+                        events.append(("native-request", epoch))
                 if epoch == fail_epoch:
                     raise RuntimeError("injected exchange failure")
                 self.last_stats = dict(r_ready_ns=time.perf_counter_ns(), generation_elapsed_ns=1000,
@@ -198,6 +235,8 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
             def launch(self):
                 if not self.empty_epoch:
                     events.append(("up",))
+                    if native_publication and self.epoch and fail_up:
+                        raise RuntimeError("injected up launch failure")
                     if concurrent_publication and self.epoch:
                         test.assertIs(threading.current_thread(), main_thread)
                         submitted.set()
@@ -242,6 +281,18 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                 exchange.bind_down.side_effect = lambda down: setattr(down, "intra_node_combine", intra)
                 stack.enter_context(patch.object(worker, "DownReadyTrace"))
                 lookup = Mock()
+                if native_publication:
+                    lookup.config = worker.CpuScatterConfig(tile_n=4)
+                    lookup.address_storage.data_ptr.return_value = 4096
+
+                    def reserve(up, columns):
+                        lookup.address_storage.numel.return_value = rows_per_epoch[up.epoch] * columns * 8
+                    lookup.reserve_addresses.side_effect = reserve
+
+                    def views(up, rows):
+                        events.append(("views", rows))
+                        return ("registered", rows)
+                    lookup.reserved_views.side_effect = views
                 def register_reserved(library, handle, up, rows):
                     events.append(("scatter", rows))
                     return ("registered", rows)
@@ -297,52 +348,52 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
         self.assertIn("r_ready_to_up_submit_us=", records[0])
         self.assertNotIn("r_ready_to_up_submit_us=", records[1])
 
-    def test_steady_down_schedule_orders_construction_publication_and_consumption(self):
-        def down_factory(events):
-            prepared_options = SimpleNamespace(external_scatter_addresses=True)
+    def down_factory(self, events):
+        prepared_options = SimpleNamespace(external_scatter_addresses=True)
 
-            def create(torch, up, counts, options, *, defer_wave_schedule=False, external_wave_schedule=None,
-                       previous=None, kernel_options=None, registered_scatter=None, **kwargs):
-                self.assertIs(kernel_options, prepared_options if previous is not None else None)
-                rows, = counts
-                events.append(("construct", rows))
-                def configure_scatter(*args, already_registered=False):
-                    if already_registered:
-                        self.assertEqual(registered_scatter, ("registered", rows))
-                    else:
-                        self.assertIsNone(registered_scatter)
-                        events.append(("scatter", rows))
-                clock = Mock()
-                clock.elapsed_time.return_value = 1.0
-                down = SimpleNamespace(
-                    cpu_scatter=bool(rows), cpu_scatter_publication="threaded", combine=True, combine_rows=4,
-                    route_weights=None, kernel_options=prepared_options,
-                    output_reset_policy="before-down", intra_node_combine=None, flops=2 * rows,
-                    reset_start=clock, reset_end=clock, mapping_start=clock, gemm_start=clock, end=clock,
-                    warmup=lambda: None,
-                    configure_cpu_scatter=configure_scatter,
-                    wait_cpu_scatter_ready=lambda epoch: events.append(("wait-scatter", epoch)),
-                )
-                if not defer_wave_schedule:
+        def create(torch, up, counts, options, *, defer_wave_schedule=False, external_wave_schedule=None,
+                   previous=None, kernel_options=None, registered_scatter=None, **kwargs):
+            self.assertIs(kernel_options, prepared_options if previous is not None else None)
+            rows, = counts
+            events.append(("construct", rows))
+            def configure_scatter(*args, already_registered=False):
+                if already_registered:
+                    self.assertEqual(registered_scatter, ("registered", rows))
+                else:
+                    self.assertIsNone(registered_scatter)
+                    events.append(("scatter", rows))
+            clock = Mock()
+            clock.elapsed_time.return_value = 1.0
+            down = SimpleNamespace(
+                cpu_scatter=bool(rows), cpu_scatter_publication="threaded", combine=True, combine_rows=4,
+                route_weights=None, kernel_options=prepared_options,
+                output_reset_policy="before-down", intra_node_combine=None, flops=2 * rows,
+                reset_start=clock, reset_end=clock, mapping_start=clock, gemm_start=clock, end=clock,
+                warmup=lambda: None,
+                configure_cpu_scatter=configure_scatter,
+                wait_cpu_scatter_ready=lambda epoch: events.append(("wait-scatter", epoch)),
+            )
+            if not defer_wave_schedule:
+                events.append(("schedule", rows))
+
+            def launch(wait_for_metadata, wait_for_wave_schedule, before_combine):
+                if wait_for_metadata:
+                    wait_for_metadata()
+                if defer_wave_schedule and rows and external_wave_schedule is None:
                     events.append(("schedule", rows))
+                if wait_for_wave_schedule:
+                    self.assertEqual(external_wave_schedule, ("table", rows))
+                    wait_for_wave_schedule()
+                events.append(("down", rows))
+                if before_combine is not None:
+                    before_combine()
+                    events.append(("combine", rows))
 
-                def launch(wait_for_metadata, wait_for_wave_schedule, before_combine):
-                    if wait_for_metadata:
-                        wait_for_metadata()
-                    if defer_wave_schedule and rows and external_wave_schedule is None:
-                        events.append(("schedule", rows))
-                    if wait_for_wave_schedule:
-                        self.assertEqual(external_wave_schedule, ("table", rows))
-                        wait_for_wave_schedule()
-                    events.append(("down", rows))
-                    if before_combine is not None:
-                        before_combine()
-                        events.append(("combine", rows))
+            down.launch = launch
+            return down
+        return create
 
-                down.launch = launch
-                return down
-            return create
-
+    def test_steady_down_schedule_orders_construction_publication_and_consumption(self):
         rows_per_epoch = (1, 3, 0, 2)
         for native, native_returns, early, concurrent in (
                 (False, False, False, False), (True, False, False, False), (True, True, False, False),
@@ -355,7 +406,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
 
                     fake.start = submit
                     fake.wait = lambda epoch, stream: events.append(("wait-schedule", epoch, stream.cuda_stream))
-                    return down_factory(events)
+                    return self.down_factory(events)
 
                 fake = SimpleNamespace()
                 with patch("down_wave_schedule.DownWaveSchedule.reserve_if_supported",
@@ -438,6 +489,35 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                     else:
                         self.assertLess(schedule, up)
                     self.assertLess(schedule, consumed)
+
+    def test_native_install_publication_grows_once_and_reuses_the_slab(self):
+        schedule = Mock()
+        schedule.start.side_effect = lambda epoch, counts: ("table", counts[0])
+        with patch("down_wave_schedule.DownWaveSchedule.reserve_if_supported", return_value=schedule):
+            events, output = self.run_worker(compute=True, early=True, native_publication=True,
+                                             scatter_publication="threaded", native_returns=True,
+                                             rows_per_epoch=(1, 3, 0, 2), down_factory=self.down_factory)
+        self.assertEqual([e for e in events if e[0] == "bind-publication"],
+                         [("bind-publication", 16), ("bind-publication", 48)])
+        self.assertEqual(output.count("native_local_publication=1"), 2)
+        self.assertEqual(output.count("native_local_publication_growth=1"), 1)
+        self.assertNotIn("submit_to_request_us=", output)
+        self.assertEqual(output.count("scatter_views_us="), 2)
+        self.assertEqual([e for e in events if e[0] == "scatter"], [("scatter", 1)])
+        self.assertFalse(any(e[0] == "early-reset" for e in events))
+        for epoch, rows in ((1, 3), (3, 2)):
+            request = events.index(("native-request", epoch))
+            self.assertLess(request, events.index(("up",), events.index(("install", epoch))))
+            self.assertLess(request, events.index(("views", rows)))
+            self.assertLess(request, events.index(("start-maps", epoch)))
+            self.assertLess(events.index(("wait-scatter", epoch)), events.index(("down", rows)))
+
+    def test_native_up_only_failure_cancels_before_join(self):
+        events, _ = self.run_worker(compute=True, early=True, native_publication=True,
+                                    rows_per_epoch=(1, 2), fail_up=True)
+        self.assertIn(("bind-publication", 0), events)
+        self.assertLess(events.index(("native-request", 1)), events.index(("cancel", 1)))
+        self.assertLess(events.index(("cancel", 1)), events.index(("join-stream",)))
 
     def test_blocking_cuda_launch_releases_the_coordinator_first(self):
         with patch.dict(os.environ, CUDA_LAUNCH_BLOCKING="1"):

@@ -303,7 +303,7 @@ Look for `a_idx_storage=exchange_device` on the per-rank timing line to confirm 
 | --- | --- |
 | `routing … elapsed_us` | Entry to benchmark preparation through completion of local route installation, including generation, retirement, alignment and exchange. |
 | `exchange_staging_us` | Aligned submission through benchmark wait completion, including the seven kernels, GPU exchange, RDMA and local gather. With `source_route=receiver`, this includes writing the outgoing snapshot. With direct GPU indices, it also includes the remote index mirrors and their GPU visibility. Pass `--device-indices` to the standalone two-node benchmark to include those writes there. |
-| `install_us` | Benchmark wait return through completion of route installation on the calling thread. On the concurrent early-local path, peer transport preparation runs later on the coordinator. |
+| `install_us` | Benchmark wait return through completion of route installation on the calling thread. On the native publication path this includes the prefix reset, scatter registration and local-ready request when the slab fits. Peer transport preparation runs later on the coordinator. |
 | `retire_us` | Local time to release the previous iteration's borrowed route data before entering the reuse barrier. Zero for the first iteration and for snapshot installs. |
 | `r_ready_to_up_submit_us` | Fresh R completed through host return from up-GEMM submission, including rank alignment before exchange, installation and compute setup. Available for compute iterations that submit work. Use a GPU trace to measure the actual kernel start. |
 | `generation_us`, `reuse_barrier_us` | Route generation and the Gloo barrier before exchange submission, respectively. |
@@ -574,6 +574,26 @@ cmake --build build/mock -j6
 ctest --test-dir build/mock --output-on-failure
 OMP_NUM_THREADS=1 PYTHONPATH=tests/python /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest -q test_benchmark_routing_worker test_cpu_scatter_publication
 OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -q
+```
+
+#### Comparing native local publication with H800 report 24
+
+Rebuild `rdma_cpu_proxy_shared` and update the Python worker on both nodes. The report 24 launch arguments select the new path. First run the small two-node numerical check above with projection and return/combine checks enabled. Then capture the 20,480-token workload.
+
+- Look for `native_local_publication=1` on each nonempty steady iteration. C++ has posted the local-ready request by the time Python submits the coordinator task. Its `handoff_us` now measures dispatch for down and transport setup. `scatter_views_us` measures the coordinator binding the already registered scatter views. The two Python request timing fields apply only to the older coordinator path.
+- `native_local_publication_growth=1` identifies an iteration in which the live scatter rows exceeded the reserved device slab. Native installation deferred the request until the main thread grew and rebound that storage.
+- Across node 0’s eight GPUs for iterations 1–4, compare staging-gather end to the first **positive** ready-prefix update, staging-gather end to up-GEMM kernel start, and full worker iteration time. Report 24 medians were 1.047 ms, 0.732 ms and 56.82 ms respectively. The first interval measures when the kernel can consume its first descriptors. A kernel can already be resident while it waits for those descriptors.
+
+Host verification used the arm64 macOS 15.6.1 Debug mock build, Python 3.9.12 and CPU PyTorch 1.13.1. The native routing test exercises a delayed peer, a too-small scatter slab and cancellation with a partially published prefix. The worker tests cover growth, reuse, empty iterations and up-only cancellation. Two-node H800 numerical and timing checks require the target hosts.
+
+```bash
+cmake --build build/mock -j6
+ctest --test-dir build/mock --output-on-failure
+ctest --test-dir build/mock -R '^test_benchmark_routing$' --repeat until-fail:5 --output-on-failure
+ctest --test-dir build/exchange-host --output-on-failure
+OMP_NUM_THREADS=1 PYTHONPATH=tests/python /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest -q test_benchmark_routing_worker test_cpu_scatter_publication
+OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -q
+ROUTER_METADATA_BENCH_LIBRARY="$PWD/build/exchange-cpu/librouter_metadata_bench.dylib" PYTHONDONTWRITEBYTECODE=1 /Users/zhuhao/opt/anaconda3/bin/python3 -m unittest discover -s benchmarks/router_metadata_exchange -p test_benchmark.py -v
 ```
 
 ### Two-node test on Hopper

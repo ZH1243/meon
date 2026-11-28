@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -349,7 +350,8 @@ RDMA_PROXY_C_API int rdma_proxy_install_borrowed_benchmark_device_indices(
  * requirements. The local staging gather must also have completed. The live
  * compute extents and route views are available when the call returns. On a
  * refreshed route with early local readiness, prepare_iteration can release
- * this GPU's own gather rows. Run run_iteration concurrently with the GEMM
+ * this GPU's own gather rows. With a native local-publication binding, installation
+ * can request those rows before returning. Run run_iteration concurrently with the GEMM
  * to finish transport preparation and publish the remaining rows. */
 RDMA_PROXY_C_API int rdma_proxy_install_benchmark_device_indices_for_compute(
     RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing,
@@ -376,6 +378,32 @@ RDMA_PROXY_C_API int rdma_proxy_prepare_early_up(RdmaProxyHandle* handle, uint64
  * calls. Repeating this request before full preparation is idempotent. */
 RDMA_PROXY_C_API int rdma_proxy_prepare_local_publication(RdmaProxyHandle* handle, uint64_t iteration);
 RDMA_PROXY_C_API int rdma_proxy_cancel_early_up(RdmaProxyHandle* handle, uint64_t iteration);
+
+/* Opt into local publication from refreshed direct benchmark route installation.
+ * Bind after initialization, before the next install, on an idle handle. A null
+ * scatter config with zero bytes selects up-only execution. Otherwise pass the
+ * full aligned slab address in scatter_addresses and its allocation size. The
+ * installed route supplies routes. Source pairs/output bases are copied. Keep
+ * the stream, slab, counts, inverse and underlying output buffers alive through
+ * GPU/native retirement. Replace the binding only after retirement or when an
+ * installed route reports NEEDS_STORAGE. Rebinding that route retries publication.
+ * Serialize binding, installation and status queries on the embedding thread. */
+RDMA_PROXY_C_API int rdma_proxy_bind_native_local_publication(
+    RdmaProxyHandle* handle, uintptr_t compute_stream, const RdmaProxyCpuScatterConfig* scatter,
+    size_t slab_bytes);
+enum {
+    RDMA_PROXY_LOCAL_INACTIVE = 0,
+    RDMA_PROXY_LOCAL_REQUESTED = 1,
+    RDMA_PROXY_LOCAL_NEEDS_STORAGE = 2,
+    RDMA_PROXY_LOCAL_UNBOUND = 3
+};
+/* Before allocating storage, query iteration zero. UNBOUND indicates an eligible
+ * configuration. Once bound, INACTIVE indicates a synchronous or empty route.
+ * REQUESTED includes the current prefix reset and wait on the bound compute
+ * stream. Do not repeat prepare_early_up, scatter configuration or local request.
+ * Cancel before joining a polling kernel after a failure. */
+RDMA_PROXY_C_API int rdma_proxy_get_native_local_publication(
+    RdmaProxyHandle* handle, uint64_t iteration, int32_t* state);
 
 /* Finite-run iteration control for embedding runtimes that own the main loop. */
 RDMA_PROXY_C_API int rdma_proxy_get_num_iterations(

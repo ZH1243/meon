@@ -970,6 +970,12 @@ class CpuScatterConfig(ctypes.Structure):
                    ctypes.cast(inverse.data_ptr(), index_ptr) if inverse is not None else None)
 
 
+# States returned by rdma_proxy_get_native_local_publication.
+LOCAL_REQUESTED = 1
+LOCAL_NEEDS_STORAGE = 2
+LOCAL_UNBOUND = 3
+
+
 class AsyncScatterLookup:
     """Stable host destinations written by the native scatter thread on refreshed routes."""
 
@@ -996,12 +1002,15 @@ class AsyncScatterLookup:
         status = self.configure(handle, ctypes.byref(self.config), packed_weights, slab.numel())
         require_proxy_success(library, status, "starting native scatter lookup")
 
-    def register_reserved(self, library, handle, up, routes):
+    def reserved_views(self, up, routes):
         if self.address_storage is None or not 0 < routes <= up.output.shape[0]:
             raise ValueError("early scatter registration requires reserved storage and a nonempty current route")
         shape = (routes, 2) if self.config.tile_n else (routes,)
-        views = allocate_cpu_scatter_metadata_storage(
+        return allocate_cpu_scatter_metadata_storage(
             up.torch, shape, up.output.device, up.route_weights is not None, storage=self.address_storage)
+
+    def register_reserved(self, library, handle, up, routes):
+        views = self.reserved_views(up, routes)
         slab, _, weights = views
         self.register(library, handle, routes, slab, weights)
         return views
@@ -2057,19 +2066,22 @@ def print_benchmark_routing(node, gpu, iteration, elapsed_ns, stats, up_submitte
           f"release_barrier_us={stats['release_barrier_ns'] / 1000:.3f}{submit} "
           f"source_route={stats['source_route']} source_route_storage={stats['source_route_storage']} "
           f"a_idx_storage={stats['a_idx_storage']} early_up_launch={int(stats.get('early_up_launch', False))} "
-          f"concurrent_local_publication={int(stats.get('concurrent_local_publication', False))}",
+          f"concurrent_local_publication={int(stats.get('concurrent_local_publication', False))} "
+          f"native_local_publication={int(stats.get('native_local_publication', False))} "
+          f"native_local_publication_growth={int(stats.get('native_local_publication_growth', False))}",
           flush=True)
     marks = stats.get("local_publication_marks")
     if marks is not None:
         submitted = previous = marks["submit"]
         fields = []
-        for phase in ("handoff", "setup_context", "expert_counts", "scatter_register"):
+        for phase in ("handoff", "setup_context", "expert_counts", "scatter_register", "scatter_views"):
             if phase in marks:
                 fields.append(f"{phase}_us={(marks[phase] - previous) / 1000:.3f}")
                 previous = marks[phase]
-        fields.append(f"submit_to_request_us={(marks['request_begin'] - submitted) / 1000:.3f}")
-        fields.append(f"request_call_us={(marks['request_end'] - marks['request_begin']) / 1000:.3f}")
-        previous = marks["request_end"]
+        if "request_end" in marks:
+            fields.append(f"submit_to_request_us={(marks['request_begin'] - submitted) / 1000:.3f}")
+            fields.append(f"request_call_us={(marks['request_end'] - marks['request_begin']) / 1000:.3f}")
+            previous = marks["request_end"]
         for phase in ("down_wave_start", "down_runner"):
             if phase in marks:
                 fields.append(f"{phase}_us={(marks[phase] - previous) / 1000:.3f}")
@@ -2314,6 +2326,36 @@ def run_proxy_with_concurrent_kernel(
             prepare_local.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
             prepare_local.restype = ctypes.c_int
 
+        bind_native = getattr(library, "rdma_proxy_bind_native_local_publication", None)
+        query_native = getattr(library, "rdma_proxy_get_native_local_publication", None)
+        use_native_publication = (can_launch_early and prepare_local is not None and num_iterations.value > 1
+                                  and getattr(benchmark_metadata, "device_indices", None) is not None
+                                  and bind_native is not None and query_native is not None)
+
+        def bind_publication_storage():
+            scatter, size = None, 0
+            if async_scatter is not None:
+                async_scatter.reserve_addresses(grouped_gemm, 2 if async_scatter.config.tile_n else 1)
+                async_scatter.config.scatter_addresses = async_scatter.address_storage.data_ptr()
+                scatter = ctypes.byref(async_scatter.config)
+                size = async_scatter.address_storage.numel()
+            require_proxy_success(library, bind_native(handle, int(kernel_stream.cuda_stream), scatter, size),
+                                  "binding local publication storage")
+
+        def publication_state(iteration):
+            state = ctypes.c_int32()
+            require_proxy_success(library, query_native(handle, iteration, ctypes.byref(state)),
+                                  "querying native local publication")
+            return state.value
+
+        if use_native_publication:
+            bind_native.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(CpuScatterConfig), ctypes.c_size_t]
+            query_native.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_int32)]
+            bind_native.restype = query_native.restype = ctypes.c_int
+            use_native_publication = publication_state(0) == LOCAL_UNBOUND
+            if use_native_publication:
+                bind_publication_storage()
+
         def cancel_polling_up(iteration):
             require_proxy_success(library, cancel_early(handle, iteration), "draining early up GEMM")
 
@@ -2324,7 +2366,7 @@ def run_proxy_with_concurrent_kernel(
                     return time.perf_counter_ns()
             return None
 
-        def refresh_runner(iteration, extents, previous, *, up_bound, publication_marks=None):
+        def refresh_runner(iteration, extents, previous, *, up_bound, publication_marks=None, native_requested=False):
             down = previous
             registered_scatter = None
             wave_views = None
@@ -2338,13 +2380,18 @@ def run_proxy_with_concurrent_kernel(
             if publication_marks is not None:
                 publication_marks["expert_counts"] = time.perf_counter_ns()
                 if down is not None:
-                    registered_scatter = async_scatter.register_reserved(
-                        library, handle, grouped_gemm, computation_tokens.value)
-                    publication_marks["scatter_register"] = time.perf_counter_ns()
-                publication_marks["request_begin"] = time.perf_counter_ns()
-                status = prepare_local(handle, iteration)
-                publication_marks["request_end"] = time.perf_counter_ns()
-                require_proxy_success(library, status, "requesting local gather publication")
+                    if native_requested:
+                        registered_scatter = async_scatter.reserved_views(grouped_gemm, computation_tokens.value)
+                        publication_marks["scatter_views"] = time.perf_counter_ns()
+                    else:
+                        registered_scatter = async_scatter.register_reserved(
+                            library, handle, grouped_gemm, computation_tokens.value)
+                        publication_marks["scatter_register"] = time.perf_counter_ns()
+                if not native_requested:
+                    publication_marks["request_begin"] = time.perf_counter_ns()
+                    status = prepare_local(handle, iteration)
+                    publication_marks["request_end"] = time.perf_counter_ns()
+                    require_proxy_success(library, status, "requesting local gather publication")
             if down_schedule is not None and computation_tokens.value:
                 wave_views = down_schedule.start(iteration, counts)
                 if publication_marks is not None:
@@ -2380,13 +2427,13 @@ def run_proxy_with_concurrent_kernel(
             require_proxy_success(library, library.rdma_proxy_prepare_iteration(handle, iteration),
                                   f"preparing proxy iteration {iteration}")
 
-        def prepare_on_coordinator(iteration, extents, previous, setup_stream, publication_marks):
+        def prepare_on_coordinator(iteration, extents, previous, setup_stream, publication_marks, native_requested):
             publication_marks["handoff"] = time.perf_counter_ns()
             # CUDA device and current stream are host-thread local.
             with torch.cuda.device(cuda_device_id), torch.cuda.stream(setup_stream):
                 publication_marks["setup_context"] = time.perf_counter_ns()
                 refreshed = refresh_runner(iteration, extents, previous, up_bound=True,
-                                           publication_marks=publication_marks)
+                                           publication_marks=publication_marks, native_requested=native_requested)
                 prepare_proxy(iteration)
                 return refreshed
 
@@ -2423,6 +2470,7 @@ def run_proxy_with_concurrent_kernel(
             up_submitted_ns = None
             prepared = None
             publication_marks = None
+            native_requested = grew_slab = False
             if dynamic and iteration:
                 # All GPU and peer readers of the previous generation have retired.
                 # Finish Python's optional checks before the native thread reuses A_idx.
@@ -2430,22 +2478,38 @@ def run_proxy_with_concurrent_kernel(
                 extents, elapsed = prepare_epoch(iteration)
                 routing_times_ns.append(elapsed)
                 if can_launch_early and extents[1]:
-                    armed = ctypes.c_int32()
-                    require_proxy_success(library, prepare_early(handle, iteration, int(kernel_stream.cuda_stream),
-                                                                  ctypes.byref(armed)), "ordering early up GEMM")
-                    if armed.value:
+                    if use_native_publication:
+                        state = publication_state(iteration)
+                        if state == LOCAL_NEEDS_STORAGE:
+                            # No publication or polling kernel can consume the undersized slab.
+                            with torch.cuda.stream(kernel_stream):
+                                grouped_gemm.bind_routing(*extents)
+                            bind_publication_storage()
+                            state = publication_state(iteration)
+                            if state != LOCAL_REQUESTED:
+                                raise RuntimeError("local publication did not start after scatter slab growth")
+                            grew_slab = True
+                        native_requested = state == LOCAL_REQUESTED
+                        armed = native_requested
+                    else:
+                        armed_result = ctypes.c_int32()
+                        require_proxy_success(library, prepare_early(handle, iteration, int(kernel_stream.cuda_stream),
+                                                                      ctypes.byref(armed_result)), "ordering early up GEMM")
+                        armed = bool(armed_result.value)
+                    if armed:
                         early_up_iteration = iteration
-                        # A growing output may be allocated with cudaMallocAsync.
-                        with torch.cuda.stream(kernel_stream):
-                            grouped_gemm.bind_routing(*extents)
-                        if down is not None:
+                        if not grew_slab:
+                            with torch.cuda.stream(kernel_stream):
+                                grouped_gemm.bind_routing(*extents)
+                        if down is not None and not native_requested:
                             columns = 2 if down_options.down_n_tile_major_output else 1
                             async_scatter.reserve_addresses(grouped_gemm, columns)
                         if prepare_local is not None:
                             prepared = Future()
                             publication_marks = {}
                             prepare = partial(prepare_on_coordinator, iteration, extents, down,
-                                              torch.cuda.current_stream(cuda_device_id), publication_marks)
+                                              torch.cuda.current_stream(cuda_device_id), publication_marks,
+                                              native_requested)
                             publication_marks["submit"] = time.perf_counter_ns()
                             payload = coordinator.submit(run_on_coordinator, iteration, None, prepare, prepared)
                             del prepare  # The queued callable owns a reference to the previous down runner.
@@ -2568,6 +2632,7 @@ def run_proxy_with_concurrent_kernel(
             if benchmark_metadata is not None:
                 stats = dict(benchmark_metadata.last_stats, early_up_launch=start_barrier is None,
                              concurrent_local_publication=prepared is not None,
+                             native_local_publication=native_requested, native_local_publication_growth=grew_slab,
                              local_publication_marks=publication_marks)
                 benchmark_timings.append((stats, up_submitted_ns))
             elapsed_ms = ctypes.c_float()

@@ -738,6 +738,30 @@ ctest --test-dir build/mock -R '^test_(benchmark_routing|dynamic_gather|c_api|ge
 OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 /Users/zhuhao/opt/anaconda3/bin/python3 -m unittest discover -s tests/python -q
 ```
 
+#### Up-GEMM gather table reuse
+
+The Debug mock regression starts the host and device tables with different nonzero values. It checks all 34 fields of each published row in a 16-source route, the ready count and the untouched suffix across route changes and an empty iteration. The cancellation regression checks that the visible local row survives and the remaining rows become empty descriptors. [Native gather tests](../tests/native/test_dynamic_gather.cpp)
+
+Host verification used arm64 macOS 15.6.1, Python 3.9.12 and CPU PyTorch 1.13.1. The native suite passed 47 tests and skipped six CUDA tests. All ten metadata-exchange host tests passed. The Python suite ran 132 tests with eight skips.
+
+```bash
+cmake -S . -B build/mock -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/mock -j4
+ctest --test-dir build/mock --output-on-failure
+cmake --build build/exchange-host -j4
+ctest --test-dir build/exchange-host --output-on-failure
+OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 /Users/zhuhao/opt/anaconda3/bin/python3 -m unittest discover -s tests/python -q
+```
+
+The CUDA regression and the two-node numerical and timing runs are pending on Hopper. The native regression reads back the published descriptor as the active source changes across three iterations. Build and run it from the meon root on each host.
+
+```bash
+cmake --build "${RDMA_PROXY_BUILD_DIR:-build-hopper}" -j4 --target rdma_cpu_proxy_shared test_dynamic_gather
+ctest --test-dir "${RDMA_PROXY_BUILD_DIR:-build-hopper}" -R '^test_borrowed_routing_upload_cuda$' --output-on-failure
+```
+
+Use the 1,024-token projection and return checks in the preceding section, then repeat the 20,480-token report 31 capture with the same launch and tracing options. Compare iterations 1–4 on each GPU from local staging gather completion to the first local descriptor upload, the first positive ready count, the first outgoing staged NVLink copy and the up-GEMM kernel start.
+
 ### Two-node test on Hopper
 
 Start these commands concurrently. The addresses below are the checked-in Hopper profile. If your hosts have different addresses, use node 0's rendezvous address for `MASTER_ADDR` in both shells and the opposite host's proxy address for each `PEER_HOST`.

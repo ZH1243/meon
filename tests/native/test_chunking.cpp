@@ -271,8 +271,8 @@ int main() {
         static_cast<const uint8_t*>(publication.device_table.ptr) + publication.device_table.bytes,
         [](uint8_t value) { return value == 0x5a; }));
     assert(*static_cast<const int32_t*>(publication.device_ready_rows.ptr) == 7);
-    std::memset(publication.host_table.ptr, 0, publication.host_table.bytes);
-    *static_cast<int32_t*>(publication.host_ready_rows.ptr) = 0;
+    router_nvlink_buffers.begin_router_notification_iteration(0);
+    assert(*static_cast<const int32_t*>(publication.device_ready_rows.ptr) == 0);
     const auto& installed = router_nvlink_buffers.nvlink_receive_buffer_for_source(2, 3);
     assert(installed.expert_metadata_ready);
     assert(installed.expert_metadata.expert_token_indices ==
@@ -311,6 +311,12 @@ int main() {
     assert(head_state.expert_token_heads == std::vector<std::size_t>(8, 0));
     assert(head_state.expert_token_tails == std::vector<std::size_t>(8, 0));
     assert(*static_cast<const int32_t*>(publication.device_ready_rows.ptr) == 11);
+    const auto* diagnostic_host = static_cast<const uint8_t*>(publication.host_table.ptr);
+    const auto* diagnostic_device = static_cast<const uint8_t*>(publication.device_table.ptr);
+    assert(std::all_of(diagnostic_device, diagnostic_device + expected_table_row_bytes,
+                       [](uint8_t byte) { return byte == 0; }));
+    assert(std::all_of(diagnostic_host + expected_table_row_bytes, diagnostic_host + publication.host_table.bytes,
+                       [](uint8_t byte) { return byte == 0x5a; }));
     *static_cast<int32_t*>(publication.host_ready_rows.ptr) = 0;
 
     router_nvlink_buffers.update_expert_token_heads(2, 3, 0, 0, 1);

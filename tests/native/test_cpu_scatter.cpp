@@ -536,8 +536,7 @@ static void run(bool per_entry, uint64_t tile, bool cuda, int weight_mode,
             buffers.begin_router_notification_iteration(5);
         });
         ReleasePackingGate release_before_reset_future_cleanup{packing_gate};
-        // Reset has requested cancellation, but cannot clear host descriptors or
-        // reuse the slab until the blocked worker relinquishes its busy lease.
+        // Reset must wait for the blocked worker to finish using its descriptor and slab.
         CpuScatterTestAccess::wait_cancelled(buffers);
         const bool reset_blocked = resetting.wait_for(std::chrono::milliseconds(0)) ==
                                    std::future_status::timeout;

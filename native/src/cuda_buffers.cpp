@@ -2045,8 +2045,10 @@ void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) 
     }
 
     auto& publication = router_notification_publication_buffers_;
-    if (publication.host_table.ptr && publication.host_table.bytes != 0) {
-        std::memset(publication.host_table.ptr, 0, publication.table_rows * publication.table_row_bytes);
+    // The scheduler overwrites every descriptor field before publishing its row.
+    // Flush-only bypasses the scheduler and copies row zero on each notification.
+    if (config_.nvlink_forward_notification_flush_only_enabled) {
+        std::memset(publication.host_table.ptr, 0, publication.table_row_bytes);
     }
     *static_cast<int32_t*>(publication.host_ready_rows.ptr) = 0;
     if (cpu_scatter_threaded_) {

@@ -9,17 +9,20 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace rdma_proxy;
 
-static RouterExpertMetadata table(int source, const std::vector<int32_t>& rows) {
+static RouterExpertMetadata table(int source, const std::vector<int32_t>& rows,
+                                 int nodes = 1, int gpus_per_node = 2) {
     RouterExpertMetadata m;
-    m.source_node_rank = m.destination_node_rank = m.destination_gpu_index = 0;
-    m.source_gpu_index = source;
-    m.num_nodes = 1;
-    m.num_gpus_per_node = 2;
-    m.num_experts = 2;
+    m.destination_node_rank = m.destination_gpu_index = 0;
+    m.source_node_rank = source / gpus_per_node;
+    m.source_gpu_index = source % gpus_per_node;
+    m.num_nodes = nodes;
+    m.num_gpus_per_node = gpus_per_node;
+    m.num_experts = nodes * gpus_per_node;
     m.experts_per_gpu = 1;
     m.first_global_expert = 0;
     m.num_tokens = 7;
@@ -97,23 +100,99 @@ static void check_mock_gather(ProxyConfig c) {
     }
 }
 
+static void check_gather_table_reuse(ProxyConfig config) {
+    constexpr int sources = 16;
+    constexpr int width = 2 + 2 * sources;
+    constexpr std::size_t n_groups = 2;
+    config.num_nodes = 2;
+    config.num_gpus_per_node = 8;
+    config.router_num_experts = sources;
+    config.peers = {{1, "peer-1", 1}};
+    config.router_pooled_up_gemm_enabled = false;
+    config.nvlink_forward_notification_scheduling_mode = "complete_round";
+    config.expert_gemm_dimension = n_groups;
+    config.expert_gemm_max_swizzle_size = 1;
+    CudaBuffers buffers(config);
+    buffers.initialize();
+
+    // Each arriving source supplies one two-token M batch. Shrink the route,
+    // run an empty iteration, then grow it with a different arrival order.
+    const std::vector<std::vector<int>> arrivals{{0, 15}, {9}, {}, {15, 0, 8}};
+    const std::vector<int32_t> batch{0, 1}, empty;
+    std::vector<int32_t> expected_host, expected_device;
+    for (std::size_t epoch = 0; epoch < arrivals.size(); ++epoch) {
+        const auto& order = arrivals[epoch];
+        std::vector<RouterExpertMetadata> metadata;
+        for (int source = 0; source < sources; ++source) {
+            const bool active = std::find(order.begin(), order.end(), source) != order.end();
+            metadata.push_back(table(source, active ? batch : empty, config.num_nodes, config.num_gpus_per_node));
+        }
+        buffers.install_iteration_expert_metadata(std::move(metadata), epoch);
+        const auto& pub = buffers.router_notification_publication_buffers();
+        assert(pub.table_rows == order.size() * n_groups && pub.table_width == width);
+        auto* host = static_cast<int32_t*>(pub.host_table.ptr);
+        auto* device = static_cast<int32_t*>(pub.device_table.ptr);
+        const auto words = pub.host_table.bytes / sizeof(*host);
+        if (epoch == 0) {
+            expected_host.assign(words, -17);
+            expected_device.assign(words, -31);
+            std::copy(expected_host.begin(), expected_host.end(), host);
+            std::copy(expected_device.begin(), expected_device.end(), device);
+        }
+        assert(words == expected_host.size());
+        const auto check_prefix = [&](std::size_t ready) {
+            assert(*static_cast<const int32_t*>(pub.device_ready_rows.ptr) == static_cast<int32_t>(ready));
+            assert(std::equal(expected_host.begin(), expected_host.end(), host));
+            assert(std::equal(expected_device.begin(), expected_device.end(), device));
+        };
+        const bool armed = buffers.prepare_early_up(epoch, 1);
+        assert(armed == !order.empty());
+        buffers.begin_router_notification_iteration(epoch, armed);
+        check_prefix(0);
+
+        std::array<int32_t, width> row{};
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            const int source = order[i];
+            buffers.ingest_router_notification_completion(source / config.num_gpus_per_node,
+                                                          source % config.num_gpus_per_node, epoch, 0, 2);
+            check_prefix(i * n_groups);
+            buffers.schedule_router_notification_completions(epoch);
+            row[3 + 2 * source] = 2;
+            for (std::size_t group = 0; group < n_groups; ++group) {
+                row[1] = static_cast<int32_t>(group);
+                const auto offset = (i * n_groups + group) * width;
+                std::copy(row.begin(), row.end(), expected_host.begin() + offset);
+                std::copy(row.begin(), row.end(), expected_device.begin() + offset);
+            }
+            check_prefix((i + 1) * n_groups);
+            row[2 + 2 * source] = 2;  // This source's range is [2, 2) in subsequent rows.
+        }
+    }
+}
+
 static void check_cancelled_staged_completion(ProxyConfig config, bool per_entry) {
     config.router_pooled_up_gemm_enabled = false;
     config.nvlink_forward_notification_flush_per_entry_enabled = per_entry;
     CudaBuffers buffers(config);
     buffers.initialize();
     buffers.install_iteration_expert_metadata({table(0, {0, 1}), table(1, {0, 1, 2, 3})}, 0);
+    const auto& pub = buffers.router_notification_publication_buffers();
+    const auto words = pub.table_rows * pub.table_width;
+    std::fill_n(static_cast<int32_t*>(pub.host_table.ptr), words, -17);
+    std::fill_n(static_cast<int32_t*>(pub.device_table.ptr), words, -31);
     if (!buffers.prepare_early_up(0, 1)) throw std::runtime_error("expected an armed gather");
     buffers.begin_router_notification_iteration(0, true);
     buffers.process_router_notification_completion(0, 0, 0, 0, 2);
-    const auto& pub = buffers.router_notification_publication_buffers();
     const auto* table_words = static_cast<const int32_t*>(pub.device_table.ptr);
     const auto* ready = static_cast<const int32_t*>(pub.device_ready_rows.ptr);
     assert(*ready == 1 && pub.table_rows == 3);
     // A complete round can be between ingest and schedule when the launch fails.
     buffers.ingest_router_notification_completion(0, 1, 0, 0, 2);
     buffers.cancel_early_up(0);
-    std::vector<int32_t> cancelled(table_words, table_words + pub.table_rows * pub.table_width);
+    std::vector<int32_t> cancelled(table_words, table_words + words);
+    const std::array<int32_t, 6> local_row{0, 0, 0, 2, 0, 0};
+    assert(std::equal(local_row.begin(), local_row.end(), cancelled.begin()));
+    assert(std::all_of(cancelled.begin() + pub.table_width, cancelled.end(), [](int32_t v) { return v == 0; }));
     buffers.schedule_router_notification_completions(0);
     buffers.process_router_notification_completion(0, 1, 0, 2, 2);
     assert(*ready == 3 && buffers.router_computation_scheduler_state().published_rows == 1);
@@ -140,7 +219,8 @@ static void check_early_reset_cuda(ProxyConfig config, TestRecords& pinned) {
     std::unique_ptr<void, decltype(release)> consumer(create_cuda_stream(config.cuda_device_id, true, false), release);
     const auto stream = static_cast<cudaStream_t>(consumer.get());
     for (unsigned epoch = 0; epoch < 3; ++epoch) {
-        buffers.install_iteration_expert_metadata({table(0, {1, 2}), table(1, {})}, epoch);
+        const int source = epoch % 2;
+        buffers.install_iteration_expert_metadata({table(source, {1, 2}), table(1 - source, {})}, epoch);
         const auto& pub = buffers.router_notification_publication_buffers();
         if (epoch) {
             if (!buffers.prepare_early_up(epoch, reinterpret_cast<uintptr_t>(stream)))
@@ -153,10 +233,14 @@ static void check_early_reset_cuda(ProxyConfig config, TestRecords& pinned) {
             if (pinned.readback[0] != 0) throw std::runtime_error("consumer read a stale ready prefix");
         }
         buffers.begin_router_notification_iteration(epoch);
-        buffers.process_router_notification_completion(0, 0, epoch, 0, config.num_tokens);
+        buffers.process_router_notification_completion(0, source, epoch, 0, config.num_tokens);
         buffers.synchronize_router_notification_stream();
         check_cuda(cudaMemcpy(pinned.readback.data(), pub.device_ready_rows.ptr, sizeof(int32_t), cudaMemcpyDeviceToHost));
         if (pinned.readback[0] != 1) throw std::runtime_error("missing current gather publication");
+        std::array<int32_t, 6> descriptor{}, expected{};
+        expected[3 + 2 * source] = 2;
+        check_cuda(cudaMemcpy(descriptor.data(), pub.device_table.ptr, sizeof(descriptor), cudaMemcpyDeviceToHost));
+        if (descriptor != expected) throw std::runtime_error("published row contains stale gather fields");
     }
 }
 
@@ -253,6 +337,7 @@ int main(int argc, char** argv) try {
 #endif
     } else {
         check_mock_gather(config);
+        check_gather_table_reuse(config);
         for (bool per_entry : {false, true}) check_cancelled_staged_completion(config, per_entry);
         TestRecords records;
         check_borrowed_upload(config, records);

@@ -658,7 +658,7 @@ OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discove
 
 #### Profiling up-GEMM submission after H800 report 29
 
-Use the updated meon worker and select the updated QuACK checkout with `QUACK_ROOT` on both hosts. Add `--trace-up-launch` to the report 29 command on each node. The diagnostic uses host timestamps and NVTX on the submission thread. It prints one `up_launch_timing` line per rank and iteration after the run. Iteration zero includes the first up launch. Its initial routing bind takes place during runner construction, outside the measured loop.
+Use the updated meon worker and select the updated QuACK checkout with `QUACK_ROOT` on both hosts. Add `--no-prepared-up-gemm --trace-up-launch` to reproduce the report 30 launch path. The diagnostic uses host timestamps and NVTX on the submission thread. It prints one `up_launch_timing` line per rank and iteration after the run. Iteration zero includes the first up launch. Its initial routing bind takes place during runner construction, outside the measured loop.
 
 Use these arguments on each host, with the node's matching launcher.
 
@@ -676,12 +676,11 @@ args=(
     --completion_timeout_ms=600000 --return-token-timeout=600 --dynamic-routing --benchmark-metadata-exchange
     --no-check-return-token-results --no-check-intra-node-combine
     --no-check-rdma-return-token-results --no-check-inter-node-combine --no-benchmark-metadata-validation
-    --trace-up-launch
 )
 # Node 0
-bash scripts/run_node0_torchrun.sh "${args[@]}"
+bash scripts/run_node0_torchrun.sh "${args[@]}" --no-prepared-up-gemm --trace-up-launch
 # Node 1
-bash scripts/run_node1_torchrun.sh "${args[@]}"
+bash scripts/run_node1_torchrun.sh "${args[@]}" --no-prepared-up-gemm --trace-up-launch
 ```
 
 | Host field | Interval |
@@ -707,6 +706,36 @@ Host verification on arm64 macOS 15.6.1 used Python 3.9.12, CPU PyTorch 1.13.1 a
 ```bash
 OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 /Users/zhuhao/opt/anaconda3/bin/python3 -m unittest discover -s tests/python -q
 ctest --test-dir build/mock -R '^test_(benchmark_routing|dynamic_gather|c_api)$' --output-on-failure
+```
+
+#### Prepared Hopper SwiGLU up-GEMM
+
+Dynamic multi-buffer SwiGLU uses the prepared host plan automatically on SM90 when the selected QuACK checkout supplies `quack.hopper_swiglu_gather`. The worker prints `prepared_up_gemm=True` at setup. Passing `--prepared-up-gemm` explicitly requires that support on the current worker. Passing `--no-prepared-up-gemm` selects the report 30 launch path.
+
+The first nonempty launch on each output allocation uses QuACK's ordinary plan lookup and dispatch. Later launches reuse the plan across changes in table and source-index length. With `--trace-up-launch`, these iterations report `plan_cache=prepared` and zero for `plan_lookup_us` and `plan_build_us`. On this path `pre_key_us` ends when QuACK selects the retained plan. Empty iterations report `plan_cache=empty`. If the output allocation grows, the next nonempty launch resolves a plan against the new storage.
+
+On each Hopper host, select the updated QuACK checkout with `QUACK_ROOT`. Use the workload array above and set `launcher=scripts/run_node0_torchrun.sh` on node 0 and `launcher=scripts/run_node1_torchrun.sh` on node 1. Run matching commands together.
+
+```bash
+(cd "$QUACK_ROOT" && python -m pytest -q tests/test_gemm_gather_table.py \
+    -k 'prepared_swiglu_gather_live_prefixes or gather_table_plan_observer')
+bash "$launcher" "${args[@]}" --num_tokens=1024 --num_iterations=3 --prepared-up-gemm \
+    --check-projections --check-return-token-results --check-intra-node-combine \
+    --check-rdma-return-token-results --check-inter-node-combine --benchmark-metadata-validation
+bash "$launcher" "${args[@]}" --prepared-up-gemm --trace-up-launch
+for mode in --no-prepared-up-gemm --prepared-up-gemm; do
+    bash "$launcher" "${args[@]}" "$mode"
+done
+```
+
+Use the diagnostic run to verify reuse. Compare the two runs with host tracing disabled for performance. In Nsight Systems, measure each GPU from its first positive local gather-ready publication to its up-GEMM CUDA launch and kernel start. Check Tensor Active through the first peer publication and compare steady full-iteration times.
+
+On an Apple M1 Max with macOS 15.6.1, Python 3.9.12 and CPU PyTorch 1.13.1, the worker suite ran 132 tests with eight skips and all four Debug native regressions passed. Both node launchers accepted the prepared, baseline, traced and numerical commands in dry runs. The local environment lacks CUDA and CUTLASS DSL. The Hopper numerical regression and two-node timing comparison remain outstanding.
+
+```bash
+cmake --build build/mock -j4
+ctest --test-dir build/mock -R '^test_(benchmark_routing|dynamic_gather|c_api|gemm_geometry)$' --output-on-failure
+OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 /Users/zhuhao/opt/anaconda3/bin/python3 -m unittest discover -s tests/python -q
 ```
 
 ### Two-node test on Hopper

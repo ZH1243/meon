@@ -1,17 +1,21 @@
 """Changing logical lengths, registered storage and row mappings across generations."""
 import ctypes
+from contextlib import contextmanager, nullcontext, redirect_stdout
+from functools import partial
+import io
 import os
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 import rdma_proxy_worker as worker
 from intra_node_combine import IntraNodeCombine
 from rdma_return_exchange import ReturnExchange
+from up_launch_timing import UpLaunchTiming
 
 
 class DynamicRoutingTests(unittest.TestCase):
@@ -78,7 +82,8 @@ class DynamicRoutingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             up.bind_routing(capacity + 1, 1)
 
-    def test_initial_dynamic_reserve_and_fixed_output_shape(self):
+    @contextmanager
+    def up_runner_factory(self, **quack_modules):
         torch = self.torch
         if torch is None:
             self.skipTest("requires PyTorch")
@@ -89,22 +94,82 @@ class DynamicRoutingTests(unittest.TestCase):
         buffers.tensors[(worker.DEVICE_BUFFER_GATHER_TABLE, -1, -1, -1)] = torch.empty(8, 6, dtype=torch.int32)
         buffers.tensors[(worker.DEVICE_BUFFER_GATHER_READY_ROWS, -1, -1, -1)] = torch.zeros(1, dtype=torch.int32)
         modules = {"quack.gemm": SimpleNamespace(gemm=None),
-                   "quack.gemm_config": SimpleNamespace(cta_tile_shape_m=lambda m, cluster, arch: m)}
+                   "quack.gemm_config": SimpleNamespace(cta_tile_shape_m=lambda m, cluster, arch: m,
+                                                        GemmConfig=SimpleNamespace),
+                   **quack_modules}
         with TemporaryDirectory() as tmp, patch.dict(sys.modules, modules), patch.object(sys, "path", sys.path[:]), \
                 patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)), \
                 patch.object(torch.cuda, "synchronize"):
             root = Path(tmp)
             (root / "quack").mkdir()
             (root / "quack" / "gemm.py").touch()
+            yield partial(worker.GroupedGemmRunner, torch, buffers, cuda_device_id=0, world_size=1,
+                          num_experts=2, output_dimension=16, tile_m=128, tile_n=128,
+                          tile_k=None, cluster_m=1, max_swizzle_size=1, quack_root=root)
+
+    def test_initial_dynamic_reserve_and_fixed_output_shape(self):
+        with self.up_runner_factory() as make_up:
             for extents, live_rows, capacity_rows in (((128, 4), 256, 260), (None, 512, 512)):
                 with self.subTest(extents=extents):
-                    up = worker.GroupedGemmRunner(
-                        torch, buffers, cuda_device_id=0, world_size=1, num_experts=2,
-                        output_dimension=16, activation=None, tile_m=128, tile_n=128,
-                        tile_k=None, cluster_m=1, max_swizzle_size=1, quack_root=root,
-                        routing_extents=extents)
+                    up = make_up(activation=None, routing_extents=extents)
                     self.assertEqual(up.output.shape, (live_rows, 16))
                     self.assertEqual(up.output_storage.shape, (capacity_rows, 16))
+
+    def test_prepared_up_rebinds_current_views_and_replaces_grown_storage(self):
+        launches = []
+
+        def make_plan(xs, weights, *, A_idx, gather_work_table, gather_work_table_ready,
+                      postact_out, config, sm_count):
+            self.assertEqual(sm_count, 12)
+            def bind(rows, work):
+                indices = tuple(i[:rows] for i in A_idx)
+                table, output = gather_work_table[:work], postact_out[:len(xs) * rows]
+                def launch(*, plan_observer):
+                    if plan_observer is not None:
+                        plan_observer("plan_reused")
+                    launches.append((indices, table, output, gather_work_table_ready))
+                return indices, table, output, launch
+            return SimpleNamespace(bind=bind)
+
+        eager, factory = Mock(), Mock(side_effect=make_plan)
+        module_name = "quack.hopper_swiglu_gather"
+        modules = {"quack.gemm_interface": SimpleNamespace(gemm_act=eager),
+                   module_name: SimpleNamespace(HopperSwiGLUGatherPlan=factory)}
+        with self.up_runner_factory(**modules) as make_up:
+            up = make_up(activation="swiglu", routing_extents=(63, 3), sm_count=12)
+            trace = UpLaunchTiming(SimpleNamespace(range=lambda _: nullcontext()))
+            launch = trace.timed("up_call", partial(up.launch, plan_observer=trace.mark))
+            for epoch, extents in enumerate(((63, 3), (64, 1), (1, 0), (60, 6), (70, 2))):
+                if epoch:
+                    up.bind_routing(*extents)
+                launch()
+                trace.finish_iteration(extents)
+                self.assertEqual(factory.call_count, 1 if epoch < 4 else 2)
+                if extents[1]:
+                    indices, table, output, ready = launches[-1]
+                    self.assertIs(indices, up.a_idx)
+                    self.assertIs(table, up.work_table)
+                    self.assertIs(output, up.output)
+                    self.assertIs(ready, up.ready_rows)
+                    self.assertEqual(output.data_ptr(), up.output_storage.data_ptr())
+                    self.assertEqual((indices[0].numel(), table.shape[0]), extents)
+            self.assertEqual(len(launches), 4)
+            self.assertNotEqual(launches[0][2].data_ptr(), launches[-1][2].data_ptr())
+            with redirect_stdout(io.StringIO()) as logs:
+                trace.report(0, 0)
+            self.assertEqual(logs.getvalue().count("plan_cache=prepared"), 4)
+            self.assertEqual(logs.getvalue().count("plan_lookup_us=0.000 plan_build_us=0.000"), 4)
+            self.assertIn("iteration=2 source_index_rows=1 table_rows=0 plan_cache=empty", logs.getvalue())
+            eager.assert_not_called()
+
+            make_up(activation="swiglu", routing_extents=(3, 1), prepared_up_gemm=False).launch()
+            with patch.dict(sys.modules, {module_name: None}):
+                make_up(activation="swiglu", routing_extents=(3, 1)).launch()
+                with self.assertRaisesRegex(RuntimeError, "updated QuACK"):
+                    make_up(activation="swiglu", routing_extents=(3, 1), prepared_up_gemm=True)
+            with self.assertRaisesRegex(ValueError, "dynamic Hopper multi-buffer"):
+                make_up(activation="swiglu", routing_extents=None, prepared_up_gemm=True)
+            self.assertEqual(eager.call_count, 2)
 
     def test_up_growth_retries_exact_rows_and_keeps_previous_bindings_on_oom(self):
         torch = self.torch

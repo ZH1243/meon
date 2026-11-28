@@ -316,6 +316,9 @@ class GroupedGemmRunner:
     """Launch QuACK's readiness-gated up GEMM on the proxy's receive storage."""
 
     empty_epoch = False
+    _prepared_plan_type = None
+    _prepared_plan = None
+    _prepared_launch = None
 
     def __init__(
         self,
@@ -335,6 +338,7 @@ class GroupedGemmRunner:
         quack_root: Path,
         sm_count: int | None = None,
         routing_extents: tuple[int, int] | None = None,
+        prepared_up_gemm: bool | None = None,
     ) -> None:
         validate_up_sm_count(sm_count, cluster_m)
         self.torch = torch_module
@@ -503,6 +507,22 @@ class GroupedGemmRunner:
         if self.x_pool is not None:
             self.pooled_index_storage = self.pooled_a_idx
             self.pooled_table_storage = self.pooled_work_table
+        supports_plan = (routing_extents is not None and self.device_capacity == 9
+                         and self.activation == "swiglu" and self.x_pool is None
+                         and len(self.x_buffers) > 1 and first_x.numel() > 0)
+        if prepared_up_gemm and not supports_plan:
+            raise ValueError("--prepared-up-gemm requires dynamic Hopper multi-buffer SwiGLU")
+        if supports_plan and prepared_up_gemm is not False:
+            try:
+                from quack.hopper_swiglu_gather import HopperSwiGLUGatherPlan
+            except ModuleNotFoundError as error:
+                if error.name != "quack.hopper_swiglu_gather":
+                    raise
+                if prepared_up_gemm:
+                    raise RuntimeError("--prepared-up-gemm requires an updated QuACK checkout "
+                                       "selected with --quack-root or QUACK_ROOT") from error
+            else:
+                self._prepared_plan_type = HopperSwiGLUGatherPlan
         if routing_extents is not None:
             self.bind_routing(*routing_extents)
         self.transposed_weights = self.weights.transpose(1, 2)
@@ -525,7 +545,8 @@ class GroupedGemmRunner:
             f"activation={activation or 'none'} projection_N={self.gemm_dimension} "
             f"active_sources={source_pairs} X={tuple(input_shape)} "
             f"A_idx={tuple(index_shape)} W={tuple(self.weights.shape)} "
-            f"output={tuple(self.output.shape)} table={tuple(table_shape)} pooled_up_gemm={pooled}",
+            f"output={tuple(self.output.shape)} table={tuple(table_shape)} pooled_up_gemm={pooled} "
+            f"prepared_up_gemm={self._prepared_plan_type is not None}",
             flush=True,
         )
 
@@ -553,12 +574,22 @@ class GroupedGemmRunner:
                     raise
                 storage = storage.new_empty((output_rows, storage.shape[1]))
 
-        self.route_weights = weights
-        self.route_weights_stacked = stacked_weights
-        self.output_storage = storage
-        self.output = storage[:output_rows]
-        self.a_idx = tuple(t[:source_index_rows] for t in self.index_storage)
-        self.work_table = self.table_storage[:table_rows]
+        if self._prepared_plan_type is not None:
+            plan = self._prepared_plan
+            if plan is None or storage is not self.output_storage:
+                plan = self._prepared_plan_type(
+                    self.x_buffers, self.weights, A_idx=self.index_storage,
+                    gather_work_table=self.table_storage, gather_work_table_ready=self.ready_rows,
+                    postact_out=storage, config=self.activation_config, sm_count=self.sm_count)
+            indices, table, output, launch = plan.bind(source_index_rows, table_rows)
+            self._prepared_plan, self._prepared_launch = plan, launch
+        else:
+            indices = tuple(t[:source_index_rows] for t in self.index_storage)
+            table = self.table_storage[:table_rows]
+            output = storage[:output_rows]
+        self.route_weights, self.route_weights_stacked = weights, stacked_weights
+        self.output_storage, self.output = storage, output
+        self.a_idx, self.work_table = indices, table
         self.empty_epoch = table_rows == 0
         if self.x_pool is not None:
             self.pooled_a_idx = self.pooled_index_storage[:output_rows]
@@ -569,11 +600,14 @@ class GroupedGemmRunner:
             pooled = self.x_pool is not None
         if pooled and self.x_pool is None:
             raise ValueError("pooled launch requires a pooled receive allocation")
+        if self.empty_epoch:
+            return
+        if self._prepared_launch is not None and not pooled:
+            self._prepared_launch(plan_observer=plan_observer)
+            return
         x = self.x_pool if pooled else self.x_buffers
         indices = self.pooled_a_idx if pooled else self.a_idx
         table = self.pooled_work_table if pooled else self.work_table
-        if self.empty_epoch:
-            return
         gemm = self.quack_gemm_act if self.activation is not None else self.quack_gemm
         if plan_observer is not None:
             gemm = partial(gemm, plan_observer=plan_observer)
@@ -2143,6 +2177,7 @@ def run_proxy_with_concurrent_kernel(
     down_options: argparse.Namespace,
     up_sm_count: int | None = None,
     trace_up_launch: bool = False,
+    prepared_up_gemm: bool | None = None,
 ) -> int:
     """Launch readiness-gated QuACK GroupedGEMM with each proxy iteration."""
 
@@ -2258,6 +2293,7 @@ def run_proxy_with_concurrent_kernel(
             quack_root=quack_root,
             sm_count=up_sm_count,
             routing_extents=extents,
+            prepared_up_gemm=prepared_up_gemm,
         )
         computation_tokens = ctypes.c_uint64()
         require_proxy_success(
@@ -2827,6 +2863,9 @@ def main() -> int:
     parser.add_argument("--trace-up-launch", action="store_true",
                         help="record per-iteration host submission and QuACK plan-cache timings "
                              "and NVTX ranges for up GEMM")
+    parser.add_argument("--prepared-up-gemm", action=argparse.BooleanOptionalAction, default=None,
+                        help="reuse the QuACK host plan for dynamic Hopper multi-buffer SwiGLU "
+                             "(default: automatic when the selected QuACK supports it)")
     parser.add_argument(
         "--communication-only",
         action="store_true",
@@ -2902,6 +2941,7 @@ def main() -> int:
         args.pooled_up_gemm = False
         args.benchmark_ready_up_gemm = False
         args.trace_up_launch = False
+        args.prepared_up_gemm = False
         args.check_projections = False
         args.weighted_contributions = False
         args.grouped_gemm_activation = "none"
@@ -2918,6 +2958,11 @@ def main() -> int:
             raise ValueError("--benchmark-ready-up-gemm requires --pooled-up-gemm")
         if args.trace_up_launch and not args.concurrent_kernel:
             raise ValueError("--trace-up-launch requires --concurrent-kernel")
+        if args.prepared_up_gemm and not args.concurrent_kernel:
+            raise ValueError("--prepared-up-gemm requires --concurrent-kernel")
+        if args.prepared_up_gemm and (args.grouped_gemm_activation != "swiglu" or args.pooled_up_gemm
+                                      or args.gemm_arch == "blackwell" or args.dynamic_routing is False):
+            raise ValueError("--prepared-up-gemm requires dynamic Hopper multi-buffer SwiGLU")
         if args.up_sm_count is not None and not args.concurrent_kernel:
             raise ValueError("--up-sm-count requires --concurrent-kernel")
         validate_up_sm_count(args.up_sm_count, args.expert_gemm_cluster_m)
@@ -2994,6 +3039,7 @@ def main() -> int:
             down_options=args,
             up_sm_count=args.up_sm_count,
             trace_up_launch=args.trace_up_launch,
+            prepared_up_gemm=args.prepared_up_gemm,
         )
     return run_proxy(
         library,

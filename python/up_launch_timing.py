@@ -39,13 +39,18 @@ class UpLaunchTiming:
                     elapsed = marks[f"{name}_end"] - marks[f"{name}_start"]
                     fields.append(f"{name}_us={elapsed / 1000:.3f}")
             cache = "no_lookup" if table_rows else "empty"
-            if "key_start" in marks:
+            if "plan_reused" in marks:
+                cache = "prepared"
+                key_start = lookup_end = plan_ready = marks["plan_reused"]
+            elif "key_start" in marks:
                 cache = "hit" if "cache_hit" in marks else "miss"
+                key_start = marks["key_start"]
                 lookup_end = marks[f"cache_{cache}"]
                 plan_ready = lookup_end if cache == "hit" else marks["plan_built"]
+            if cache in ("prepared", "hit", "miss"):
                 for name, elapsed in (
-                    ("pre_key", marks["key_start"] - marks["up_call_start"]),
-                    ("plan_lookup", lookup_end - marks["key_start"]),
+                    ("pre_key", key_start - marks["up_call_start"]),
+                    ("plan_lookup", lookup_end - key_start),
                     ("plan_build", plan_ready - lookup_end),
                     ("after_plan", marks["up_call_end"] - plan_ready),
                 ):

@@ -484,6 +484,16 @@ class ActivationCliTests(unittest.TestCase):
         result = self.run_cli("--trace-up-launch", "--communication-only")
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_prepared_up_gemm_is_a_worker_option(self):
+        options = ("--concurrent-kernel", "--dynamic-routing", "--grouped-gemm-activation=swiglu")
+        for flag in ("--prepared-up-gemm", "--no-prepared-up-gemm"):
+            result = self.run_cli(*options, flag)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn(flag, result.stdout.splitlines()[-1])
+        invalid = self.run_cli(*options, "--prepared-up-gemm", "--pooled-up-gemm")
+        self.assertIn("requires dynamic Hopper multi-buffer SwiGLU", invalid.stderr)
+        self.assertNotEqual(invalid.returncode, 0)
+
     def test_up_sm_count_reaches_plain_and_fused_launches(self):
         # CPU-only boundary test: do not import CUDA/QuACK or construct buffers.
         for activation in (None, "relu", "swiglu"):

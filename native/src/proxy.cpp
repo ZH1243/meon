@@ -964,6 +964,8 @@ void Proxy::prepare_local_publication(uint64_t iteration) {
 }
 
 void Proxy::prepare_iteration_step(uint64_t iteration) {
+    if (payload_state_ != PayloadState::Pending)
+        throw std::runtime_error("cannot prepare after an unfinished or failed payload");
     cuda_buffers_.check_early_up_cancelled();
     if (!initialized_) throw std::runtime_error("proxy is not initialized");
     if (config_.num_iterations != 0 && iteration >= config_.num_iterations) {
@@ -1009,6 +1011,13 @@ void Proxy::prepare_iteration_step(uint64_t iteration) {
 }
 
 void Proxy::run_iteration_step(uint64_t iteration) {
+    run_iteration_payload(iteration);
+    complete_iteration_step(iteration);
+}
+
+void Proxy::run_iteration_payload(uint64_t iteration) {
+    if (payload_state_ != PayloadState::Pending)
+        throw std::runtime_error("iteration payload already ran or failed");
     cuda_buffers_.check_early_up_cancelled();
     if (!initialized_) throw std::runtime_error("proxy is not initialized");
     if (config_.num_iterations != 0 && iteration >= config_.num_iterations) {
@@ -1018,10 +1027,32 @@ void Proxy::run_iteration_step(uint64_t iteration) {
     if (prepared_iteration_ != iteration) {
         throw std::runtime_error("prepared proxy iteration index does not match run request");
     }
-    run_iteration(iteration);
-    finish_rdma_returns();
-    synchronize_iteration(iteration);
-    cuda_buffers_.check_down_metadata_error();
+    try {
+        run_iteration(iteration);
+        finish_rdma_returns();
+        cuda_buffers_.check_down_metadata_error();
+    } catch (...) {
+        payload_state_ = PayloadState::Failed;
+        throw;
+    }
+    // Routes, receive buffers and the generation remain live for the embedder.
+    payload_state_ = PayloadState::ReadyForDone;
+}
+
+void Proxy::complete_iteration_step(uint64_t iteration) {
+    if (!initialized_ || !iteration_prepared_ || prepared_iteration_ != iteration ||
+        payload_state_ != PayloadState::ReadyForDone)
+        throw std::runtime_error("iteration completion requires the matching finished payload");
+    try {
+        cuda_buffers_.check_early_up_cancelled();
+        synchronize_iteration(iteration);
+        cuda_buffers_.check_down_metadata_error();
+    } catch (...) {
+        // Some peers may already have consumed our marker.
+        payload_state_ = PayloadState::Failed;
+        throw;
+    }
+    payload_state_ = PayloadState::Pending;
     iteration_prepared_ = false;
     if (config_.router_dynamic_routing_enabled) {
         dynamic_payload_active_.store(false);
@@ -1417,6 +1448,8 @@ void Proxy::arm_return_copies(uint64_t iteration) {
 
 void Proxy::finish_run() {
     if (!initialized_) throw std::runtime_error("proxy is not initialized");
+    if (payload_state_ != PayloadState::Pending)
+        throw std::runtime_error("cannot finish run with an incomplete iteration");
     if (config_.num_iterations != 0) {
         report_rdma_bandwidth_summary();
     }
@@ -1478,6 +1511,7 @@ void Proxy::shutdown() {
     dynamic_payload_active_.store(false);
     routing_failed_ = false;
     release_local_iteration_sync();
+    payload_state_ = PayloadState::Pending;
     iteration_prepared_ = false;
     local_router_input_staged_ = false;
     // stop_forwarding_thread has joined the mailbox consumer before reset.

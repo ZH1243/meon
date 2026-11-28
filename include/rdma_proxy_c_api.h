@@ -423,6 +423,16 @@ RDMA_PROXY_C_API int rdma_proxy_run_iteration(
     RdmaProxyHandle* handle,
     uint64_t iteration);
 
+/* Two-phase alternative to run_iteration for an external final consumer.
+ * run_iteration_payload returns after transport, reverse-RDMA markers and any
+ * required receive visibility flush. It keeps the iteration prepared and its
+ * buffers live. After joining the consumer's GPU work, call complete_iteration
+ * on the same generation to enter iteration_done and advance the handle.
+ * Serialize the two calls. A failed consumer requires teardown without sending
+ * iteration_done. Do not mix the one- and two-phase calls for an iteration. */
+RDMA_PROXY_C_API int rdma_proxy_run_iteration_payload(RdmaProxyHandle* handle, uint64_t iteration);
+RDMA_PROXY_C_API int rdma_proxy_complete_iteration(RdmaProxyHandle* handle, uint64_t iteration);
+
 /* GPU-event timing for readiness-gated computation launched by the embedder. */
 RDMA_PROXY_C_API int rdma_proxy_record_computation_end(
     RdmaProxyHandle* handle,

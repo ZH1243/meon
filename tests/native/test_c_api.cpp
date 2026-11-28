@@ -193,7 +193,20 @@ void check_dynamic_rank(int gpu, const std::string& run_id, const std::string& p
         }
         require(rdma_proxy_prepare_iteration(handle, i) == 0);
         require(build_rows(handle) != 0 && build_inter(handle) != 0);
-        require(rdma_proxy_run_iteration(handle, i) == 0);
+        if (i == 0) {
+            require(rdma_proxy_run_iteration(handle, i) == 0);
+        } else {
+            require(rdma_proxy_complete_iteration(handle, i) != 0);
+            require(rdma_proxy_run_iteration_payload(handle, i) == 0);
+            require(rdma_proxy_run_iteration_payload(handle, i) != 0);
+            require(rdma_proxy_run_iteration(handle, i) != 0);
+            require(rdma_proxy_finish(handle) != 0);
+            require(rdma_proxy_complete_iteration(handle, i + 1) != 0);
+            require(rdma_proxy_get_outgoing_token_indices(handle, source_node, outgoing.data(), capacity,
+                        &outgoing_rows, &original_tokens) == 0);
+            require(rdma_proxy_complete_iteration(handle, i) == 0);
+            require(rdma_proxy_complete_iteration(handle, i) != 0);
+        }
         require(rdma_proxy_wait_cpu_scatter_ready(handle, i, 1, 5000) == 0);
         const auto local_count = std::count_if(masks.begin(), masks.end(),
                                                [gpu](uint8_t mask) { return mask & (1u << gpu); });

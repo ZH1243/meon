@@ -56,6 +56,8 @@ public:
     int native_local_publication_state(uint64_t iteration) const;
     void prepare_iteration_step(uint64_t iteration);
     void run_iteration_step(uint64_t iteration);
+    void run_iteration_payload(uint64_t iteration);
+    void complete_iteration_step(uint64_t iteration);
     void record_router_computation_end(uint64_t iteration, uintptr_t cuda_stream);
     float router_computation_elapsed_ms(uint64_t iteration);
     std::size_t router_computation_num_tokens() const;
@@ -550,6 +552,8 @@ private:
     std::vector<double> rdma_iteration_bandwidth_gbps_;
     std::vector<std::string> metadata_exchange_reports_;
     std::vector<std::string> rdma_bandwidth_reports_;
+    enum class PayloadState { Pending, ReadyForDone, Failed };
+    PayloadState payload_state_{PayloadState::Pending};
     bool iteration_prepared_{false};
     uint64_t prepared_iteration_{0};
     LocalIterationSyncHeader* local_iteration_sync_header_{nullptr};

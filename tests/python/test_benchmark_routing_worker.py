@@ -100,7 +100,8 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
     def run_worker(self, *, compute=False, fail_epoch=None, scatter_publication=None,
                    tile_major=True, has_reservation_api=True, rows_per_epoch=(1, 0), down_factory=None,
                    native_returns=False, early=False, concurrent_publication=False, native_publication=False,
-                   fail_prepare=False, fail_up=False, fail_local=False, inter_combine=False, need_counts=False):
+                   fail_prepare=False, fail_up=False, fail_local=False, inter_combine=False, need_counts=False,
+                   fail_inter_epoch=None, split_api=True):
         events, output = [], io.StringIO()
 
         def status(name):
@@ -124,6 +125,9 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
             rdma_proxy_record_computation_end=status("up_end"), rdma_proxy_get_computation_elapsed_ms=write(1.0),
             rdma_proxy_finish=status("finish"), rdma_proxy_shutdown=status("shutdown"), rdma_proxy_destroy=status("destroy"),
         )
+        if split_api:
+            library.rdma_proxy_run_iteration_payload = status("payload-ready")
+            library.rdma_proxy_complete_iteration = status("iteration-done")
         if early:
             def arm(handle, epoch, stream, armed):
                 events.append(("early-reset", epoch, stream))
@@ -291,6 +295,9 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                     def run_inter(*, local_finished):
                         self.assertIs(local_finished, intra.finished)
                         events.append(("inter-run",))
+                        if events.count(("inter-run",)) - 1 == fail_inter_epoch:
+                            raise RuntimeError("injected inter-node combine stream failure")
+                        events.append(("inter-gpu-finished",))
                     inter.run.side_effect = run_inter
                     stack.enter_context(patch("inter_node_combine.InterNodeCombine", return_value=inter))
                 maps.start.side_effect = lambda epoch: events.append(("start-maps", epoch))
@@ -328,6 +335,10 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                 stack.enter_context(self.assertRaisesRegex(RuntimeError, "injected up launch failure"))
             if fail_epoch is not None:
                 stack.enter_context(self.assertRaisesRegex(RuntimeError, "injected exchange failure"))
+            if fail_inter_epoch is not None:
+                stack.enter_context(self.assertRaisesRegex(RuntimeError, "injected inter-node combine stream failure"))
+            if inter_combine and not split_api:
+                stack.enter_context(self.assertRaisesRegex(RuntimeError, "requires a rebuilt native proxy"))
             if compute:
                 worker.run_proxy_with_concurrent_kernel(
                     library, ["worker"], 0, node_rank=0, local_gpu_index=0, world_size=16, num_experts=128,
@@ -518,14 +529,33 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                 self.assertEqual(output.count("return_done_us="), 3 if need_counts else 0)
                 self.assertEqual(output.count("combine_done_us="), 3)
                 for epoch in range(3):
-                    inter = events.index(("inter-run",), events.index(("payload", epoch)))
-                    finish = events.index(("local-finish",), inter)
+                    self.assertNotIn(("payload", epoch), events)
+                    inter = events.index(("inter-run",), events.index(("payload-ready", epoch)))
+                    done = events.index(("iteration-done", epoch))
+                    self.assertLess(events.index(("inter-gpu-finished",), inter), done)
+                    finish = events.index(("local-finish",), done)
                     if need_counts:
-                        self.assertLess(inter, events.index(("return-counts", epoch)))
+                        self.assertLess(done, events.index(("return-counts", epoch)))
                         self.assertLess(events.index(("return-counts", epoch)), finish)
                     else:
                         self.assertNotIn(("return-counts", epoch), events)
                     self.assertLess(finish, events.index(("intra-node-done", epoch)))
+
+    def test_inter_combine_failure_keeps_iteration_open_until_shutdown(self):
+        with patch("down_wave_schedule.DownWaveSchedule.reserve_if_supported", return_value=None):
+            events, _ = self.run_worker(compute=True, scatter_publication="threaded", native_returns=True,
+                                        inter_combine=True, rows_per_epoch=(1, 0, 2), down_factory=self.down_factory,
+                                        fail_inter_epoch=1)
+        self.assertIn(("iteration-done", 0), events)
+        self.assertIn(("payload-ready", 1), events)
+        self.assertNotIn(("iteration-done", 1), events)
+        self.assertNotIn(("intra-node-done", 1), events)
+        self.assertNotIn(("prepare", 2), events)
+        self.assertIn(("close", False), events)
+
+    def test_inter_combine_requires_split_api_before_initialization(self):
+        events, _ = self.run_worker(compute=True, native_returns=True, inter_combine=True, split_api=False)
+        self.assertNotIn(("init",), events)
 
     def test_native_install_publication_grows_once_and_reuses_the_slab(self):
         schedule = Mock()

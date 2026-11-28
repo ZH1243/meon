@@ -1797,6 +1797,11 @@ def load_proxy_library(path: Path, *, torch_cuda_version=None) -> ctypes.CDLL:
     library.rdma_proxy_get_computation_num_tokens.restype = ctypes.c_int
     library.rdma_proxy_run_iteration.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
     library.rdma_proxy_run_iteration.restype = ctypes.c_int
+    for name in ("rdma_proxy_run_iteration_payload", "rdma_proxy_complete_iteration"):
+        fn = getattr(library, name, None)
+        if fn is not None:
+            fn.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+            fn.restype = ctypes.c_int
     library.rdma_proxy_finish.argtypes = [ctypes.c_void_p]
     library.rdma_proxy_finish.restype = ctypes.c_int
     library.rdma_proxy_shutdown.argtypes = [ctypes.c_void_p]
@@ -2141,6 +2146,15 @@ def run_proxy_with_concurrent_kernel(
     # Like down GEMM, oversized budgets are accepted and capped by QuACK's
     # hardware-aware cluster capacity; this is not physical SM reservation.
     validate_up_sm_count(up_sm_count, expert_gemm_cluster_m)
+    run_payload = library.rdma_proxy_run_iteration
+    complete_iteration = None
+    if down_options.inter_node_combine:
+        try:
+            run_payload = library.rdma_proxy_run_iteration_payload
+            complete_iteration = library.rdma_proxy_complete_iteration
+        except AttributeError as error:
+            raise RuntimeError("--inter-node-combine requires a rebuilt native proxy on all ranks "
+                               "to signal iteration_done after GPU completion") from error
     torch = import_torch_for_proxy(cuda_device_id)
     capacity = resolve_gemm_architecture(
         getattr(down_options, "gemm_arch", "auto"),
@@ -2449,7 +2463,7 @@ def run_proxy_with_concurrent_kernel(
                     prepared.set_result(prepare())
                 elif start_barrier is not None:
                     start_barrier.wait()
-                require_proxy_success(library, library.rdma_proxy_run_iteration(handle, iteration),
+                require_proxy_success(library, run_payload(handle, iteration),
                                       f"proxy iteration {iteration}")
             except BaseException as error:
                 if start_barrier is None:
@@ -2601,7 +2615,7 @@ def run_proxy_with_concurrent_kernel(
             log_startup("proxy result received")
             combine = down.intra_node_combine if return_exchange is not None else None
             try:
-                if combine is not None and combine.inter_node_combine is not None:
+                if complete_iteration is not None:
                     # payload.result() covers reverse-RDMA completion and visibility.
                     # Down has recorded the local combine event for this iteration.
                     combine.inter_node_combine.run(local_finished=combine.finished)
@@ -2609,6 +2623,10 @@ def run_proxy_with_concurrent_kernel(
                 kernel_finished.synchronize()
                 early_up_iteration = None
             log_startup("GPU iteration complete")
+            if complete_iteration is not None:
+                # InterNodeCombine.run joins its CUDA stream before returning.
+                require_proxy_success(library, complete_iteration(handle, iteration),
+                                      f"post-combine iteration_done for iteration {iteration}")
             if trace is not None:
                 down_traces.append((iteration, trace.read(iteration)))
             if return_exchange is not None and return_exchange.needs_return_counts:

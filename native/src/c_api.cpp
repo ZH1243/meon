@@ -655,9 +655,9 @@ extern "C" int rdma_proxy_get_num_iterations(
     return 0;
 }
 
-extern "C" int rdma_proxy_run_iteration(
-    RdmaProxyHandle* handle,
-    uint64_t iteration) {
+enum class IterationAction { Run, RunPayload, Complete };
+
+static int execute_iteration(RdmaProxyHandle* handle, uint64_t iteration, IterationAction action) {
     clear_error();
     if (handle == nullptr) {
         last_error = "rdma_proxy_run_iteration received a null handle";
@@ -684,12 +684,31 @@ extern "C" int rdma_proxy_run_iteration(
         // call this function from a coordinator thread other than the thread
         // that initialized the proxy, so select the configured device here.
         select_proxy_cuda_device(*handle);
-        handle->proxy.run_iteration_step(iteration);
+        if (action == IterationAction::RunPayload) {
+            handle->proxy.run_iteration_payload(iteration);
+            return 0;
+        }
+        if (action == IterationAction::Complete)
+            handle->proxy.complete_iteration_step(iteration);
+        else
+            handle->proxy.run_iteration_step(iteration);
         ++handle->next_iteration;
         return 0;
     } catch (...) {
         return record_current_exception();
     }
+}
+
+extern "C" int rdma_proxy_run_iteration(RdmaProxyHandle* handle, uint64_t iteration) {
+    return execute_iteration(handle, iteration, IterationAction::Run);
+}
+
+extern "C" int rdma_proxy_run_iteration_payload(RdmaProxyHandle* handle, uint64_t iteration) {
+    return execute_iteration(handle, iteration, IterationAction::RunPayload);
+}
+
+extern "C" int rdma_proxy_complete_iteration(RdmaProxyHandle* handle, uint64_t iteration) {
+    return execute_iteration(handle, iteration, IterationAction::Complete);
 }
 
 extern "C" int rdma_proxy_prepare_early_up(RdmaProxyHandle* handle, uint64_t iteration,

@@ -623,6 +623,21 @@ OMP_NUM_THREADS=1 PYTHONPATH=tests/python /Users/zhuhao/opt/anaconda3/bin/python
 OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -q
 ```
 
+#### Checking the post-combine barrier against H800 report 27
+
+Update the Python worker and rebuild the native shared library on both nodes with `cmake --build "$RDMA_PROXY_BUILD_DIR" --target rdma_cpu_proxy_shared -j4`. Use the report 27 launch arguments on both nodes. Each rank should finish the inter-node combine kernel before its native `phase=iteration_done` completes. The native log reports the remote and same-node waits as `peer_wait_us` and `local_wait_us`. The Python `combine_done_us` field measures the later same-node reader check-in.
+
+For the performance comparison, use GPU 0 and iterations 1–4. Measure the last PCIe RX sample above 5% to inter-node combine start as in report 27, and compare full iteration time. Repeat the small two-node run with the return-copy, intra-node, RDMA-return and inter-node checks enabled to verify reuse across iterations.
+
+Host checks on arm64 macOS 15.6.1 used a Debug mock build, Python 3.9.12 and CPU PyTorch 1.13.1. The native regression holds one of eight mock consumers back and checks when the other ranks can leave the barrier. The worker regression covers an empty iteration and a failed combine. Two-node GPU ordering, numerical checks and timing remain to be verified on Hopper.
+
+```bash
+cmake --build build/mock -j6
+ctest --test-dir build/mock --output-on-failure
+ctest --test-dir build/mock -R '^test_(benchmark_routing|c_api)$' --repeat until-fail:5 --output-on-failure
+OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -q
+```
+
 ### Two-node test on Hopper
 
 Start these commands concurrently. The addresses below are the checked-in Hopper profile. If your hosts have different addresses, use node 0's rendezvous address for `MASTER_ADDR` in both shells and the opposite host's proxy address for each `PEER_HOST`.

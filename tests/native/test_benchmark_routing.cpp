@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <future>
@@ -171,7 +172,8 @@ uint8_t payload_value(int epoch, int gpu, int token) {
     return static_cast<uint8_t>(epoch*40 + gpu*3 + token + 1);
 }
 
-void run_benchmark_iteration(Rank& rank, int gpu, int epoch, bool split_transport, bool prebound) {
+void run_benchmark_iteration(Rank& rank, int gpu, int epoch, bool split_transport, bool prebound,
+                             std::atomic<int>& finished_consumers) {
     std::array<std::vector<int32_t>, nodes> rows;
     std::vector<int32_t> r;
     const auto dest = destination_gpu(epoch, gpu, 0);
@@ -517,7 +519,30 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch, bool split_transpor
             (epoch == 1 && state.published_rows != 0))
             throw std::runtime_error("repeated preparation changed the local prefix");
     }
-    rank.proxy->run_iteration_step(epoch);
+    if (split_transport) {
+        expect_error([&] { rank.proxy->complete_iteration_step(epoch); });
+        rank.proxy->run_iteration_payload(epoch);
+        expect_error([&] { rank.proxy->run_iteration_step(epoch); });
+        expect_error([&] { rank.proxy->complete_iteration_step(epoch + 1); });
+        expect_error([&] { rank.proxy->prepare_routing(epoch + 1); });
+        expect_error([&] { rank.proxy->finish_run(); });
+        // Hold one simulated GPU consumer until every other rank can enter done.
+        if (gpu == gpus - 1) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (finished_consumers.load() < gpus - 1) {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    throw std::runtime_error("payload completion waited for a peer's final consumer");
+                std::this_thread::yield();
+            }
+        }
+        ++finished_consumers;
+        rank.proxy->complete_iteration_step(epoch);
+        if (finished_consumers.load() != gpus)
+            throw std::runtime_error("iteration_done released before every consumer finished");
+        expect_error([&] { rank.proxy->complete_iteration_step(epoch); });
+    } else {
+        rank.proxy->run_iteration_step(epoch);
+    }
     if (split_transport && gpu == 0 && epoch == 2) {
         rank.proxy->wait_cpu_scatter_ready(epoch, 1, 5000);
         for (int source = 0; source < nodes*gpus; ++source) {
@@ -732,6 +757,7 @@ void run(bool prepared, bool validate, bool split_transport) {
     }
     on_all_gpus([&](int gpu) { ranks[gpu].proxy->initialize(); });
     for (int epoch = 0; epoch < 3; ++epoch) {
+        std::atomic<int> finished_consumers{0};
         on_all_gpus([&](int gpu) {
             if (split_transport && epoch == 2 && gpu == gpus - 1) {
                 // Hold a peer before installation. Rank zero must publish real
@@ -759,7 +785,8 @@ void run(bool prepared, bool validate, bool split_transport) {
                     std::this_thread::yield();
                 }
             }
-            run_benchmark_iteration(ranks[gpu], gpu, epoch, split_transport, prepared && split_transport);
+            run_benchmark_iteration(ranks[gpu], gpu, epoch, split_transport, prepared && split_transport,
+                                    finished_consumers);
         });
         if (!epoch) {
             const auto state = ranks[0].proxy->native_local_publication_state(epoch);

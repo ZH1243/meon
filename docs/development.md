@@ -596,6 +596,19 @@ OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discove
 ROUTER_METADATA_BENCH_LIBRARY="$PWD/build/exchange-cpu/librouter_metadata_bench.dylib" PYTHONDONTWRITEBYTECODE=1 /Users/zhuhao/opt/anaconda3/bin/python3 -m unittest discover -s benchmarks/router_metadata_exchange -p test_benchmark.py -v
 ```
 
+#### Comparing local completion waits with H800 report 25
+
+Update `python/rdma_proxy_worker.py` and `python/rdma_return_exchange.py` on both nodes. Use the same QuACK checkout and launch arguments. The return-copy startup line reports `local_completion=fifo` when all workers on that node support wakeup notifications. A node containing an older worker uses the shared-record polling path.
+
+Run the small numerical check with projection and return/combine validation enabled, then repeat the report 25 profile. Each `local_completion` summary line records host time spent in the return-count gather (`return_done_us`) and, when enabled, the reader-completion gather (`combine_done_us`). Compare these for iteration *i* with route-generator finish-time spread and `reuse_barrier_us` in iteration *i + 1*. In report 25 the median Gloo reuse-barrier time was 9.84 ms across node 0’s eight GPUs in iterations 1–4. The preceding gathers and the 16-rank Gloo barrier protect different buffers.
+
+CPU verification used arm64 macOS 15.6.1 and Python 3.9.12. The return tests use real FIFOs for delayed arrival, repeated stages, cancellation, timeout and partial setup. The two-node H800 numerical and timing checks require the target hosts.
+
+```bash
+OMP_NUM_THREADS=1 PYTHONPATH=tests/python /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest -q test_return_exchange_cleanup test_benchmark_routing_worker
+OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -q
+```
+
 ### Two-node test on Hopper
 
 Start these commands concurrently. The addresses below are the checked-in Hopper profile. If your hosts have different addresses, use node 0's rendezvous address for `MASTER_ADDR` in both shells and the opposite host's proxy address for each `PEER_HOST`.

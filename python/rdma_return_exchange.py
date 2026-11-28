@@ -1,7 +1,10 @@
 """Same-node return storage and IPC control plane for the embedded proxy."""
 
+from contextlib import ExitStack
 import ctypes
 import os
+import selectors
+import tempfile
 import time
 
 
@@ -11,6 +14,66 @@ class ReturnCopy(ctypes.Structure):
         ("capacity_bytes", ctypes.c_uint64), ("row_index", ctypes.c_uint64),
         ("peer", ctypes.c_int32),
     ]
+
+
+class _CompletionWakeups:
+    """Rank-local FIFO notifications. The shared exchange owns the stage values and errors."""
+
+    def __init__(self, control):
+        self.control = control
+        self.writers = []
+        with ExitStack() as setup:
+            self.directory = tempfile.TemporaryDirectory(dir=control.path.parent)
+            directory = setup.enter_context(self.directory)
+            self.path = os.path.join(directory, "ready")
+            os.mkfifo(self.path, 0o600)
+            self.reader = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
+            setup.callback(os.close, self.reader)
+            self.selector = setup.enter_context(selectors.DefaultSelector())
+            self.selector.register(self.reader, selectors.EVENT_READ)
+            self.resources = setup.pop_all()
+
+    def connect(self, paths):
+        for rank, path in enumerate(paths):
+            if rank != self.control.rank:
+                fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+                self.writers.append(fd)
+                self.resources.callback(os.close, fd)
+
+    def notify(self):
+        for fd in self.writers:
+            try:
+                os.write(fd, b"\x01")
+            except BlockingIOError:
+                pass  # A full pipe already contains a wakeup.
+            except BrokenPipeError:
+                pass  # A peer can already have left during abort.
+
+    def gather(self, stage, value):
+        deadline = time.monotonic() + self.control.timeout
+        # state(stage, value) publishes and returns a snapshot under one file lock.
+        state = self.control.state(stage, value)
+        if len(state[stage]) == self.control.world:
+            self.notify()
+        while True:
+            if state.get("error"):
+                raise RuntimeError(f"Token exchange worker failed: {state['error']}")
+            values = state[stage]
+            if len(values) == self.control.world:
+                return [values[str(rank)] for rank in range(self.control.world)]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Token exchange timed out at {stage}; arrived: {list(values)}")
+            # epoll accepts a signed 32-bit millisecond timeout.
+            if self.selector.select(min(remaining, 86400)):
+                if not os.read(self.reader, 4096):
+                    raise RuntimeError(f"Local completion peers disconnected at {stage}")
+            # Notifications can coalesce or belong to an earlier stage. Only
+            # this stage's complete shared record releases its readers.
+            state = self.control.state()
+
+    def close(self):
+        self.resources.close()
 
 
 class ReturnExchange:
@@ -56,6 +119,8 @@ class ReturnExchange:
         trace_startup("initial CUDA synchronization")
         torch.cuda.synchronize(device)
         self.closed = False
+        self.wakeups = None
+        self.completion_wait_ns = {}
         try:
             if self.world < 2:
                 raise ValueError("return-token-results requires at least two local GPUs")
@@ -75,11 +140,19 @@ class ReturnExchange:
                          options.inter_node_combine, options.check_inter_node_combine,
                          os.environ.get("CUDA_VISIBLE_DEVICES")]
             trace_startup(f"configuration exchange: waiting for {self.world} local ranks")
+            self.wakeups = _CompletionWakeups(self.control)
             settings = self.control.gather("configuration", {
-                "signature": signature, "device": device, "sources": sources,
+                "signature": signature, "device": device, "sources": sources, "completion_fifo": self.wakeups.path,
             })
             if any(item["signature"] != signature for item in settings):
                 raise ValueError("return layouts/options must match across local ranks")
+            paths = [item.get("completion_fifo") for item in settings]
+            if all(paths):
+                self.wakeups.connect(paths)
+            else:
+                # Older local workers still publish through the same shared record.
+                self.wakeups.close()
+                self.wakeups = None
             self.settings = settings
             trace_startup(f"allocating {(self.world - 1) * len(nodes)} receive buffers")
             for peer in range(self.world):
@@ -146,15 +219,21 @@ class ReturnExchange:
             trace_startup("native return stream configured; waiting for local ranks")
             self.control.gather("configured")
             trace_startup("return exchange ready")
+            if self.wakeups is not None:
+                # All peers have opened their writers. Descriptors suffice from
+                # here, even if a worker is killed during the measured run.
+                self.wakeups.directory.cleanup()
+            completion_mode = "fifo" if self.wakeups is not None else "poll"
             print(f"Return copies configured: receive_slots={len(self.received)} "
                   f"mode={'per-group' if options.return_token_results_per_group else 'whole-buffer'} "
-                  "stream=dedicated-nonblocking; return completion/barrier excluded from GEMM timing",
+                  f"stream=dedicated-nonblocking local_completion={completion_mode}; "
+                  "return completion/barrier excluded from GEMM timing",
                   flush=True)
         except BaseException as error:
             trace_startup(f"return setup failed: {error}")
-            self.control.state("error", str(error))
-            # Retain allocations/imports on failure until process exit.
+            # Retain allocations/imports even if notifying a peer also fails.
             _failed_exchanges.append(self)
+            self._abort_completion(str(error))
             raise
 
     def require(self, status):
@@ -191,11 +270,29 @@ class ReturnExchange:
         self.arm(iteration)
         self.down.intra_node_combine.bind_return_maps(iteration)
 
+    def gather_completion(self, phase, iteration, value=True):
+        stage = f"{phase}-{iteration}"
+        start = time.perf_counter_ns()
+        gather = self.wakeups.gather if self.wakeups is not None else self.control.gather
+        result = gather(stage, value)
+        self.completion_wait_ns[phase] = time.perf_counter_ns() - start
+        return result
+
+    def _abort_completion(self, message):
+        try:
+            self.control.state("error", message)
+            if self.wakeups is not None:
+                self.wakeups.notify()
+        finally:
+            if self.wakeups is not None:
+                self.wakeups.close()
+                self.wakeups = None
+
     def finish_iteration(self, iteration):
         # Caller already waited for native outgoing-return completion. The
         # all-rank barrier establishes incoming completion before reuse.
         counts = self.rows_host.tolist()
-        all_counts = self.control.gather(f"done-{iteration}", counts)
+        all_counts = self.gather_completion("done", iteration, counts)
         for peer, source_node in self.received:
             index = self.settings[peer]["sources"].index([source_node, self.rank])
             self.received_valid_rows[peer, source_node] = all_counts[peer][index]
@@ -234,8 +331,8 @@ class ReturnExchange:
             return
         self.closed = True
         if not success:
-            self.control.state("error", "return exchange aborted")
             _failed_exchanges.append(self)
+            self._abort_completion("return exchange aborted")
             return
         try:
             self.control.gather("workers_stopped")
@@ -243,6 +340,9 @@ class ReturnExchange:
             self.control.gather("imports_closed")
             for exported in self.exports:
                 exported.release()
+            if self.wakeups is not None:
+                self.wakeups.close()
+                self.wakeups = None
             self.control.close()
             # Counter release alone does not destroy the exported storages.
             # Break down -> exchange -> down so they are reclaimed before

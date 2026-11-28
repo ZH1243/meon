@@ -2070,6 +2070,12 @@ def print_benchmark_routing(node, gpu, iteration, elapsed_ns, stats, up_submitte
           f"native_local_publication={int(stats.get('native_local_publication', False))} "
           f"native_local_publication_growth={int(stats.get('native_local_publication_growth', False))}",
           flush=True)
+    waits = stats.get("completion_wait_ns", {})
+    if "done" in waits:
+        combine = (f" combine_done_us={waits['intra-node-done'] / 1000:.3f}"
+                   if "intra-node-done" in waits else "")
+        print(f"  local_completion node={node} gpu={gpu} iteration={iteration} "
+              f"return_done_us={waits['done'] / 1000:.3f}{combine}", flush=True)
     marks = stats.get("local_publication_marks")
     if marks is not None:
         submitted = previous = marks["submit"]
@@ -2605,7 +2611,7 @@ def run_proxy_with_concurrent_kernel(
                     if down.intra_node_combine.inter_node_combine is not None:
                         down.intra_node_combine.inter_node_combine.run()
                     # No rank may overwrite returned buffers while a peer still combines.
-                    return_exchange.control.gather(f"intra-node-done-{iteration}")
+                    return_exchange.gather_completion("intra-node-done", iteration)
             # Snapshot existing completion joins before projection validation;
             # append the optional tail reset separately without hiding its cost.
             # Return/combine check flags must also be disabled for performance runs.
@@ -2634,6 +2640,8 @@ def run_proxy_with_concurrent_kernel(
                              concurrent_local_publication=prepared is not None,
                              native_local_publication=native_requested, native_local_publication_growth=grew_slab,
                              local_publication_marks=publication_marks)
+                if return_exchange is not None:
+                    stats["completion_wait_ns"] = return_exchange.completion_wait_ns.copy()
                 benchmark_timings.append((stats, up_submitted_ns))
             elapsed_ms = ctypes.c_float()
             require_proxy_success(

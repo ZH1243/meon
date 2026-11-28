@@ -275,6 +275,11 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                 stack.enter_context(patch.object(worker, "DownProjectionRunner", down_factory(events)))
             if native_returns:
                 maps, exchange, intra = Mock(), Mock(), Mock(inter_node_combine=None)
+                exchange.completion_wait_ns = {}
+                exchange.finish_iteration.side_effect = lambda epoch: exchange.completion_wait_ns.update(
+                    {"done": (epoch + 1) * 1000})
+                exchange.gather_completion.side_effect = lambda phase, epoch: exchange.completion_wait_ns.update(
+                    {phase: (epoch + 1) * 2000})
                 maps.start.side_effect = lambda epoch: events.append(("start-maps", epoch))
                 exchange.arm_and_bind_maps.side_effect = lambda epoch: events.append(("arm-maps", epoch))
                 exchange.arm.side_effect = lambda epoch: events.append(("arm", epoch))
@@ -501,6 +506,9 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                          [("bind-publication", 16), ("bind-publication", 48)])
         self.assertEqual(output.count("native_local_publication=1"), 2)
         self.assertEqual(output.count("native_local_publication_growth=1"), 1)
+        for epoch in range(4):
+            self.assertIn(f"local_completion node=0 gpu=0 iteration={epoch} "
+                          f"return_done_us={epoch + 1:.3f} combine_done_us={2 * (epoch + 1):.3f}", output)
         self.assertNotIn("submit_to_request_us=", output)
         self.assertEqual(output.count("scatter_views_us="), 2)
         self.assertEqual([e for e in events if e[0] == "scatter"], [("scatter", 1)])

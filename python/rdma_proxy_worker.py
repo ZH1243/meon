@@ -956,6 +956,19 @@ class CpuScatterConfig(ctypes.Structure):
         ("counts", ctypes.POINTER(ctypes.c_int64)),
         ("output_to_input", ctypes.POINTER(ctypes.c_int64))]
 
+    @classmethod
+    def for_outputs(cls, down, counts, inverse):
+        up = down.up
+        sources = len(up.source_pairs)
+        pairs = (ctypes.c_int32 * (2 * sources))(
+            *(value for pair in up.source_pairs for value in pair))
+        bases = (ctypes.c_uint64 * sources)(*(buffer.data_ptr() for buffer in down.output_buffers()))
+        index_ptr = ctypes.POINTER(ctypes.c_int64)
+        return cls(ctypes.sizeof(cls), sources, 0, down.combine_rows, int(up.x_buffers[0].shape[1]),
+                   down.combine_tile_n or 0, up.output.element_size(), 0, pairs, bases,
+                   ctypes.cast(counts.data_ptr(), index_ptr),
+                   ctypes.cast(inverse.data_ptr(), index_ptr) if inverse is not None else None)
+
 
 class AsyncScatterLookup:
     """Stable host destinations written by the native scatter thread on refreshed routes."""
@@ -964,12 +977,34 @@ class AsyncScatterLookup:
 
     def reserve_addresses(self, up, columns):
         # cudaMalloc on cache growth can join a polling up kernel. Reserve before launch.
-        size = up.output_storage.shape[0] * columns * 8
+        capacity = up.output_storage.shape[0]
+        size = capacity * columns * 8
+        if up.route_weights is not None:
+            size = (size + 15) // 16 * 16 + capacity * 4
         if self.address_storage is None or self.address_storage.numel() < size:
             self.address_storage = up.torch.empty(size, dtype=up.torch.uint8, device=up.output.device)
             # Native H2D uses a different stream. Finish a stream-ordered
             # allocation on growth, before a polling kernel can be resident.
             up.torch.cuda.current_stream(up.cuda_device_id).synchronize()
+
+    def register(self, library, handle, routes, slab, weights):
+        # Native copies the geometry and output bases before returning. The slab,
+        # output tensors and host counts/inverse remain live through retirement.
+        self.config.routes = routes
+        self.config.scatter_addresses = slab.data_ptr()
+        packed_weights = weights.data_ptr() if weights is not None else 0
+        status = self.configure(handle, ctypes.byref(self.config), packed_weights, slab.numel())
+        require_proxy_success(library, status, "starting native scatter lookup")
+
+    def register_reserved(self, library, handle, up, routes):
+        if self.address_storage is None or not 0 < routes <= up.output.shape[0]:
+            raise ValueError("early scatter registration requires reserved storage and a nonempty current route")
+        shape = (routes, 2) if self.config.tile_n else (routes,)
+        views = allocate_cpu_scatter_metadata_storage(
+            up.torch, shape, up.output.device, up.route_weights is not None, storage=self.address_storage)
+        slab, _, weights = views
+        self.register(library, handle, routes, slab, weights)
+        return views
 
     @classmethod
     def reserve_if_supported(cls, library, down, options, exchange):
@@ -988,6 +1023,7 @@ class AsyncScatterLookup:
                          else torch.empty(sources, dtype=torch.int64, device="cpu"))
         lookup.inverse = (torch.empty((sources, down.combine_rows), dtype=torch.int64, device="cpu")
                           if options.check_projections or options.check_intra_node_combine else None)
+        lookup.config = CpuScatterConfig.for_outputs(down, lookup.counts, lookup.inverse)
         print("Native threaded scatter lookup enabled", flush=True)
         return lookup
 
@@ -1030,7 +1066,8 @@ class DownProjectionRunner:
     """Compose QuACK's existing plain grouped-GEMM runner with the up output."""
 
     def __init__(self, torch, up, counts, options, trace_configure=None, previous=None, *,
-                 defer_wave_schedule=False, external_wave_schedule=None, async_scatter=None, kernel_options=None):
+                 defer_wave_schedule=False, external_wave_schedule=None, async_scatter=None, kernel_options=None,
+                 registered_scatter=None):
         # GroupedGemmRunner has already inserted the selected QuACK checkout.
         from run import hopper_pregather_gemm as pregather
 
@@ -1115,10 +1152,13 @@ class DownProjectionRunner:
             external["output_buffers"] = outputs
             if previous is not None and self.cpu_scatter and self.kernel_options.external_scatter_addresses:
                 # The native publisher fills every live row before down's event wait.
-                address_shape = (routes, 2) if args.n_tile_major_output else (routes,)
-                self.cpu_scatter_metadata, addresses, self.route_weights = allocate_cpu_scatter_metadata_storage(
-                    torch, address_shape, up.output.device, weighted,
-                    storage=getattr(async_scatter, "address_storage", None))
+                if registered_scatter is not None:
+                    self.cpu_scatter_metadata, addresses, self.route_weights = registered_scatter
+                else:
+                    address_shape = (routes, 2) if args.n_tile_major_output else (routes,)
+                    self.cpu_scatter_metadata, addresses, self.route_weights = allocate_cpu_scatter_metadata_storage(
+                        torch, address_shape, up.output.device, weighted,
+                        storage=getattr(async_scatter, "address_storage", None))
                 external["scatter_row_addresses"] = addresses
             elif routes:
                 external["scatter_mapping"] = torch.zeros((routes, 2), dtype=torch.int64, device=up.output.device)
@@ -1291,32 +1331,22 @@ class DownProjectionRunner:
         if self.publish_empty_down is not None:
             self.publish_empty_down(self.up.torch.cuda.current_stream(self.up.cuda_device_id))
 
-    def configure_cpu_scatter(self, library, handle):
-        """Bind the current route's compact maps before native iteration preparation."""
+    def configure_cpu_scatter(self, library, handle, *, already_registered=False):
+        """Bind native scatter and configure the down stream's publication wait."""
         torch = self.up.torch
         sources = len(self.up.source_pairs)
-        pairs = (ctypes.c_int32 * (2 * sources))(
-            *(value for pair in self.up.source_pairs for value in pair))
-        bases = (ctypes.c_uint64 * sources)(
-            *(buffer.data_ptr() for buffer in self.output_buffers()))
         lookup = getattr(self, "async_scatter", None)
-        counts = lookup.counts if lookup is not None else torch.empty(sources, dtype=torch.int64)
-        inverse = lookup.inverse if lookup is not None else torch.empty((sources, self.combine_rows), dtype=torch.int64)
-        # On a deferred refresh the address view starts at byte zero of the slab.
-        addresses = self.cpu_scatter_metadata if self.inputs is None else self.inputs.scatter_row_addresses
-        index_ptr = ctypes.POINTER(ctypes.c_int64)
-        config = CpuScatterConfig(
-            ctypes.sizeof(CpuScatterConfig), sources, self.routes, self.combine_rows,
-            int(self.up.x_buffers[0].shape[1]), self.combine_tile_n or 0,
-            self.up.output.element_size(), addresses.data_ptr(), pairs, bases,
-            ctypes.cast(counts.data_ptr(), index_ptr),
-            ctypes.cast(inverse.data_ptr(), index_ptr) if inverse is not None else None)
         if lookup is not None:
-            packed_weights = self.route_weights.data_ptr() if self.route_weights is not None else 0
-            require_proxy_success(library, lookup.configure(handle, ctypes.byref(config), packed_weights,
-                                                             self.cpu_scatter_metadata.numel()),
-                                  "starting native scatter lookup")
+            counts = lookup.counts
+            if not already_registered:
+                lookup.register(library, handle, self.routes, self.cpu_scatter_metadata, self.route_weights)
         else:
+            counts = torch.empty(sources, dtype=torch.int64)
+            inverse = torch.empty((sources, self.combine_rows), dtype=torch.int64)
+            config = CpuScatterConfig.for_outputs(self, counts, inverse)
+            addresses = self.cpu_scatter_metadata if self.inputs is None else self.inputs.scatter_row_addresses
+            config.routes = self.routes
+            config.scatter_addresses = addresses.data_ptr()
             try:
                 configure = library.rdma_proxy_configure_cpu_scatter
             except AttributeError as error:
@@ -2033,16 +2063,20 @@ def print_benchmark_routing(node, gpu, iteration, elapsed_ns, stats, up_submitte
     if marks is not None:
         submitted = previous = marks["submit"]
         fields = []
-        for phase in ("handoff", "setup_context", "expert_counts", "down_wave_start",
-                      "down_runner", "scatter_register"):
+        for phase in ("handoff", "setup_context", "expert_counts", "scatter_register"):
+            if phase in marks:
+                fields.append(f"{phase}_us={(marks[phase] - previous) / 1000:.3f}")
+                previous = marks[phase]
+        fields.append(f"submit_to_request_us={(marks['request_begin'] - submitted) / 1000:.3f}")
+        fields.append(f"request_call_us={(marks['request_end'] - marks['request_begin']) / 1000:.3f}")
+        previous = marks["request_end"]
+        for phase in ("down_wave_start", "down_runner"):
             if phase in marks:
                 fields.append(f"{phase}_us={(marks[phase] - previous) / 1000:.3f}")
                 previous = marks[phase]
         print(f"  local_publication_timing node={node} gpu={gpu} iteration={iteration} "
               f"r_ready_to_submit_us={(submitted - stats['r_ready_ns']) / 1000:.3f} "
-              f"{' '.join(fields)} "
-              f"submit_to_request_us={(marks['request_begin'] - submitted) / 1000:.3f} "
-              f"request_call_us={(marks['request_end'] - marks['request_begin']) / 1000:.3f}",
+              f"{' '.join(fields)}",
               flush=True)
 
 
@@ -2292,6 +2326,7 @@ def run_proxy_with_concurrent_kernel(
 
         def refresh_runner(iteration, extents, previous, *, up_bound, publication_marks=None):
             down = previous
+            registered_scatter = None
             wave_views = None
             reference_setup_ns = 0
             if return_maps is not None and publication_marks is None:
@@ -2302,6 +2337,14 @@ def run_proxy_with_concurrent_kernel(
             computation_tokens.value = sum(counts)
             if publication_marks is not None:
                 publication_marks["expert_counts"] = time.perf_counter_ns()
+                if down is not None:
+                    registered_scatter = async_scatter.register_reserved(
+                        library, handle, grouped_gemm, computation_tokens.value)
+                    publication_marks["scatter_register"] = time.perf_counter_ns()
+                publication_marks["request_begin"] = time.perf_counter_ns()
+                status = prepare_local(handle, iteration)
+                publication_marks["request_end"] = time.perf_counter_ns()
+                require_proxy_success(library, status, "requesting local gather publication")
             if down_schedule is not None and computation_tokens.value:
                 wave_views = down_schedule.start(iteration, counts)
                 if publication_marks is not None:
@@ -2313,20 +2356,13 @@ def run_proxy_with_concurrent_kernel(
                                             trace_configure=trace.configure if trace else None,
                                             previous=previous, defer_wave_schedule=True,
                                             external_wave_schedule=wave_views, async_scatter=async_scatter,
-                                            kernel_options=previous.kernel_options)
+                                            kernel_options=previous.kernel_options, registered_scatter=registered_scatter)
                 if publication_marks is not None:
                     publication_marks["down_runner"] = time.perf_counter_ns()
                 if down.cpu_scatter:
-                    down.configure_cpu_scatter(library, handle)
-                    if publication_marks is not None:
-                        publication_marks["scatter_register"] = time.perf_counter_ns()
-            if publication_marks is not None:
-                publication_marks["request_begin"] = time.perf_counter_ns()
-                status = prepare_local(handle, iteration)
-                publication_marks["request_end"] = time.perf_counter_ns()
-                require_proxy_success(library, status, "requesting local gather publication")
-                if return_maps is not None:
-                    return_maps.start(iteration)
+                    down.configure_cpu_scatter(library, handle, already_registered=registered_scatter is not None)
+            if publication_marks is not None and return_maps is not None:
+                return_maps.start(iteration)
             if down is not None:
                 if down.output_reset_policy == "end-of-iteration" and not down.combine:
                     down.reset_outputs()

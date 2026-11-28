@@ -241,7 +241,12 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                 exchange.arm.side_effect = lambda epoch: events.append(("arm", epoch))
                 exchange.bind_down.side_effect = lambda down: setattr(down, "intra_node_combine", intra)
                 stack.enter_context(patch.object(worker, "DownReadyTrace"))
-                stack.enter_context(patch.object(worker.AsyncScatterLookup, "reserve_if_supported", return_value=Mock()))
+                lookup = Mock()
+                def register_reserved(library, handle, up, rows):
+                    events.append(("scatter", rows))
+                    return ("registered", rows)
+                lookup.register_reserved.side_effect = register_reserved
+                stack.enter_context(patch.object(worker.AsyncScatterLookup, "reserve_if_supported", return_value=lookup))
                 stack.enter_context(patch("return_maps.ReturnMaps.reserve_if_supported", return_value=maps))
                 stack.enter_context(patch("rdma_return_exchange.ReturnExchange", return_value=exchange))
                 stack.enter_context(patch("intra_node_combine.IntraNodeCombine", return_value=intra))
@@ -297,9 +302,16 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
             prepared_options = SimpleNamespace(external_scatter_addresses=True)
 
             def create(torch, up, counts, options, *, defer_wave_schedule=False, external_wave_schedule=None,
-                       previous=None, kernel_options=None, **kwargs):
+                       previous=None, kernel_options=None, registered_scatter=None, **kwargs):
                 self.assertIs(kernel_options, prepared_options if previous is not None else None)
                 rows, = counts
+                events.append(("construct", rows))
+                def configure_scatter(*args, already_registered=False):
+                    if already_registered:
+                        self.assertEqual(registered_scatter, ("registered", rows))
+                    else:
+                        self.assertIsNone(registered_scatter)
+                        events.append(("scatter", rows))
                 clock = Mock()
                 clock.elapsed_time.return_value = 1.0
                 down = SimpleNamespace(
@@ -308,7 +320,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                     output_reset_policy="before-down", intra_node_combine=None, flops=2 * rows,
                     reset_start=clock, reset_end=clock, mapping_start=clock, gemm_start=clock, end=clock,
                     warmup=lambda: None,
-                    configure_cpu_scatter=lambda *_: events.append(("scatter", rows)),
+                    configure_cpu_scatter=configure_scatter,
                     wait_cpu_scatter_ready=lambda epoch: events.append(("wait-scatter", epoch)),
                 )
                 if not defer_wave_schedule:
@@ -358,7 +370,9 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                 self.assertEqual([int(record["iteration"]) for record in records], [1, 3] if concurrent else [])
                 for record in records:
                     phases = [float(record[name + "_us"]) for name in (
-                        "handoff", "setup_context", "expert_counts", "down_wave_start", "down_runner", "scatter_register")]
+                        "handoff", "setup_context", "expert_counts", "scatter_register")]
+                    self.assertGreaterEqual(float(record["down_wave_start_us"]), 0)
+                    self.assertGreaterEqual(float(record["down_runner_us"]), 0)
                     self.assertTrue(all(value >= 0 for value in phases))
                     # The individually rounded intervals cover submission through scatter registration.
                     self.assertLessEqual(sum(phases), float(record["submit_to_request_us"]) + 0.004)
@@ -394,6 +408,9 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                         if concurrent:
                             requested = events.index(("request-local", epoch))
                             self.assertLess(events.index(("scatter", rows)), requested)
+                            self.assertLess(requested, schedule)
+                            self.assertLess(schedule, events.index(("construct", rows)))
+                            self.assertEqual(events.count(("scatter", rows)), 1)
                             self.assertLess(requested, map_start)
                         else:
                             self.assertLess(up, events.index(("scatter", rows)))
@@ -411,7 +428,8 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                             self.assertLess(up, schedule)
                         elif not early:
                             self.assertLess(schedule, events.index(("bind", rows)))
-                        self.assertLess(schedule, events.index(("scatter", rows)))
+                        if not concurrent:
+                            self.assertLess(schedule, events.index(("scatter", rows)))
                         join = events.index(("wait-schedule", epoch, 42))
                         self.assertLess(wait, join)
                         self.assertLess(join, consumed)

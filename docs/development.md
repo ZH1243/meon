@@ -531,7 +531,7 @@ The post-install barrier removal passed the same host suites on the M1 Max. The 
 
 The CUDA build, two-node numerical and transport checks, and Nsight timing comparison require the Hopper hosts.
 
-#### Diagnosing the host delay in H800 report 22
+#### Comparing first-batch publication with H800 reports 22 and 23
 
 Update `python/rdma_proxy_worker.py` on both nodes and repeat the report 22
 command. For each successful steady iteration with `concurrent_local_publication=1`,
@@ -544,11 +544,11 @@ Each value is host wall time in microseconds from the same rank's monotonic cloc
 | `handoff_us` | Immediately before executor submission through entry into the preparation callable on the coordinator. Includes executor dispatch and time until Python can run there. |
 | `setup_context_us` | Coordinator entry through selection of its CUDA device and setup stream. |
 | `expert_counts_us` | Reading current expert counts and computing the routed token total. |
-| `down_wave_start_us` | Starting the asynchronous down-wave job and binding its returned views. |
-| `down_runner_us` | Constructing the refreshed down projection runner. |
 | `scatter_register_us` | Configuring the current scatter destinations and starting native lookup. |
 | `submit_to_request_us` | Total from executor submission to entry into the native local-publication call. Includes all preceding phases starting at handoff. |
 | `request_call_us` | Wall time inside that native call, which prepares gather inputs and posts the local-ready request. The receiver publishes eligible descriptors asynchronously. |
+| `down_wave_start_us` | After the request returns, starting the asynchronous down-wave job and binding its returned views. |
+| `down_runner_us` | Constructing the refreshed down projection runner with the registered scatter views. |
 
 For iterations 1–4, compare `handoff_us` with the individual setup phases on
 the same GPU. Optional phases appear only when executed. The timings include
@@ -557,11 +557,22 @@ to measure gather-end to first positive ready prefix (report 22 median
 **1.323 ms** across node 0's 32 samples). The worker collects host timestamps
 without adding CUDA synchronization or printing during submission.
 
-Host verification used an Apple M1 Max on macOS 15.6.1 with Python 3.9.12 and
-CPU PyTorch 1.13.1. The instrumented two-node H800 run is outstanding.
+In report 23 the down-wave start and runner construction preceded the request
+and took a combined **189 µs** median. With the updated worker those fields
+follow `request_call_us`. Compare `submit_to_request_us` with **656 µs** and
+GPU gather-end to first positive ready prefix with **1.217 ms**. Check full
+worker iteration time as well (report 23 median **56.74 ms**). Use the same
+eight node 0 GPUs and iterations 1–4. Before the timing capture, run the small
+two-node numerical check above with projection and return/combine checks enabled.
+
+Host verification used the Debug mock build on an Apple M1 Max with macOS
+15.6.1, Python 3.9.12 and CPU PyTorch 1.13.1. The two-node H800 numerical and
+timing checks for this reordering are outstanding.
 
 ```bash
-OMP_NUM_THREADS=1 PYTHONPATH=tests/python /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest -q test_benchmark_routing_worker
+cmake --build build/mock -j6
+ctest --test-dir build/mock --output-on-failure
+OMP_NUM_THREADS=1 PYTHONPATH=tests/python /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest -q test_benchmark_routing_worker test_cpu_scatter_publication
 OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -q
 ```
 

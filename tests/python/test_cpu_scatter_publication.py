@@ -109,6 +109,36 @@ class MetadataSlabTests(unittest.TestCase):
                 lib.rdma_proxy_configure_cpu_scatter_threaded.assert_not_called()
                 lib.rdma_proxy_wait_cpu_scatter_ready.assert_not_called()
 
+    def test_early_scatter_registers_only_live_bytes_after_growth(self):
+        torch = self.torch
+        outputs = (torch.empty(5, 4), torch.empty(5, 4))
+        up = SimpleNamespace(torch=torch, x_buffers=outputs, source_pairs=((1, 0), (0, 0)),
+                             cuda_device_id=0, route_weights=None, output=torch.empty(2, 4))
+        down = SimpleNamespace(up=up, torch=torch, combine_rows=5, combine_tile_n=2,
+                               output_buffers=lambda: outputs)
+        options = SimpleNamespace(cpu_scatter_preparation=True, cpu_scatter_publication="threaded",
+                                  check_projections=False, check_intra_node_combine=False)
+        lib = SimpleNamespace(rdma_proxy_configure_cpu_scatter_async=mock.Mock(return_value=0))
+        lookup = worker.AsyncScatterLookup.reserve_if_supported(lib, down, options, None)
+        with mock.patch.object(torch.cuda, "current_stream") as stream:
+            for routes, capacity in ((2, 2), (5, 6), (1, 6)):
+                up.output_storage = torch.empty(capacity, 4)
+                up.output = up.output_storage[:routes]
+                lookup.reserve_addresses(up, columns=2)
+                slab, addresses, weights = lookup.register_reserved(lib, 123, up, routes)
+                _, config_ptr, weight_ptr, live_bytes = lib.rdma_proxy_configure_cpu_scatter_async.call_args.args
+                config = config_ptr._obj
+                self.assertEqual(config.source_pairs[:4], [1, 0, 0, 0])
+                self.assertEqual(config.output_bases[:2], [t.data_ptr() for t in outputs])
+                self.assertEqual((config.routes, config.tile_n, live_bytes), (routes, 2, routes * 16))
+                self.assertEqual(lookup.address_storage.numel(), capacity * 16)
+                self.assertEqual(config.scatter_addresses, lookup.address_storage.data_ptr())
+                self.assertEqual(slab.data_ptr(), addresses.data_ptr())
+                self.assertEqual(addresses.shape, (routes, 2))
+                self.assertEqual(weight_ptr, 0)
+                self.assertIsNone(weights)
+            self.assertEqual(stream.return_value.synchronize.call_count, 2)
+
     def test_native_wave_slab_reuses_storage_with_exact_table_and_prefix_views(self):
         torch = self.torch
         device = torch.device("cpu")
@@ -310,6 +340,7 @@ class MetadataSlabTests(unittest.TestCase):
             "--down-n-tile-major-output",
         ])
         options.weighted_contributions = True
+        options.check_projections = True
         options.return_token_results = True
         sources = (torch.empty(8, 4), torch.empty(8, 4))
         up = SimpleNamespace(torch=torch, output=torch.empty(8, 4), weights=torch.empty(2, 4, 4),
@@ -318,7 +349,7 @@ class MetadataSlabTests(unittest.TestCase):
                              max_swizzle_size=1, route_weights=(torch.empty(8),), cuda_device_id=0)
         ready_address = torch.tensor([0x1234], dtype=torch.int64)
         submitted = []
-        setup_stream = object()
+        setup_stream = mock.Mock()
         compute_stream = mock.Mock()
         active_stream = setup_stream
 
@@ -369,16 +400,39 @@ class MetadataSlabTests(unittest.TestCase):
             previous = worker.DownProjectionRunner(torch, up, [0, 0], options,
                                                    trace_configure=lambda groups: ready_address.item())
             outputs = previous.output_buffers()
+            library = SimpleNamespace(rdma_proxy_configure_cpu_scatter_async=mock.Mock(return_value=0),
+                                      rdma_proxy_wait_cpu_scatter_ready=mock.Mock(return_value=0))
+            lookup = worker.AsyncScatterLookup.reserve_if_supported(library, previous, options, None)
+            up.output_storage = up.output
+            lookup.reserve_addresses(up, columns=2)
             empty_publisher.prepare_empty_down_publisher.reset_mock()
             for epoch, counts in enumerate(([1, 4], [4, 1], [0, 0], [2, 1]), start=1):
                 with self.subTest(counts=counts):
                     count_before = len(submitted)
                     address = previous.inputs.wave_ready_host_address
                     external_views = (torch.empty(2, 4), torch.empty(1)) if epoch in (2, 4) else None
+                    registered = lookup.register_reserved(library, 123, up, sum(counts)) if external_views else None
+                    if registered is not None:
+                        args = library.rdma_proxy_configure_cpu_scatter_async.call_args.args
+                        config = args[1]._obj
+                        self.assertEqual(config.routes, sum(counts))
+                        self.assertEqual(config.scatter_addresses, lookup.address_storage.data_ptr())
+                        self.assertEqual(config.scatter_addresses, registered[1].data_ptr())
+                        self.assertEqual((args[2], args[3]), (registered[2].data_ptr(), registered[0].numel()))
                     runner = worker.DownProjectionRunner(torch, up, counts, options, previous=previous,
+                                                         async_scatter=lookup if registered is not None else None,
+                                                         registered_scatter=registered,
                                                          trace_configure=lambda groups: ready_address.item(),
                                                          kernel_options=previous.kernel_options,
                                                          defer_wave_schedule=True, external_wave_schedule=external_views)
+                    if registered is not None:
+                        calls = library.rdma_proxy_configure_cpu_scatter_async.call_count
+                        runner.configure_cpu_scatter(library, 123, already_registered=True)
+                        self.assertEqual(library.rdma_proxy_configure_cpu_scatter_async.call_count, calls)
+                        self.assertIs(runner.cpu_scatter_metadata, registered[0])
+                        self.assertIs(runner.route_weights, registered[2])
+                        self.assertIs(runner.cpu_scatter_counts, lookup.counts)
+                        self.assertIs(runner._cpu_scatter_wait, library.rdma_proxy_wait_cpu_scatter_ready)
                     runner.wait_cpu_scatter_ready = mock.Mock()
                     self.assertEqual(len(submitted), count_before)
                     compute_stream.wait_stream.reset_mock()

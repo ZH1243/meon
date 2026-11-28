@@ -100,7 +100,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
     def run_worker(self, *, compute=False, fail_epoch=None, scatter_publication=None,
                    tile_major=True, has_reservation_api=True, rows_per_epoch=(1, 0), down_factory=None,
                    native_returns=False, early=False, concurrent_publication=False, native_publication=False,
-                   fail_prepare=False, fail_up=False, fail_local=False):
+                   fail_prepare=False, fail_up=False, fail_local=False, inter_combine=False, need_counts=False):
         events, output = [], io.StringIO()
 
         def status(name):
@@ -260,7 +260,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                                   down_pingpong=None, down_gather_table_wave_barrier=True,
                                   down_gather_table=True, down_gather_table_expert_waves=True,
                                   down_gather_table_publish_ready=True, return_token_results=native_returns,
-                                  intra_node_combine=native_returns, inter_node_combine=False,
+                                  intra_node_combine=native_returns, inter_node_combine=inter_combine,
                                   return_token_timeout=2,
                                   benchmark_ready_up_gemm=False, check_projections=False, trace_down_ready=False)
         with contextlib.ExitStack() as stack:
@@ -275,11 +275,24 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                 stack.enter_context(patch.object(worker, "DownProjectionRunner", down_factory(events)))
             if native_returns:
                 maps, exchange, intra = Mock(), Mock(), Mock(inter_node_combine=None)
+                exchange.needs_return_counts = need_counts
                 exchange.completion_wait_ns = {}
-                exchange.finish_iteration.side_effect = lambda epoch: exchange.completion_wait_ns.update(
-                    {"done": (epoch + 1) * 1000})
-                exchange.gather_completion.side_effect = lambda phase, epoch: exchange.completion_wait_ns.update(
-                    {phase: (epoch + 1) * 2000})
+                def counts(epoch):
+                    events.append(("return-counts", epoch))
+                    exchange.completion_wait_ns["done"] = (epoch + 1) * 1000
+                def readers(phase, epoch):
+                    events.append((phase, epoch))
+                    exchange.completion_wait_ns[phase] = (epoch + 1) * 2000
+                exchange.finish_iteration.side_effect = counts
+                exchange.gather_completion.side_effect = readers
+                intra.finish.side_effect = lambda: events.append(("local-finish",))
+                if inter_combine:
+                    inter = Mock()
+                    def run_inter(*, local_finished):
+                        self.assertIs(local_finished, intra.finished)
+                        events.append(("inter-run",))
+                    inter.run.side_effect = run_inter
+                    stack.enter_context(patch("inter_node_combine.InterNodeCombine", return_value=inter))
                 maps.start.side_effect = lambda epoch: events.append(("start-maps", epoch))
                 exchange.arm_and_bind_maps.side_effect = lambda epoch: events.append(("arm-maps", epoch))
                 exchange.arm.side_effect = lambda epoch: events.append(("arm", epoch))
@@ -495,6 +508,25 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                         self.assertLess(schedule, up)
                     self.assertLess(schedule, consumed)
 
+    def test_inter_combine_precedes_optional_counts_and_reader_barrier(self):
+        for need_counts in (False, True):
+            with self.subTest(need_counts=need_counts), patch(
+                    "down_wave_schedule.DownWaveSchedule.reserve_if_supported", return_value=None):
+                events, output = self.run_worker(compute=True, scatter_publication="threaded",
+                                                 native_returns=True, inter_combine=True, need_counts=need_counts,
+                                                 rows_per_epoch=(1, 0, 2), down_factory=self.down_factory)
+                self.assertEqual(output.count("return_done_us="), 3 if need_counts else 0)
+                self.assertEqual(output.count("combine_done_us="), 3)
+                for epoch in range(3):
+                    inter = events.index(("inter-run",), events.index(("payload", epoch)))
+                    finish = events.index(("local-finish",), inter)
+                    if need_counts:
+                        self.assertLess(inter, events.index(("return-counts", epoch)))
+                        self.assertLess(events.index(("return-counts", epoch)), finish)
+                    else:
+                        self.assertNotIn(("return-counts", epoch), events)
+                    self.assertLess(finish, events.index(("intra-node-done", epoch)))
+
     def test_native_install_publication_grows_once_and_reuses_the_slab(self):
         schedule = Mock()
         schedule.start.side_effect = lambda epoch, counts: ("table", counts[0])
@@ -508,7 +540,8 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
         self.assertEqual(output.count("native_local_publication_growth=1"), 1)
         for epoch in range(4):
             self.assertIn(f"local_completion node=0 gpu=0 iteration={epoch} "
-                          f"return_done_us={epoch + 1:.3f} combine_done_us={2 * (epoch + 1):.3f}", output)
+                          f"combine_done_us={2 * (epoch + 1):.3f}", output)
+        self.assertNotIn("return_done_us=", output)
         self.assertNotIn("submit_to_request_us=", output)
         self.assertEqual(output.count("scatter_views_us="), 2)
         self.assertEqual([e for e in events if e[0] == "scatter"], [("scatter", 1)])

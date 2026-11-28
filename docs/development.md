@@ -609,6 +609,20 @@ OMP_NUM_THREADS=1 PYTHONPATH=tests/python /Users/zhuhao/opt/anaconda3/bin/python
 OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -q
 ```
 
+#### Comparing inter-node combine launch with H800 report 26
+
+Update the Python worker, `rdma_return_exchange.py` and `inter_node_combine.py` on both nodes. With the report 26 flags, each `local_completion` line should contain `combine_done_us` alone. Use GPU 0, iterations 1–4, and compare the last PCIe RX sample above 5% to the inter-node combine start. In report 26 that gap was 3.75–4.76 ms. The PCIe samples approximate the end of bulk transfer. The kernel still requires native completion and visibility, plus the current local combine event. Compare full iteration time as well.
+
+On the small numerical run, enable both return-copy and intra-node checks and confirm they pass on every rank. In that configuration `return_done_us` should appear alongside `combine_done_us`. The gather follows inter-node launch. Return-only runs continue to provide the valid counts to their consumers.
+
+CPU checks on arm64 macOS with Python 3.9.12 and CPU PyTorch 1.13.1 cover checked and unchecked launch order, empty routes, event reuse and compatibility with local workers that still require the gather. The two-node correctness and performance measurements require the Hopper hosts.
+
+```bash
+ctest --test-dir build/mock -R '^test_(rdma_returns|return_copies|return_batch_sync)$' --output-on-failure
+OMP_NUM_THREADS=1 PYTHONPATH=tests/python /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest -q test_benchmark_routing_worker test_return_exchange_cleanup test_inter_node_combine test_intra_node_combine
+OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -q
+```
+
 ### Two-node test on Hopper
 
 Start these commands concurrently. The addresses below are the checked-in Hopper profile. If your hosts have different addresses, use node 0's rendezvous address for `MASTER_ADDR` in both shells and the opposite host's proxy address for each `PEER_HOST`.

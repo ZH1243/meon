@@ -22,6 +22,18 @@ class Storage:
     pass
 
 
+class ReturnCountTests(unittest.TestCase):
+    def test_counts_for_output_validation_and_older_peers(self):
+        peers = [{"optional_return_counts": True}] * 8
+        for combine, check_copy, check_combine, expected in (
+                (False, False, False, True), (True, False, False, False),
+                (True, True, False, True), (True, False, True, True)):
+            options = SimpleNamespace(intra_node_combine=combine, check_return_token_results=check_copy,
+                                      check_intra_node_combine=check_combine)
+            self.assertEqual(MODULE._needs_return_counts(options, peers), expected)
+            self.assertTrue(MODULE._needs_return_counts(options, [*peers[:-1], {}]))
+
+
 class CompletionTests(unittest.TestCase):
     def setUp(self):
         stack = ExitStack()

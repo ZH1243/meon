@@ -2071,11 +2071,11 @@ def print_benchmark_routing(node, gpu, iteration, elapsed_ns, stats, up_submitte
           f"native_local_publication_growth={int(stats.get('native_local_publication_growth', False))}",
           flush=True)
     waits = stats.get("completion_wait_ns", {})
-    if "done" in waits:
-        combine = (f" combine_done_us={waits['intra-node-done'] / 1000:.3f}"
-                   if "intra-node-done" in waits else "")
+    if waits:
+        fields = [f"{name}={waits[phase] / 1000:.3f}" for phase, name in
+                  (("done", "return_done_us"), ("intra-node-done", "combine_done_us")) if phase in waits]
         print(f"  local_completion node={node} gpu={gpu} iteration={iteration} "
-              f"return_done_us={waits['done'] / 1000:.3f}{combine}", flush=True)
+              f"{' '.join(fields)}", flush=True)
     marks = stats.get("local_publication_marks")
     if marks is not None:
         submitted = previous = marks["submit"]
@@ -2599,19 +2599,24 @@ def run_proxy_with_concurrent_kernel(
                         f"concurrent CUDA kernel failed at iteration {iteration}: {kernel_error}"
                     ) from kernel_error
             log_startup("proxy result received")
-            kernel_finished.synchronize()
-            early_up_iteration = None
+            combine = down.intra_node_combine if return_exchange is not None else None
+            try:
+                if combine is not None and combine.inter_node_combine is not None:
+                    # payload.result() covers reverse-RDMA completion and visibility.
+                    # Down has recorded the local combine event for this iteration.
+                    combine.inter_node_combine.run(local_finished=combine.finished)
+            finally:
+                kernel_finished.synchronize()
+                early_up_iteration = None
             log_startup("GPU iteration complete")
             if trace is not None:
                 down_traces.append((iteration, trace.read(iteration)))
-            if return_exchange is not None:
+            if return_exchange is not None and return_exchange.needs_return_counts:
                 return_exchange.finish_iteration(iteration)
-                if down.intra_node_combine is not None:
-                    down.intra_node_combine.finish()
-                    if down.intra_node_combine.inter_node_combine is not None:
-                        down.intra_node_combine.inter_node_combine.run()
-                    # No rank may overwrite returned buffers while a peer still combines.
-                    return_exchange.gather_completion("intra-node-done", iteration)
+            if combine is not None:
+                combine.finish()
+                # No rank may overwrite returned buffers while a peer still combines or validates.
+                return_exchange.gather_completion("intra-node-done", iteration)
             # Snapshot existing completion joins before projection validation;
             # append the optional tail reset separately without hiding its cost.
             # Return/combine check flags must also be disabled for performance runs.

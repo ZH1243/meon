@@ -2348,11 +2348,14 @@ positive system-release ready prefix therefore also establishes count readiness.
 
 In whole-buffer mode, the receiver continues polling until the return stream
 completes; per-group mode waits synchronously for each group, including the last.
-Python waits for return completion and a same-node rank barrier
-before starting the next iteration. The barrier also exchanges valid counts.
-`down.return_exchange.received[(peer, source_node)]` exposes the receive tensor;
-`received_valid_rows[(peer, source_node)]` gives its current valid count after
-the barrier. Exported allocations and imported mappings remain alive until all
+The worker joins native returns and synchronizes local readers before reuse.
+Return-only mode and the return-copy or intra-node validation checks exchange
+valid row counts. In these modes, `received_valid_rows[(peer, source_node)]`
+gives the live prefix of `down.return_exchange.received[(peer, source_node)]`.
+With combine enabled and those checks disabled, updated ranks skip this
+exchange and the dictionary stays empty. If an older local worker requires
+the collective, all local ranks participate. Inter-node combine reads its
+prepared row maps and can launch before any count exchange. Exported allocations and imported mappings remain alive until all
 workers stop and all imports close. Non-identity CUDA device maps are supported;
 all workers must use consistent CUDA visibility and distinct devices.
 

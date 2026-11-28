@@ -5,10 +5,29 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'python'))
-from inter_node_combine import InterNodeCombine, inverse_token_rows
+from inter_node_combine import InterNodeCombine, TokenOrderCombine, inverse_token_rows
+
+
+class LaunchTests(unittest.TestCase):
+    def test_current_local_event_precedes_each_launch(self):
+        combine = TokenOrderCombine.__new__(TokenOrderCombine)
+        calls = Mock()
+        combine.stream, combine.start, combine.end = calls.stream, calls.start, calls.end
+        combine.stream.cuda_stream = 17
+        combine.cuda = SimpleNamespace(CUstream=int)
+        combine.arguments = ()
+        combine.compiled = calls.launch
+        combine.check_enabled = False
+        for event in (object(), object()):
+            calls.reset_mock()
+            combine.run(local_finished=event)
+            self.assertEqual([call[0] for call in calls.mock_calls],
+                             ["stream.wait_event", "start.record", "launch", "end.record",
+                              "stream.synchronize", "start.elapsed_time"])
+            combine.stream.wait_event.assert_called_once_with(event)
 
 
 class MappingTests(unittest.TestCase):
@@ -191,7 +210,6 @@ class KernelTests(unittest.TestCase):
             self.skipTest('requires SM90 or SM100/SM103')
         sys.path.insert(0, os.environ.get('QUACK_ROOT', str(
             Path(__file__).resolve().parents[3] / 'quack_for_communication_overlap')))
-        from inter_node_combine import TokenOrderCombine
         for dtype in (torch.bfloat16, torch.float16):
             for domains, tokens in (([[5, 0, 2]], 7), ([[]], 7), ([[]], 0),
                                     ([[5, 0, 2], [2, 4]], 7),
@@ -204,6 +222,7 @@ class KernelTests(unittest.TestCase):
                                   for ids in domains]
                         combine = TokenOrderCombine(inputs, domains, tokens, check=True,
                                                     ctas=1 if tile == 8 else 4)
+                        local_finished = torch.cuda.Event()
                         for iteration in range(2):
                             expected = torch.zeros((tokens, width), dtype=torch.float32, device='cuda')
                             for tensor, ids in zip(inputs, domains):
@@ -212,8 +231,8 @@ class KernelTests(unittest.TestCase):
                                 for row, token in enumerate(ids):
                                     expected[token] += values[row].float()
                             combine.output.fill_(float('nan'))
-                            torch.cuda.synchronize()
-                            combine.run()
+                            local_finished.record()
+                            combine.run(local_finished=local_finished)
                             torch.testing.assert_close(combine.output, expected.to(dtype), rtol=0, atol=0)
 
 

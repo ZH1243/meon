@@ -108,8 +108,10 @@ class TokenOrderCombine:
         # Setup uploads must precede the first launch on the private stream.
         torch.cuda.synchronize(first.device)
 
-    def run(self):
-        """Caller has joined native RDMA and local combine, including visibility."""
+    def run(self, *, local_finished=None):
+        """Native returns must be visible. Order local output reads after its producer."""
+        if local_finished is not None:
+            self.stream.wait_event(local_finished)
         self.start.record(self.stream)
         try:
             if self.compiled is not None:

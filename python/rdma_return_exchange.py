@@ -76,6 +76,14 @@ class _CompletionWakeups:
         self.resources.close()
 
 
+def _needs_return_counts(options, settings):
+    # The return-only result exposes peer row counts. With combine, only
+    # validation consumes them. Older local workers always enter this collective.
+    return (not options.intra_node_combine or options.check_return_token_results
+            or options.check_intra_node_combine
+            or not all(peer.get("optional_return_counts", False) for peer in settings))
+
+
 class ReturnExchange:
     """One receive slot per (computing peer, original source node).
 
@@ -143,9 +151,11 @@ class ReturnExchange:
             self.wakeups = _CompletionWakeups(self.control)
             settings = self.control.gather("configuration", {
                 "signature": signature, "device": device, "sources": sources, "completion_fifo": self.wakeups.path,
+                "optional_return_counts": True,
             })
             if any(item["signature"] != signature for item in settings):
                 raise ValueError("return layouts/options must match across local ranks")
+            self.needs_return_counts = _needs_return_counts(options, settings)
             paths = [item.get("completion_fifo") for item in settings]
             if all(paths):
                 self.wakeups.connect(paths)

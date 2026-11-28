@@ -850,21 +850,7 @@ bool Proxy::prepare_early_up(uint64_t iteration, uintptr_t stream) {
     return cuda_buffers_.prepare_early_up(iteration, stream);
 }
 
-void Proxy::prepare_iteration_step(uint64_t iteration) {
-    cuda_buffers_.check_early_up_cancelled();
-    if (!initialized_) throw std::runtime_error("proxy is not initialized");
-    if (config_.num_iterations != 0 && iteration >= config_.num_iterations) {
-        throw std::runtime_error("proxy iteration index exceeds configured num_iterations");
-    }
-    if (config_.router_dynamic_routing_enabled) prepare_routing(iteration);
-    if (config_.rdma_qp_calibration_enabled && !rdma_qp_calibration_complete_) {
-        calibrate_rdma_qps();
-    }
-    if (iteration_prepared_) {
-        if (prepared_iteration_ == iteration) return;
-        throw std::runtime_error(
-            "cannot prepare a new proxy iteration while another is pending");
-    }
+void Proxy::prepare_gather_inputs(uint64_t iteration, bool require_early_up) {
     if (config_.router_local_input_early_ready_enabled) {
         const auto requested = local_router_input_early_ready_requested_.load(std::memory_order_acquire);
         if (requested) wait_for_local_router_input_ready(requested - 1);
@@ -872,7 +858,7 @@ void Proxy::prepare_iteration_step(uint64_t iteration) {
     if (forwarding_rounds_ && forwarding_round_requested_.load(std::memory_order_acquire) !=
         forwarding_round_completed_.load(std::memory_order_acquire))
         throw std::runtime_error("cannot reset while forwarding rounds are pending");
-    cuda_buffers_.begin_router_notification_iteration(iteration);
+    cuda_buffers_.begin_router_notification_iteration(iteration, require_early_up);
     // begin_router_notification_iteration publishes ready_rows=0 on the
     // proxy's private stream. Up-GEMM may poll it immediately. Only the GPU
     // reset needs to finish here; CPU scatter serves a later consumer.
@@ -890,6 +876,36 @@ void Proxy::prepare_iteration_step(uint64_t iteration) {
             " tokens=", local_x3.size());
     }
     prepared_iteration_ = iteration;
+}
+
+void Proxy::prepare_local_publication(uint64_t iteration) {
+    cuda_buffers_.check_early_up_cancelled();
+    if (!initialized_ || routing_failed_ || iteration_prepared_ || !has_pending_benchmark_transport(iteration) ||
+        !config_.router_local_input_early_ready_enabled)
+        throw std::runtime_error("local publication requires the installed early benchmark route");
+    if (local_router_input_early_ready_requested_.load(std::memory_order_acquire) == iteration + 1) return;
+    prepare_gather_inputs(iteration, true);
+    request_local_router_input_ready(iteration);
+}
+
+void Proxy::prepare_iteration_step(uint64_t iteration) {
+    cuda_buffers_.check_early_up_cancelled();
+    if (!initialized_) throw std::runtime_error("proxy is not initialized");
+    if (config_.num_iterations != 0 && iteration >= config_.num_iterations) {
+        throw std::runtime_error("proxy iteration index exceeds configured num_iterations");
+    }
+    if (config_.router_dynamic_routing_enabled) prepare_routing(iteration);
+    if (config_.rdma_qp_calibration_enabled && !rdma_qp_calibration_complete_) {
+        calibrate_rdma_qps();
+    }
+    if (iteration_prepared_) {
+        if (prepared_iteration_ == iteration) return;
+        throw std::runtime_error(
+            "cannot prepare a new proxy iteration while another is pending");
+    }
+    const bool local_requested = has_pending_benchmark_transport(iteration) &&
+        local_router_input_early_ready_requested_.load(std::memory_order_acquire) == iteration + 1;
+    if (!local_requested) prepare_gather_inputs(iteration, false);
     if (config_.nvlink_return_completion_notifications_enabled) {
         if (!return_copies_configured_)
             throw std::runtime_error("return notifications require configured per-group return copies");
@@ -906,7 +922,7 @@ void Proxy::prepare_iteration_step(uint64_t iteration) {
         // while the coordinator prepares the peer transfers. All other source
         // frontiers still advance only on their actual completion records.
         try {
-            request_local_router_input_ready(iteration);
+            if (!local_requested) request_local_router_input_ready(iteration);
         } catch (...) {
             routing_failed_ = true;
             iteration_prepared_ = false;
@@ -5475,7 +5491,7 @@ void Proxy::request_local_router_input_ready(uint64_t iteration) {
     if (!config_.router_local_input_early_ready_enabled) return;
     if (!config_.router_local_input_staging_enabled ||
         !config_.nvlink_forward_completion_notifications_enabled ||
-        !iteration_prepared_ || prepared_iteration_ != iteration ||
+        prepared_iteration_ != iteration || (!iteration_prepared_ && !has_pending_benchmark_transport(iteration)) ||
         !local_router_input_staged_ || !local_router_staging_buffer_ ||
         !local_router_staging_buffer_->ptr) {
         throw std::runtime_error("early local input readiness requires this iteration's staged input");

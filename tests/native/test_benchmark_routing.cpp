@@ -307,6 +307,7 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch, bool split_transpor
                 rank.device_indices.at(live)[0] = -11;
                 direct_install(views);
                 const auto& pub = rank.proxy->router_notification_publication_buffers();
+                expect_error([&] { rank.proxy->prepare_local_publication(epoch); });
                 if (rank.proxy->prepare_early_up(epoch, 1) != split_transport)
                     throw std::runtime_error("incorrect early up eligibility");
                 if (split_transport) {
@@ -467,6 +468,16 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch, bool split_transpor
             reinterpret_cast<uintptr_t>(rank.packed_maps.data()), rank.packed_maps.size(), true);
     }
     std::array<uint64_t, nodes> mask_counts{}, token_counts{};
+    if (split_transport && gpu == 0 && epoch == 2) {
+        rank.proxy->prepare_local_publication(epoch);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!rank.proxy->router_computation_scheduler_state().published_rows) {
+            if (std::chrono::steady_clock::now() >= deadline)
+                throw std::runtime_error("local publication waited for return maps or full preparation");
+            std::this_thread::yield();
+        }
+        rank.proxy->prepare_local_publication(epoch);
+    }
     rank.proxy->start_return_maps(epoch, mask_counts.data(), token_counts.data(), nodes);
     for (int domain = 0; domain < nodes; ++domain) {
         if (mask_counts[domain] != domain_counts[domain] || token_counts[domain] != rows[domain_nodes[domain]].size())
@@ -476,18 +487,8 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch, bool split_transpor
         const auto& publication = rank.proxy->router_notification_publication_buffers();
         const auto before = publication.ready_rows_publication_count;
         rank.proxy->prepare_iteration_step(epoch);
-        if (epoch == 1 && publication.ready_rows_publication_count != before)
-            throw std::runtime_error("ordinary preparation repeated the early reset");
-        if (epoch == 2) {
-            // The coordinator has not entered run_iteration_step: transport
-            // preparation is still pending while the owner publishes real rows.
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-            while (rank.proxy->router_computation_scheduler_state().published_rows == 0) {
-                if (std::chrono::steady_clock::now() >= deadline)
-                    throw std::runtime_error("owner publication waited for deferred transport preparation");
-                std::this_thread::yield();
-            }
-        }
+        if (publication.ready_rows_publication_count != before)
+            throw std::runtime_error("full preparation republished the current prefix");
         const auto state = rank.proxy->router_computation_scheduler_state();
         rank.proxy->prepare_iteration_step(epoch);
         if (rank.proxy->router_computation_scheduler_state().published_rows != state.published_rows ||
@@ -610,7 +611,7 @@ void check_cancelled_publication(Rank& rank, int gpu, bool publish_local) {
     const auto words = pub.table_width * pub.table_rows;
     std::fill_n(table, words, -9);
     if (publish_local) {
-        rank.proxy->prepare_iteration_step(epoch);
+        rank.proxy->prepare_local_publication(epoch);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (!rank.proxy->router_computation_scheduler_state().published_rows) {
             if (std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("missing local publication");

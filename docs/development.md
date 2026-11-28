@@ -369,6 +369,37 @@ ctest --test-dir build/exchange-host --output-on-failure
 OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -q
 ```
 
+For comparison with H800 report 21, rebuild the shared library and update the
+Python worker on both nodes. The same launch flags select concurrent local
+publication. Check for `concurrent_local_publication=1` on each nonempty steady
+iteration. Run the small numerical check above, then repeat the 20,480-token
+profile. Across node 0's eight GPUs in iterations 1–4, report 21's median
+gather-end to first positive ready-prefix update was **1.212 ms**, gather-end
+to up-kernel start was **0.742 ms**, and full iteration time was **56.29 ms**.
+Measure all three intervals to distinguish earlier usable work from earlier
+kernel residency. For an attribution trace, enable
+`--nvlink_forward_prepared_nvtx_enabled=true` and inspect
+`router/local_input_early_ready` on the notification receiver.
+An expert with insufficient local rows will still need peer
+input before its first batch can publish.
+
+Host checks for concurrent publication used the Debug mock build, Python
+3.9.12 and CPU PyTorch 1.13.1 on an Apple M1 Max running macOS 15.6.1.
+The native regression waits for a positive local prefix before starting return
+maps or preparing peer payloads. The Python regression holds the QuACK submit
+call open while the coordinator requests publication and exercises cancellation
+on both threads. Two-node H800 numerical results and timings remain outstanding.
+
+```bash
+cmake --build build/mock -j6
+ctest --test-dir build/mock --output-on-failure
+ctest --test-dir build/mock -R '^test_benchmark_routing$' --repeat until-fail:10 --output-on-failure
+ctest --test-dir build/exchange-host --output-on-failure
+OMP_NUM_THREADS=1 PYTHONPATH=tests/python /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest -q test_benchmark_routing_worker
+OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -q
+ROUTER_METADATA_BENCH_LIBRARY="$PWD/build/exchange-cpu/librouter_metadata_bench.dylib" PYTHONDONTWRITEBYTECODE=1 /Users/zhuhao/opt/anaconda3/bin/python3 -m unittest discover -s benchmarks/router_metadata_exchange -p test_benchmark.py -v
+```
+
 Local verification of this change used an Apple M1 Max, macOS 15.6.1 and CPU PyTorch 1.13.1. The Debug native regressions cover a delayed rank, an empty local source, multiple epochs and shutdown after preparation. The two-node Hopper numerical and timing checks above require CUDA, NVLink and RDMA.
 
 ```bash

@@ -705,6 +705,18 @@ extern "C" int rdma_proxy_prepare_early_up(RdmaProxyHandle* handle, uint64_t ite
     } catch (...) { return record_current_exception(); }
 }
 
+extern "C" int rdma_proxy_prepare_local_publication(RdmaProxyHandle* handle, uint64_t iteration) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down || handle->finished ||
+            iteration != handle->next_iteration)
+            throw std::runtime_error("local publication requires the next unfinished proxy iteration");
+        select_proxy_cuda_device(*handle);
+        handle->proxy.prepare_local_publication(iteration);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
 extern "C" int rdma_proxy_cancel_early_up(RdmaProxyHandle* handle, uint64_t iteration) {
     clear_error();
     try {

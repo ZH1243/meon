@@ -2078,8 +2078,8 @@ bool CudaBuffers::prepare_early_up(uint64_t iteration, uintptr_t compute_stream)
         iteration + 1 != metadata_generations_installed_)
         throw std::runtime_error("invalid or repeated early up reset");
     if (!publication.table_rows) return false;
-    // Installation joined the previous publication stream. No current
-    // descriptor may be submitted until ordinary iteration preparation.
+    // Installation joined the previous publication stream. Current descriptors
+    // can follow this reset once the gather scheduler starts for this route.
     *static_cast<int32_t*>(publication.host_ready_rows.ptr) = 0;
     write_gather_ready_rows(0);
 #if RDMA_PROXY_HAVE_CUDA
@@ -2132,7 +2132,7 @@ void CudaBuffers::cancel_early_up(uint64_t iteration) {
     early_up_visible_rows_ = p.table_rows;
 }
 
-void CudaBuffers::begin_router_notification_iteration(uint64_t iteration) {
+void CudaBuffers::begin_router_notification_iteration(uint64_t iteration, bool require_early_up) {
     if (!config_.router_routing_enabled ||
         !config_.nvlink_forward_completion_notifications_enabled) {
         return;
@@ -2142,6 +2142,8 @@ void CudaBuffers::begin_router_notification_iteration(uint64_t iteration) {
     if (!scheduler.initialized) {
         throw std::runtime_error("router computation scheduler is not initialized");
     }
+    if (require_early_up && early_up_iteration_ != iteration)
+        throw std::runtime_error("local publication requires an armed early up launch");
     if (scheduler.iteration_initialized && iteration < scheduler.iteration) {
         throw std::runtime_error("cannot begin a stale router notification iteration");
     }

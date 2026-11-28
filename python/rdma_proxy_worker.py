@@ -4,13 +4,13 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
 import ctypes
 from functools import partial
 import inspect
 import math
 import os
 from pathlib import Path
-import queue
 import re
 import shlex
 import sys
@@ -2026,7 +2026,8 @@ def print_benchmark_routing(node, gpu, iteration, elapsed_ns, stats, up_submitte
           f"reuse_barrier_us={stats['reuse_barrier_ns'] / 1000:.3f} "
           f"release_barrier_us={stats['release_barrier_ns'] / 1000:.3f}{submit} "
           f"source_route={stats['source_route']} source_route_storage={stats['source_route_storage']} "
-          f"a_idx_storage={stats['a_idx_storage']} early_up_launch={int(stats.get('early_up_launch', False))}",
+          f"a_idx_storage={stats['a_idx_storage']} early_up_launch={int(stats.get('early_up_launch', False))} "
+          f"concurrent_local_publication={int(stats.get('concurrent_local_publication', False))}",
           flush=True)
 
 
@@ -2090,9 +2091,7 @@ def run_proxy_with_concurrent_kernel(
         raise RuntimeError(f"proxy creation failed: {proxy_last_error(library)}")
 
     initialized = False
-    coordinator: threading.Thread | None = None
-    commands: queue.Queue = queue.Queue()
-    results: queue.Queue = queue.Queue()
+    coordinator = None
     device_buffers: TorchDeviceBuffers | None = None
     trace = None
     return_exchange = None
@@ -2261,6 +2260,11 @@ def run_proxy_with_concurrent_kernel(
             cancel_early.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
             prepare_early.restype = cancel_early.restype = ctypes.c_int
 
+        prepare_local = getattr(library, "rdma_proxy_prepare_local_publication", None)
+        if prepare_local is not None:
+            prepare_local.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+            prepare_local.restype = ctypes.c_int
+
         def cancel_polling_up(iteration):
             require_proxy_success(library, cancel_early(handle, iteration), "draining early up GEMM")
 
@@ -2271,31 +2275,75 @@ def run_proxy_with_concurrent_kernel(
                     return time.perf_counter_ns()
             return None
 
-        def proxy_iteration_coordinator() -> None:
-            while True:
-                command = commands.get()
-                if command is None:
-                    return
-                iteration, start_barrier = command
-                try:
-                    # The ordinary path rendezvous precedes launch. An early up
-                    # is already submitted and only needs the payload to progress.
-                    if start_barrier is not None:
-                        start_barrier.wait()
-                    status = library.rdma_proxy_run_iteration(handle, iteration)
-                    error = None if status == 0 else proxy_last_error(library)
-                    if status != 0 and start_barrier is None:
-                        cancel_polling_up(iteration)
-                    results.put((status, error))
-                except BaseException as error:
-                    results.put((-1, f"proxy coordinator failed: {error}"))
-                    return
+        def refresh_runner(iteration, extents, previous, *, up_bound, publish_local):
+            down = previous
+            wave_views = None
+            reference_setup_ns = 0
+            if return_maps is not None and not publish_local:
+                # Remote contributions can require both maps even when this
+                # computing rank has no expert work this epoch.
+                return_maps.start(iteration)
+            counts = get_expert_counts(library, handle)
+            computation_tokens.value = sum(counts)
+            if down_schedule is not None and computation_tokens.value:
+                wave_views = down_schedule.start(iteration, counts)
+            if not up_bound:
+                grouped_gemm.bind_routing(*extents)
+            if down is not None:
+                down = DownProjectionRunner(torch, grouped_gemm, counts, down_options,
+                                            trace_configure=trace.configure if trace else None,
+                                            previous=previous, defer_wave_schedule=True,
+                                            external_wave_schedule=wave_views, async_scatter=async_scatter,
+                                            kernel_options=previous.kernel_options)
+                if down.cpu_scatter:
+                    down.configure_cpu_scatter(library, handle)
+            if publish_local:
+                require_proxy_success(library, prepare_local(handle, iteration), "requesting local gather publication")
+                if return_maps is not None:
+                    return_maps.start(iteration)
+            if down is not None:
+                if down.output_reset_policy == "end-of-iteration" and not down.combine:
+                    down.reset_outputs()
+                if return_exchange is not None:
+                    return_exchange.bind_down(down)
+                    if down_options.check_projections and down.route_weights is not None:
+                        from projection_validation import configure_original_reference
+                        reference_begin = time.perf_counter_ns()
+                        configure_original_reference(grouped_gemm, down, library, handle, return_exchange,
+                                                     num_experts=num_experts, iteration=iteration)
+                        reference_setup_ns = time.perf_counter_ns() - reference_begin
+            return down, wave_views, reference_setup_ns
 
-        coordinator = threading.Thread(
-            target=proxy_iteration_coordinator,
-            name="rdma-proxy-iteration-coordinator",
-        )
-        coordinator.start()
+        def prepare_proxy(iteration):
+            require_proxy_success(library, library.rdma_proxy_prepare_iteration(handle, iteration),
+                                  f"preparing proxy iteration {iteration}")
+
+        def prepare_on_coordinator(iteration, extents, previous, setup_stream):
+            # CUDA device and current stream are host-thread local.
+            with torch.cuda.device(cuda_device_id), torch.cuda.stream(setup_stream):
+                refreshed = refresh_runner(iteration, extents, previous, up_bound=True, publish_local=True)
+                prepare_proxy(iteration)
+                return refreshed
+
+        def run_on_coordinator(iteration, start_barrier, prepare=None, prepared=None):
+            try:
+                if prepare is not None:
+                    prepared.set_result(prepare())
+                elif start_barrier is not None:
+                    start_barrier.wait()
+                require_proxy_success(library, library.rdma_proxy_run_iteration(handle, iteration),
+                                      f"proxy iteration {iteration}")
+            except BaseException as error:
+                if start_barrier is None:
+                    # A partially submitted launch can already be polling the prefix.
+                    try:
+                        cancel_polling_up(iteration)
+                    finally:
+                        if prepared is not None and not prepared.done():
+                            prepared.set_exception(error)
+                raise
+
+        coordinator = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rdma-proxy-iteration-coordinator")
 
         print(
             "concurrent-kernel mode enabled: Python will launch one readiness-gated "
@@ -2308,6 +2356,7 @@ def run_proxy_with_concurrent_kernel(
             reference_setup_ns = 0
             wave_views = None
             up_submitted_ns = None
+            prepared = None
             if dynamic and iteration:
                 # All GPU and peer readers of the previous generation have retired.
                 # Finish Python's optional checks before the native thread reuses A_idx.
@@ -2326,39 +2375,22 @@ def run_proxy_with_concurrent_kernel(
                         if down is not None:
                             columns = 2 if down_options.down_n_tile_major_output else 1
                             async_scatter.reserve_addresses(grouped_gemm, columns)
-                        up_submitted_ns = submit_up()
-                if return_maps is not None:
-                    # Remote contributions can require both maps even when this
-                    # computing rank has no expert work this epoch.
-                    return_maps.start(iteration)
-                counts = get_expert_counts(library, handle)
-                computation_tokens.value = sum(counts)
-                if down_schedule is not None and computation_tokens.value:
-                    wave_views = down_schedule.start(iteration, counts)
-                if early_up_iteration is None:
-                    grouped_gemm.bind_routing(*extents)
-                if down is not None:
-                    previous = down
-                    down = DownProjectionRunner(torch, grouped_gemm, counts, down_options,
-                                                trace_configure=trace.configure if trace else None,
-                                                previous=previous, defer_wave_schedule=True,
-                                                external_wave_schedule=wave_views, async_scatter=async_scatter,
-                                                kernel_options=previous.kernel_options)
-                    if down.cpu_scatter:
-                        down.configure_cpu_scatter(library, handle)
-                    if down.output_reset_policy == "end-of-iteration" and not down.combine:
-                        down.reset_outputs()
-                    if return_exchange is not None:
-                        return_exchange.bind_down(down)
-                        if down_options.check_projections and down.route_weights is not None:
-                            from projection_validation import configure_original_reference
-                            reference_begin = time.perf_counter_ns()
-                            configure_original_reference(grouped_gemm, down, library, handle, return_exchange,
-                                                         num_experts=num_experts, iteration=iteration)
-                            reference_setup_ns = time.perf_counter_ns() - reference_begin
-                    if early_up_iteration is None:
-                        del previous
-                # Finish any local torch setup. Async metadata publication is gated by final gather.
+                        if prepare_local is not None:
+                            prepared = Future()
+                            payload = coordinator.submit(
+                                run_on_coordinator, iteration, None,
+                                partial(prepare_on_coordinator, iteration, extents, down,
+                                        torch.cuda.current_stream(cuda_device_id)), prepared)
+                        # Keep the old runner's allocations through the setup-stream join.
+                        previous = down
+                        try:
+                            up_submitted_ns = submit_up()
+                        finally:
+                            if prepared is not None:
+                                down, wave_views, reference_setup_ns = prepared.result()
+                if prepared is None:
+                    down, wave_views, reference_setup_ns = refresh_runner(
+                        iteration, extents, down, up_bound=early_up_iteration is not None, publish_local=False)
                 if early_up_iteration is None:
                     torch.cuda.synchronize(cuda_device_id)
 
@@ -2369,13 +2401,10 @@ def run_proxy_with_concurrent_kernel(
             if early_up_iteration is None and down is not None and down.intra_node_combine is not None:
                 down.intra_node_combine.prepare_iteration()
             log_startup("proxy preparation begin")
-            require_proxy_success(
-                library,
-                library.rdma_proxy_prepare_iteration(handle, iteration),
-                f"preparing proxy iteration {iteration}",
-            )
             start_barrier = threading.Barrier(2) if early_up_iteration is None else None
-            commands.put((iteration, start_barrier))
+            if prepared is None:
+                prepare_proxy(iteration)
+                payload = coordinator.submit(run_on_coordinator, iteration, start_barrier)
             if start_barrier is not None:
                 start_barrier.wait()
             log_startup("proxy released; up GEMM launch begin")
@@ -2424,16 +2453,14 @@ def run_proxy_with_concurrent_kernel(
                       file=sys.stderr, flush=True)
 
             log_startup("waiting for proxy result")
-            proxy_status, proxy_error = results.get()
+            try:
+                payload.result()
+            finally:
+                if kernel_error is not None:
+                    raise RuntimeError(
+                        f"concurrent CUDA kernel failed at iteration {iteration}: {kernel_error}"
+                    ) from kernel_error
             log_startup("proxy result received")
-            if kernel_error is not None:
-                raise RuntimeError(
-                    f"concurrent CUDA kernel failed at iteration {iteration}: {kernel_error}"
-                ) from kernel_error
-            if proxy_status != 0:
-                raise RuntimeError(
-                    f"proxy iteration {iteration} failed: {proxy_error}"
-                )
             kernel_finished.synchronize()
             early_up_iteration = None
             log_startup("GPU iteration complete")
@@ -2471,7 +2498,8 @@ def run_proxy_with_concurrent_kernel(
                 pipeline_ms += (time.perf_counter_ns() - reset_started_ns) / 1e6
             pipeline_timings.append((iteration, pipeline_ms))
             if benchmark_metadata is not None:
-                stats = dict(benchmark_metadata.last_stats, early_up_launch=start_barrier is None)
+                stats = dict(benchmark_metadata.last_stats, early_up_launch=start_barrier is None,
+                             concurrent_local_publication=prepared is not None)
                 benchmark_timings.append((stats, up_submitted_ns))
             elapsed_ms = ctypes.c_float()
             require_proxy_success(
@@ -2500,8 +2528,7 @@ def run_proxy_with_concurrent_kernel(
                 down_timings.append((iteration, down.flops, reset_ms, mapping_ms, down_ms,
                                      elapsed_ms.value + tail_ms))
 
-        commands.put(None)
-        coordinator.join()
+        coordinator.shutdown(wait=True)
         coordinator = None
         require_proxy_success(library, library.rdma_proxy_finish(handle), "proxy finish")
         if down_options.benchmark_ready_up_gemm and computation_tokens.value:
@@ -2581,8 +2608,7 @@ def run_proxy_with_concurrent_kernel(
             except Exception as error:
                 print(f"compute stream cleanup failed: {error}", file=sys.stderr, flush=True)
         if coordinator is not None:
-            commands.put(None)
-            coordinator.join()
+            coordinator.shutdown(wait=True)
         shutdown_embedded_proxy(library, handle, device_buffers, initialized, success, return_exchange,
                                 benchmark_metadata)
 

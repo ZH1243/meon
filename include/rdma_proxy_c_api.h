@@ -369,6 +369,12 @@ RDMA_PROXY_C_API int rdma_proxy_get_routing_extents(
  * joining the polling kernel. A cancelled iteration is only valid for teardown. */
 RDMA_PROXY_C_API int rdma_proxy_prepare_early_up(RdmaProxyHandle* handle, uint64_t iteration,
     uintptr_t compute_stream, int32_t* armed);
+/* Optional after armed=1 and registration of this route's scatter destinations.
+ * Starts the gather scheduler and requests local publication. May overlap GPU
+ * launch. Return maps may start afterwards. Call prepare_iteration/run_iteration
+ * to prepare returns and advance peer transport. Serialize these host control
+ * calls. Repeating this request before full preparation is idempotent. */
+RDMA_PROXY_C_API int rdma_proxy_prepare_local_publication(RdmaProxyHandle* handle, uint64_t iteration);
 RDMA_PROXY_C_API int rdma_proxy_cancel_early_up(RdmaProxyHandle* handle, uint64_t iteration);
 
 /* Finite-run iteration control for embedding runtimes that own the main loop. */
@@ -376,10 +382,11 @@ RDMA_PROXY_C_API int rdma_proxy_get_num_iterations(
     RdmaProxyHandle* handle,
     uint64_t* num_iterations);
 /*
- * Reset the gather-table publication state for one iteration and wait until
- * ready_rows=0 is visible on the configured GPU. This lets an embedding
- * runtime safely launch a readiness-gated persistent kernel before calling
- * rdma_proxy_run_iteration, possibly from another host thread.
+ * Prepare the gather and return state for one iteration. The gather prefix
+ * reset is visible on the configured GPU before return. If local publication
+ * already started, preserve its published prefix. An embedding runtime can
+ * launch a readiness-gated kernel and drive rdma_proxy_run_iteration from
+ * another host thread.
  */
 RDMA_PROXY_C_API int rdma_proxy_prepare_iteration(
     RdmaProxyHandle* handle,

@@ -258,7 +258,7 @@ public:
     bool prepare_early_up(uint64_t iteration, uintptr_t stream);
     void cancel_early_up(uint64_t iteration);
     void check_early_up_cancelled() const;
-    void begin_router_notification_iteration(uint64_t iteration);
+    void begin_router_notification_iteration(uint64_t iteration, bool require_early_up = false);
     void synchronize_router_notification_stream();
     void synchronize_router_notification_publication();
     void record_router_computation_end(uint64_t iteration, uintptr_t cuda_stream);

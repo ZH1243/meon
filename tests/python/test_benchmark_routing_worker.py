@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -98,7 +99,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
 
     def run_worker(self, *, compute=False, fail_epoch=None, scatter_publication=None,
                    tile_major=True, has_reservation_api=True, rows_per_epoch=(1, 0), down_factory=None,
-                   native_returns=False, early=False, fail_prepare=False):
+                   native_returns=False, early=False, concurrent_publication=False, fail_prepare=False, fail_up=False, fail_local=False):
         events, output = [], io.StringIO()
 
         def status(name):
@@ -129,6 +130,25 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                 return 0
             library.rdma_proxy_prepare_early_up = arm
             library.rdma_proxy_cancel_early_up = status("cancel")
+        if concurrent_publication:
+            submitted = threading.Event()
+            launch_released = threading.Event()
+
+            def publish(handle, epoch):
+                test.assertIsNot(threading.current_thread(), main_thread)
+                test.assertTrue(submitted.wait(3), "coordinator did not overlap launch")
+                if fail_local:
+                    raise RuntimeError("injected local publication failure")
+                events.append(("request-local", epoch))
+                launch_released.set()
+                return 0
+            def cancel(handle, epoch):
+                events.append(("cancel", epoch))
+                launch_released.set()
+                return 0
+
+            library.rdma_proxy_prepare_local_publication = publish
+            library.rdma_proxy_cancel_early_up = cancel
         if fail_prepare:
             def prepare(handle, epoch):
                 events.append(("prepare", epoch))
@@ -140,6 +160,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
             library.rdma_proxy_reserve_threaded_cpu_scatter = status("reserve_scatter")
         buffers = SimpleNamespace(finish_initialization=lambda: events.append(("buffers",)), tensors_of_kind=lambda _: [])
         test = self
+        main_thread = threading.current_thread()
 
         class Provider:
             def __init__(self, lib, handle, torch, device_buffers, *, concurrent_compute):
@@ -170,19 +191,29 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                 self.bind_routing(*routing_extents)
 
             def bind_routing(self, source_rows, rows):
+                self.epoch = getattr(self, "epoch", -1) + 1
                 self.empty_epoch = not rows
                 events.append(("bind", rows))
 
             def launch(self):
                 if not self.empty_epoch:
                     events.append(("up",))
+                    if concurrent_publication and self.epoch:
+                        test.assertIs(threading.current_thread(), main_thread)
+                        submitted.set()
+                        test.assertTrue(launch_released.wait(3), "local publication waited for QuACK to return")
+                        events.append(("submit-released", self.epoch))
+                        launch_released.clear()
+                        submitted.clear()
+                        if fail_up:
+                            raise RuntimeError("injected up launch failure")
 
         stream = SimpleNamespace(cuda_stream=42, synchronize=lambda: events.append(("join-stream",)),
                                  wait_stream=lambda other: events.append(("wait-setup",)))
         torch = SimpleNamespace(cuda=SimpleNamespace(
             get_device_capability=lambda _: (9, 0), Stream=lambda **_: stream,
             Event=lambda **_: SimpleNamespace(record=lambda _: None, synchronize=lambda: None),
-            stream=lambda _: contextlib.nullcontext(), current_stream=lambda _: stream,
+            device=lambda _: contextlib.nullcontext(), stream=lambda _: contextlib.nullcontext(), current_stream=lambda _: stream,
             synchronize=lambda _: events.append(("device-sync",))))
         options = SimpleNamespace(pooled_up_gemm=False, down_projection2=scatter_publication is not None,
                                   cpu_scatter_preparation=scatter_publication is not None,
@@ -217,6 +248,10 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
             stack.enter_context(contextlib.redirect_stdout(output))
             if fail_prepare:
                 stack.enter_context(self.assertRaisesRegex(RuntimeError, "injected preparation failure"))
+            if fail_local:
+                stack.enter_context(self.assertRaisesRegex(RuntimeError, "injected local publication failure"))
+            if fail_up:
+                stack.enter_context(self.assertRaisesRegex(RuntimeError, "injected up launch failure"))
             if fail_epoch is not None:
                 stack.enter_context(self.assertRaisesRegex(RuntimeError, "injected exchange failure"))
             if compute:
@@ -297,9 +332,10 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
             return create
 
         rows_per_epoch = (1, 3, 0, 2)
-        for native, native_returns, early in ((False, False, False), (True, False, False),
-                                              (True, True, False), (True, True, True)):
-            with self.subTest(native=native, native_returns=native_returns, early=early):
+        for native, native_returns, early, concurrent in (
+                (False, False, False, False), (True, False, False, False), (True, True, False, False),
+                (True, True, True, False), (True, True, True, True)):
+            with self.subTest(native=native, native_returns=native_returns, early=early, concurrent=concurrent):
                 def factory(events):
                     def submit(epoch, counts):
                         events.append(("schedule", counts[0]))
@@ -312,9 +348,11 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                 fake = SimpleNamespace()
                 with patch("down_wave_schedule.DownWaveSchedule.reserve_if_supported",
                            return_value=fake if native else None) as reserve:
-                    events, _ = self.run_worker(compute=True, scatter_publication="threaded",
+                    events, output = self.run_worker(compute=True, scatter_publication="threaded",
                                                 rows_per_epoch=rows_per_epoch, down_factory=factory,
-                                                native_returns=native_returns, early=early)
+                                                native_returns=native_returns, early=early,
+                                                concurrent_publication=concurrent)
+                self.assertEqual(output.count("concurrent_local_publication=1"), 2 if concurrent else 0)
                 reserve.assert_called_once()
                 for epoch, rows in enumerate(rows_per_epoch):
                     start = events.index(("install", epoch))
@@ -342,7 +380,12 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                         reset = events.index(("early-reset", epoch, 42))
                         self.assertLess(reset, up)
                         self.assertLess(up, map_start)
-                        self.assertLess(up, events.index(("scatter", rows)))
+                        if concurrent:
+                            requested = events.index(("request-local", epoch))
+                            self.assertLess(events.index(("scatter", rows)), requested)
+                            self.assertLess(requested, map_start)
+                        else:
+                            self.assertLess(up, events.index(("scatter", rows)))
                         self.assertLess(up, prepared)
                         self.assertNotIn(("device-sync",), events[up:prepared])
                     else:
@@ -353,9 +396,9 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                     consumed = events.index(("down", rows))
                     if native and epoch:
                         self.assertLess(start, schedule)
-                        if early:
+                        if early and not concurrent:
                             self.assertLess(up, schedule)
-                        else:
+                        elif not early:
                             self.assertLess(schedule, events.index(("bind", rows)))
                         self.assertLess(schedule, events.index(("scatter", rows)))
                         join = events.index(("wait-schedule", epoch, 42))
@@ -379,6 +422,25 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
         cancel = events.index(("cancel", 1))
         self.assertLess(events.index(("up",), events.index(("early-reset", 1, 42))), cancel)
         self.assertLess(cancel, events.index(("join-stream",)))
+        self.assertNotIn(("payload", 1), events)
+
+    def test_concurrent_setup_and_launch_failures_drain_before_stream_join(self):
+        for failure in ("fail_prepare", "fail_up"):
+            with self.subTest(failure=failure):
+                events, _ = self.run_worker(compute=True, early=True, rows_per_epoch=(1, 2),
+                                            concurrent_publication=True, **{failure: True})
+                self.assertLess(events.index(("request-local", 1)), events.index(("cancel", 1)))
+                self.assertLess(events.index(("cancel", 1)), events.index(("join-stream",)))
+                if failure == "fail_prepare":
+                    self.assertNotIn(("payload", 1), events)
+                self.assertIn(("close", False), events)
+
+    def test_publication_failure_releases_in_flight_submit(self):
+        events, _ = self.run_worker(compute=True, early=True, rows_per_epoch=(1, 2),
+                                    concurrent_publication=True, fail_local=True)
+        self.assertLess(events.index(("cancel", 1)), events.index(("submit-released", 1)))
+        self.assertLess(events.index(("submit-released", 1)), events.index(("join-stream",)))
+        self.assertNotIn(("prepare", 1), events)
         self.assertNotIn(("payload", 1), events)
 
     def test_partial_exchange_failure_stops_before_payload_and_closes_provider(self):

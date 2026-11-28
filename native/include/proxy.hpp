@@ -51,6 +51,7 @@ public:
     void run_once();
     bool prepare_early_up(uint64_t iteration, uintptr_t stream);
     void cancel_early_up(uint64_t iteration) { cuda_buffers_.cancel_early_up(iteration); }
+    void prepare_local_publication(uint64_t iteration);
     void prepare_iteration_step(uint64_t iteration);
     void run_iteration_step(uint64_t iteration);
     void record_router_computation_end(uint64_t iteration, uintptr_t cuda_stream);
@@ -355,6 +356,7 @@ private:
     void install_iteration_routing(uint64_t iteration, IterationRouteData route,
                                   const RdmaProxyBenchmarkDeviceIndices* device_indices = nullptr,
                                   bool defer_transport = false);
+    void prepare_gather_inputs(uint64_t iteration, bool require_early_up);
     bool has_pending_benchmark_transport(uint64_t iteration) const;
     void finish_benchmark_transport(uint64_t iteration);
     void configure_receive_chunks(PeerState& peer, const std::vector<std::size_t>& token_indices);

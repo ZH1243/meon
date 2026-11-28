@@ -1,4 +1,5 @@
 #include "two_node_layout.hpp"
+#include "benchmark_route_views.hpp"
 #include "rdma_transport.hpp"
 #include "router_routing.hpp"
 #include "logging.hpp"
@@ -11,6 +12,74 @@ template<class F> void rejects(F f) {
     try { f(); } catch (const std::runtime_error&) { rejected = true; }
     check(rejected);
 }
+void test_benchmark_route_views() {
+    using namespace rme2;
+    constexpr int tokens = 32;
+    const uint64_t epoch = (uint64_t{1} << 32) + 3;
+    std::array<std::array<int32_t, two::header_words + tokens>, two::sources> records{};
+    std::array<Installed, two::sources> installed{};
+    for (int rank = 0; rank < two::sources; ++rank) {
+        auto* h = records[rank].data();
+        h[two::header_words - 1] = rank;
+        install(installed[rank], h + 6, rank ? h + two::header_words : nullptr, tokens, epoch, false, two::epg);
+    }
+    int32_t remote_x3[] = {2, 7};
+    uint8_t remote_x4[] = {0x80, 3};
+    two::InstalledX3X4 remote{remote_x3, remote_x4, 2, epoch};
+    std::vector<int32_t> storage((receiver::source_snapshot_bytes(tokens) + 3) / 4);
+    const auto local = receiver::source_snapshot(storage.data(), tokens);
+    local.node_offsets[1] = 3;
+    local.node_offsets[2] = 7;
+    std::array<RdmaProxyBenchmarkSource, two::sources> sources{};
+    RdmaProxyBenchmarkRouting route{};
+    RdmaProxyBenchmarkHostRoute host{};
+    route.struct_size = sizeof(route);
+    host.struct_size = sizeof(host);
+    auto collect = [&](uint64_t requested, int capacity = two::sources) {
+        collect_benchmark_route_views(requested, tokens, installed, remote, local,
+                                      sources.data(), capacity, &route, &host);
+    };
+    collect(epoch);
+    check(route.num_sources == two::sources && route.sources == sources.data());
+    for (int rank = 0; rank < two::sources; ++rank) {
+        check(sources[rank].offsets == installed[rank].offsets && sources[rank].indices == installed[rank].indices);
+        check(sources[rank].count == static_cast<uint64_t>(rank));
+    }
+    check(route.remote_x3 == remote_x3 && route.remote_x4 == remote_x4 && route.remote_count == 2);
+    check(!route.device_r && !route.device_node_offsets && !route.device_x3 && !route.device_x4);
+    check(host.node_offset_count == 3 && host.packed_count == 7 && host.assignment_count == tokens * 8);
+    check(host.node_offsets == local.node_offsets && host.x3 == local.x3 && host.x4 == local.x4 && host.r == local.r);
+    rejects([&] { collect(epoch, two::sources - 1); });
+    --host.struct_size;
+    rejects([&] { collect(epoch); });
+    host.struct_size = sizeof(host);
+    --route.struct_size;
+    rejects([&] { collect(epoch); });
+    route.struct_size = sizeof(route);
+
+    // Reuse the descriptors for an empty generation. A stale last source or
+    // remote slice must leave every output from the previous handoff intact.
+    for (int rank = 0; rank < two::sources; ++rank) {
+        records[rank][two::header_words - 1] = 0;
+        install(installed[rank], records[rank].data() + 6, nullptr, tokens, epoch + 1, false, two::epg);
+    }
+    local.node_offsets[1] = local.node_offsets[2] = 0;
+    rejects([&] { collect(epoch + 1); });  // Remote view is stale.
+    remote = {nullptr, nullptr, 0, epoch + 1};
+    installed.back().iteration = epoch;
+    rejects([&] { collect(epoch + 1); });
+    check(sources.back().count == two::sources - 1 && sources[1].count == 1);
+    check(route.remote_count == 2 && host.packed_count == 7);
+    installed.back().iteration = epoch + 1;
+    installed.back().count = 1;  // A live prefix needs an index pointer.
+    rejects([&] { collect(epoch + 1); });
+    installed.back().count = 0;
+    collect(epoch + 1);
+    check(!route.remote_count && !route.remote_x3 && !route.remote_x4 && !host.packed_count);
+    for (const auto& view : sources) check(view.offsets && !view.indices && !view.count);
+    rejects([&] { collect(epoch); });
+}
+
 void test_device_index_endpoint() {
     constexpr int capacity = 256;
     const auto gpu_bytes = rme2::two::remote_indices_bytes(capacity);
@@ -108,6 +177,7 @@ int main() {
         rdma_proxy::Logger::instance().set_level(rdma_proxy::LogLevel::kError);
         constexpr int tokens = 257, capacity = tokens * 8;
         test_device_index_endpoint();
+        test_benchmark_route_views();
         for (int source = 0; source < 16; ++source) {
             rdma_proxy::ProxyConfig c;
             c.num_nodes = 2; c.num_gpus_per_node = 8; c.num_tokens = tokens;

@@ -18,6 +18,7 @@ class ProviderTests(unittest.TestCase):
         p.next_iteration = 0
         p.retire_routing = None
         p.install_host_routing = p.source_snapshot_view = None
+        p.batched_route_view = None
         p.install_device_indices = p.device_indices = None
         p.borrow_source_route = False
         p.last_stats = {}
@@ -118,7 +119,7 @@ class ProviderTests(unittest.TestCase):
             return SimpleNamespace(data_ptr=lambda: 2**40 + i)
         p.r = device(0)
         p.plan = SimpleNamespace(node_offsets=device(1), x3=device(2), x4=device(3))
-        p._install(7)
+        p._install(7, *p._collect_route_views(7))
 
         local_offsets = (C.c_int32 * 3)(0, 3, 4)
         local_x3 = (C.c_int32 * 4)(1, 3, 7, 12)
@@ -146,7 +147,7 @@ class ProviderTests(unittest.TestCase):
         p.install_routing = MagicMock(side_effect=AssertionError("unexpected device readback"))
         p.source_snapshot_view, p.install_host_routing = source_view, MagicMock(side_effect=install_host)
         p.r, p.plan = None, None  # A host install gets every pointer from the receiver.
-        p._install(7)
+        p._install(7, *p._collect_route_views(7))
         p.install_host_routing.assert_called_once()
         arrays = [SimpleNamespace(address=2**40 + source * 4096, capacity=160) for source in range(16)]
         p.device_buffers = MagicMock()
@@ -161,7 +162,7 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(slots.indices[:16], [array.address for array in arrays])
             return 0
         p.install_device_indices = MagicMock(side_effect=install_direct)
-        p._install(7)
+        p._install(7, *p._collect_route_views(7))
         p.install_device_indices.assert_called_once()
         p.install_host_routing.assert_called_once()
         p.source_snapshot_view = MagicMock(return_value=-1)
@@ -170,7 +171,61 @@ class ProviderTests(unittest.TestCase):
                 raise RuntimeError("failed receiver view")
         p.session.check = check
         with self.assertRaisesRegex(RuntimeError, "failed receiver view"):
-            p._install(8)
+            p._collect_route_views(8)
+        p.install_host_routing.assert_called_once()
+        p.install_device_indices.assert_called_once()
+
+    def test_batched_handoff_reuses_descriptors_and_stops_on_rejected_epoch(self):
+        p = self.provider()
+        p.r = SimpleNamespace(data_ptr=lambda: 2**40)
+        p.plan, p.stream = object(), MagicMock()
+        p._generate, p._barrier = MagicMock(), MagicMock()
+        p.session = MagicMock()
+        p.session.lib.rme2_enable_source_snapshot.return_value = 0
+        def check(status):
+            if status:
+                raise RuntimeError("rejected exchange epoch")
+        p.session.check = check
+        buffers = []
+        def collect(handle, epoch, sources, capacity, routing, host):
+            self.assertEqual((handle, capacity), (p.session.handle, 16))
+            self.assertEqual(routing._obj.struct_size, C.sizeof(backend.BenchmarkRouting))
+            self.assertEqual(host._obj.struct_size, C.sizeof(backend.BenchmarkHostRoute))
+            buffers.append((C.addressof(sources), C.addressof(routing._obj), C.addressof(host._obj)))
+            if epoch == 3:
+                return -1
+            live = 2 - epoch  # Second iteration has an empty source.
+            sources[15].count = live
+            routing._obj.sources = sources
+            host._obj.packed_count = live
+            return 0
+        p.session.lib.rme2_benchmark_route_views.side_effect = collect
+        def install(handle, iteration, routing, host, *device):
+            self.assertEqual(handle, p.handle)
+            self.assertEqual(routing._obj.sources[15].count, 1 - iteration)
+            self.assertEqual(host._obj.packed_count, 1 - iteration)
+            if device:
+                self.assertIs(device[0]._obj, p.device_indices)
+            return 0
+        p.install_host_routing = MagicMock(side_effect=install)
+        p.install_device_indices = MagicMock(side_effect=install)
+        p._enable_source_snapshot()
+        self.assertEqual(p.batched_route_view.argtypes,
+                         [C.c_void_p, C.c_uint64, C.POINTER(backend.BenchmarkSource), C.c_int,
+                          C.POINTER(backend.BenchmarkRouting), C.POINTER(backend.BenchmarkHostRoute)])
+        p.prepare(0, compute_extents=False)
+        self.assertEqual(p.last_stats["route_view_mode"], "batched")
+        p.device_indices = backend.BenchmarkDeviceIndices()
+        p.prepare(1, compute_extents=False)
+        with self.assertRaisesRegex(RuntimeError, "rejected exchange epoch"):
+            p.prepare(2, compute_extents=False)
+        self.assertTrue(p.failed)
+        self.assertEqual(p.next_iteration, 2)
+        self.assertEqual([call.args[1] for call in p.batched_route_view.call_args_list], [1, 2, 3])
+        self.assertEqual(len(set(buffers)), 1)
+        p.session.lib.rme2_view.assert_not_called()
+        p.session.lib.rme2_x3_x4_view.assert_not_called()
+        p.session.lib.rme2_source_snapshot_view.assert_not_called()
         p.install_host_routing.assert_called_once()
         p.install_device_indices.assert_called_once()
 
@@ -249,7 +304,11 @@ class ProviderTests(unittest.TestCase):
         p.plan = object()
         p._generate = lambda i: events.append(("R", i))
         p._barrier = lambda: events.append("world")
-        p._install = lambda i: events.append(("install", i))
+        def collect(i):
+            events.append(("views", i))
+            return "routing", "host"
+        p._collect_route_views = collect
+        p._install = lambda i, record, host: events.append(("install", i, record, host))
         p.stream = SimpleNamespace(synchronize=lambda: events.append("R complete"))
         def wait():
             events.append("rme2 complete")
@@ -265,13 +324,15 @@ class ProviderTests(unittest.TestCase):
             events.append(("retire", handle, iteration))
             return 0
         p.retire_routing = retire
-        with patch.object(backend.time, "perf_counter_ns", side_effect=[100, 130, 145, 190, 215]):
+        with patch.object(backend.time, "perf_counter_ns", side_effect=[100, 130, 145, 190, 197, 215]):
             self.assertEqual(p.prepare(0), ((18, 4), 115))
         self.assertEqual(events, [("R", 0), "R complete", "world", ("rme2", 1),
-                                  "rme2 complete", ("install", 0), "query extents"])
+                                  "rme2 complete", ("views", 0), ("install", 0, "routing", "host"), "query extents"])
         self.assertEqual(p.last_stats["r_ready_ns"], 130)
         self.assertEqual(p.last_stats["exchange_staging_elapsed_ns"], 45)
         self.assertEqual(p.last_stats["install_elapsed_ns"], 25)
+        self.assertEqual(p.last_stats["view_collection_elapsed_ns"], 7)
+        self.assertEqual(p.last_stats["route_view_mode"], "per_source")
         self.assertEqual(p.last_stats["r_ready_to_install_elapsed_ns"], 85)
         self.assertEqual(p.last_stats["reuse_barrier_ns"], 15)
         self.assertEqual(p.last_stats["retire_elapsed_ns"], 0)
@@ -285,10 +346,17 @@ class ProviderTests(unittest.TestCase):
         p.borrow_source_route = True
         p.source_snapshot_view = MagicMock()
         p.device_indices = backend.BenchmarkDeviceIndices()
-        with patch.object(backend.time, "perf_counter_ns", side_effect=[220, 235, 240, 250, 272, 292]):
-            self.assertEqual(p.prepare(1), ((18, 4), 72))
+        p.torch = MagicMock()
+        scope = p.torch.cuda.nvtx.range.return_value
+        scope.__enter__.side_effect = lambda: events.append("range begin")
+        scope.__exit__.side_effect = lambda *args: events.append("range end")
+        with patch.object(backend.time, "perf_counter_ns", side_effect=[220, 235, 240, 250, 272, 275, 292]):
+            self.assertEqual(p.prepare(1, trace_route_views=True), ((18, 4), 72))
         self.assertEqual(events, [("R", 1), "R complete", ("retire", 3, 0), "world", ("rme2", 2),
-                                  "rme2 complete", ("install", 1), "query extents"])
+                                  "rme2 complete", "range begin", ("views", 1), "range end",
+                                  ("install", 1, "routing", "host"), "query extents"])
+        p.torch.cuda.nvtx.range.assert_called_once_with("meon/metadata/collect_route_views")
+        self.assertEqual(p.last_stats["view_collection_elapsed_ns"], 3)
         self.assertEqual(p.last_stats["retire_elapsed_ns"], 5)
         self.assertEqual(p.last_stats["reuse_barrier_ns"], 10)
         self.assertEqual(p.last_stats["release_barrier_ns"], 0)
@@ -312,6 +380,7 @@ class ProviderTests(unittest.TestCase):
         p = self.provider()
         p.plan, p.stream, p.session, p.library = object(), MagicMock(), MagicMock(), MagicMock()
         p._generate, p._barrier = MagicMock(), MagicMock()
+        p._collect_route_views = MagicMock(return_value=(object(), None))
         p._install = MagicMock(side_effect=RuntimeError("bad route"))
         with self.assertRaisesRegex(RuntimeError, "bad route"):
             p.prepare(0)
@@ -346,12 +415,14 @@ class ProviderTests(unittest.TestCase):
         p = self.provider()
         p.plan, p.stream, p.session, p.library = object(), MagicMock(), MagicMock(), MagicMock()
         p._generate, p._barrier, p._install = MagicMock(), MagicMock(), MagicMock()
+        record = object()
+        p._collect_route_views = MagicMock(return_value=(record, None))
         extents, elapsed = p.prepare(0, compute_extents=False)
         self.assertIsNone(extents)
         self.assertGreaterEqual(elapsed, 0)
         p._barrier.assert_called_once_with()
         self.assertEqual(p.last_stats["release_barrier_ns"], 0)
-        p._install.assert_called_once_with(0)
+        p._install.assert_called_once_with(0, record, None)
         p.library.rdma_proxy_get_routing_extents.assert_not_called()
 
     def test_failed_peer_disconnect_never_frees_export(self):

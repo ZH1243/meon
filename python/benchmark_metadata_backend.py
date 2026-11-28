@@ -98,6 +98,7 @@ class BenchmarkMetadataBackend:
         self.failed = False
         self.next_iteration = 0
         self.source_snapshot_view = None
+        self.batched_route_view = None
         self.device_indices = None
         self.last_stats = {}
         self.config = BenchmarkConfig(struct_size=C.sizeof(BenchmarkConfig))
@@ -287,6 +288,17 @@ class BenchmarkMetadataBackend:
         # self.r is updated in place and stays alive through benchmark shutdown.
         self.session.check(enable(self.session.handle, self.r.data_ptr()))
         self.source_snapshot_view = view
+        batch = getattr(self.session.lib, "rme2_benchmark_route_views", None)
+        if batch is not None:
+            batch.argtypes = [C.c_void_p, C.c_uint64, C.POINTER(BenchmarkSource), C.c_int,
+                              C.POINTER(BenchmarkRouting), C.POINTER(BenchmarkHostRoute)]
+            batch.restype = C.c_int
+            # Each install consumes the descriptors synchronously. The pointed-to
+            # records remain owned by the exchange through retirement.
+            self.route_view_buffers = ((BenchmarkSource * 16)(),
+                                       BenchmarkRouting(struct_size=C.sizeof(BenchmarkRouting)),
+                                       BenchmarkHostRoute(struct_size=C.sizeof(BenchmarkHostRoute)))
+            self.batched_route_view = batch
 
     def _capture(self):
         import cuda.bindings.driver as cuda
@@ -325,8 +337,16 @@ class BenchmarkMetadataBackend:
         seed = _generation_seed(self.config.router_seed, self.rank, iteration)
         self.generator(self.r_argument, self.seed_type(seed), self.cu_stream)
 
-    def _install(self, iteration):
+    def _collect_route_views(self, iteration):
         session = self.session
+        # Exchange sequences start at one and payload iterations start at zero.
+        sequence = iteration + 1
+        if self.batched_route_view is not None:
+            sources, record, host = self.route_view_buffers
+            session.check(self.batched_route_view(session.handle, sequence, sources, len(sources),
+                                                  C.byref(record), C.byref(host)))
+            return record, host
+
         sources = (BenchmarkSource * 16)()
         for rank in range(16):
             offsets, indices, count = _I32P(), _I32P(), C.c_int()
@@ -341,26 +361,29 @@ class BenchmarkMetadataBackend:
         record = BenchmarkRouting(C.sizeof(BenchmarkRouting), 16, sources, x3, x4, count.value)
         if self.source_snapshot_view is not None:
             offsets, source_x3, source_x4, r = _I32P(), _I32P(), _U8P(), _I32P()
-            # Benchmark sequences start at one; payload iterations start at zero.
-            session.check(self.source_snapshot_view(session.handle, iteration + 1, C.byref(offsets),
+            session.check(self.source_snapshot_view(session.handle, sequence, C.byref(offsets),
                                                     C.byref(source_x3), C.byref(source_x4), C.byref(r)))
             if not offsets:
                 raise RuntimeError("benchmark source snapshot is missing its node offsets")
             nodes = self.config.num_nodes
             host = BenchmarkHostRoute(C.sizeof(BenchmarkHostRoute), nodes + 1, offsets[nodes],
                                       8 * self.config.num_tokens, offsets, source_x3, source_x4, r)
-            if self.device_indices is not None:
-                status = self.install_device_indices(self.handle, iteration, C.byref(record), C.byref(host),
-                                                     C.byref(self.device_indices))
-            else:
-                status = self.install_host_routing(self.handle, iteration, C.byref(record), C.byref(host))
-        else:
-            record.device_r, record.device_node_offsets = self.r.data_ptr(), self.plan.node_offsets.data_ptr()
-            record.device_x3, record.device_x4 = self.plan.x3.data_ptr(), self.plan.x4.data_ptr()
+            return record, host
+        record.device_r, record.device_node_offsets = self.r.data_ptr(), self.plan.node_offsets.data_ptr()
+        record.device_x3, record.device_x4 = self.plan.x3.data_ptr(), self.plan.x4.data_ptr()
+        return record, None
+
+    def _install(self, iteration, record, host):
+        if host is None:
             status = self.install_routing(self.handle, iteration, C.byref(record))
+        elif self.device_indices is not None:
+            status = self.install_device_indices(self.handle, iteration, C.byref(record), C.byref(host),
+                                                 C.byref(self.device_indices))
+        else:
+            status = self.install_host_routing(self.handle, iteration, C.byref(record), C.byref(host))
         self._check(status, "installing benchmark routing in the payload proxy")
 
-    def prepare(self, iteration, *, compute_extents=True):
+    def prepare(self, iteration, *, compute_extents=True, trace_route_views=False):
         if self.closed or self.failed or iteration != self.next_iteration:
             raise RuntimeError("benchmark metadata requires an active session and consecutive iterations")
         try:
@@ -380,7 +403,13 @@ class BenchmarkMetadataBackend:
             self.session.submit(iteration + 1, self.plan, self.stream)
             native_stats = self.session.wait()
             exchanged = time.perf_counter_ns()
-            self._install(iteration)
+            if trace_route_views:
+                with self.torch.cuda.nvtx.range("meon/metadata/collect_route_views"):
+                    record, host = self._collect_route_views(iteration)
+            else:
+                record, host = self._collect_route_views(iteration)
+            collected = time.perf_counter_ns()
+            self._install(iteration, record, host)
             installed = time.perf_counter_ns()
             # Local setup can use this route now. Native iteration-start synchronization
             # precedes payload dispatch and publication of ready rows on both nodes.
@@ -393,6 +422,8 @@ class BenchmarkMetadataBackend:
             self.last_stats = {
                 "r_ready_ns": r_ready, "generation_elapsed_ns": r_ready - started,
                 "exchange_staging_elapsed_ns": exchanged - exchange_start, "install_elapsed_ns": installed - exchanged,
+                "view_collection_elapsed_ns": collected - exchanged,
+                "route_view_mode": "batched" if self.batched_route_view is not None else "per_source",
                 "r_ready_to_install_elapsed_ns": installed - r_ready,
                 "retire_elapsed_ns": reuse_start - r_ready, "reuse_barrier_ns": exchange_start - reuse_start,
                 "release_barrier_ns": 0,  # Retain the timing field for older log readers.

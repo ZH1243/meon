@@ -201,10 +201,11 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                 test.assertEqual(concurrent_compute, compute)
                 events.append(("provider",))
 
-            def prepare(self, epoch, *, compute_extents=True):
+            def prepare(self, epoch, *, compute_extents=True, trace_route_views=False):
                 nonlocal epoch_installed, native_state
                 epoch_installed = epoch
                 test.assertEqual(compute_extents, compute)
+                test.assertEqual(trace_route_views, trace_up_launch)
                 events.append(("install", epoch))
                 if native_publication and epoch and rows_per_epoch[epoch]:
                     if native_returns and bound_bytes < rows_per_epoch[epoch] * 16:
@@ -216,6 +217,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                     raise RuntimeError("injected exchange failure")
                 self.last_stats = dict(r_ready_ns=time.perf_counter_ns(), generation_elapsed_ns=1000,
                                        exchange_staging_elapsed_ns=2000, install_elapsed_ns=3000,
+                                       view_collection_elapsed_ns=375, route_view_mode="batched",
                                        r_ready_to_install_elapsed_ns=5000, retire_elapsed_ns=100,
                                        reuse_barrier_ns=0, release_barrier_ns=0, source_route="receiver",
                                        source_route_storage="borrowed", a_idx_storage="exchange_device")
@@ -382,6 +384,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
         self.assertEqual(result.count("release_barrier_us=0.000"), 2)
         self.assertIn("source_route=receiver source_route_storage=borrowed", result)
         self.assertIn("a_idx_storage=exchange_device", result)
+        self.assertEqual(result.count("view_collection_us=0.375 route_view_mode=batched"), 2)
         self.assertNotIn("r_ready_to_up_submit_us", result)
 
     def test_up_uses_current_route_and_timing_is_only_for_actual_launches(self):

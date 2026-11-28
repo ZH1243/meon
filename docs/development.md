@@ -304,6 +304,7 @@ Look for `a_idx_storage=exchange_device` on the per-rank timing line to confirm 
 | `routing … elapsed_us` | Entry to benchmark preparation through completion of local route installation, including generation, retirement, alignment and exchange. |
 | `exchange_staging_us` | Aligned submission through benchmark wait completion, including the seven kernels, GPU exchange, RDMA and local gather. With `source_route=receiver`, this includes writing the outgoing snapshot. With direct GPU indices, it also includes the remote index mirrors and their GPU visibility. Pass `--device-indices` to the standalone two-node benchmark to include those writes there. |
 | `install_us` | Benchmark wait return through completion of route installation on the calling thread. On the native publication path this includes the prefix reset, scatter registration and local-ready request when the slab fits. Peer transport preparation runs later on the coordinator. |
+| `view_collection_us` | Portion of `install_us` from the Python exchange-and-staging wait return until the descriptors are ready to pass to the payload installer. `route_view_mode=batched` uses one exchange call for all views. `per_source` uses the individual getters. With `--trace-up-launch`, the host NVTX range is `meon/metadata/collect_route_views`. |
 | `retire_us` | Local time to release the previous iteration's borrowed route data before entering the reuse barrier. Zero for the first iteration and for snapshot installs. |
 | `r_ready_to_up_submit_us` | Fresh R completed through host return from up-GEMM submission, including rank alignment before exchange, installation and compute setup. Available for compute iterations that submit work. Use a GPU trace to measure the actual kernel start. |
 | `generation_us`, `reuse_barrier_us` | Route generation and the Gloo barrier before exchange submission, respectively. |
@@ -761,6 +762,32 @@ ctest --test-dir "${RDMA_PROXY_BUILD_DIR:-build-hopper}" -R '^test_borrowed_rout
 ```
 
 Use the 1,024-token projection and return checks in the preceding section, then repeat the 20,480-token report 31 capture with the same launch and tracing options. Compare iterations 1–4 on each GPU from local staging gather completion to the first local descriptor upload, the first positive ready count, the first outgoing staged NVLink copy and the up-GEMM kernel start.
+
+#### Batched route views after H800 report 32
+
+Update the Python worker and rebuild the exchange library on each Hopper node. The worker discovers the batched getter during setup. Run the 1,024-token projection and return checks first, then repeat the report 32 workload at 20,480 tokens per GPU. Use the same `args` and node-specific `launcher` as in the [prepared up-GEMM check](#prepared-hopper-swiglu-up-gemm).
+
+```bash
+cmake --build "${RDMA_PROXY_BUILD_DIR:-build-hopper}" --target rdma_cpu_proxy_shared -j4
+bash "$launcher" "${args[@]}" --num_tokens=1024 --num_iterations=3 \
+    --check-projections --check-return-token-results --check-intra-node-combine \
+    --check-rdma-return-token-results --check-inter-node-combine --benchmark-metadata-validation
+bash "$launcher" "${args[@]}"
+```
+
+Look for `route_view_mode=batched` on each rank. For a paired measurement, run the same updated worker with `MEON_BENCHMARK_METADATA_LIBRARY` pointing to the saved report 32 exchange library on each host. That run reports `per_source` and measures the 18 calls for the receiver route. Compare `view_collection_us` and total `install_us` for each GPU in iterations 1–4. In Nsight, compare local staging gather completion to the first local gather-table upload, the first positive ready count, the up-GEMM kernel start and the first outgoing staged NVLink copy. To see the collection itself in the timeline, add `--trace-up-launch` on both nodes and capture NVTX in both comparison runs.
+
+Host verification used arm64 macOS 15.6.1, Python 3.9.12 and CPU PyTorch 1.13.1. The exchange suite checks native and ctypes layouts, source-rank order, pointer identity, empty generations and rejection of mixed epochs. All ten exchange host tests passed. The Debug meon suite passed 47 tests and skipped six CUDA tests. The Python suite ran 133 tests with eight skips. CUDA compilation, two-node numerical checks and GPU timing require the Hopper hosts.
+
+```bash
+cmake -S benchmarks/router_metadata_exchange2 -B build/exchange-host -DRME2_HOST_TESTS_ONLY=ON -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/exchange-host -j4
+ctest --test-dir build/exchange-host --output-on-failure
+cmake -S . -B build/mock -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/mock -j4
+ctest --test-dir build/mock --output-on-failure
+OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 /Users/zhuhao/opt/anaconda3/bin/python3 -m unittest discover -s tests/python -q
+```
 
 ### Two-node test on Hopper
 

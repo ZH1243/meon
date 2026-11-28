@@ -145,6 +145,19 @@ int rme2_x3_x4_view(Rme2Proxy*, const int32_t** x3, const uint8_t** x4, int* cou
  * borrowed through the next submit or destroy. */
 int rme2_source_snapshot_view(Rme2Proxy*, uint64_t iteration, const int32_t** node_offsets,
                               const int32_t** x3, const uint8_t** x4, const int32_t** r);
+/* Optional meon handoff using the descriptors in include/rdma_proxy_c_api.h.
+ * Enable the source snapshot and successfully wait for this 1-based iteration.
+ * Supply storage for at least 16 sources and initialize both struct_size fields.
+ * On success routing->sources points to the supplied array, in global-rank order.
+ * The exchange owns the pointed-to data until the next submit or destroy.
+ * On error all caller-owned outputs retain their previous values. */
+struct RdmaProxyBenchmarkSource;
+struct RdmaProxyBenchmarkRouting;
+struct RdmaProxyBenchmarkHostRoute;
+int rme2_benchmark_route_views(Rme2Proxy*, uint64_t iteration,
+                               struct RdmaProxyBenchmarkSource* sources, int source_capacity,
+                               struct RdmaProxyBenchmarkRouting* routing,
+                               struct RdmaProxyBenchmarkHostRoute* host_route);
 void rme2_destroy(Rme2Proxy*);
 #ifdef __cplusplus
 }

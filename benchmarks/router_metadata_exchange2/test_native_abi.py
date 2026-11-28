@@ -1,12 +1,16 @@
 import ctypes
 import os
+from pathlib import Path
 import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from native import Proxy, Stats
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
+from benchmark_metadata_backend import BenchmarkHostRoute, BenchmarkRouting, BenchmarkSource
 
 class NativeAbiTests(unittest.TestCase):
     def test_receiver_overlap_is_configured_after_receiver_before_connect(self):
@@ -34,9 +38,14 @@ class NativeAbiTests(unittest.TestCase):
             finally:
                 proxy.close()
 
-    def test_stats_c_layout_matches_ctypes(self):
+    def test_c_layouts_match_ctypes(self):
         result = subprocess.run([os.environ['RME2_ABI_BIN']], check=True, text=True, capture_output=True)
         layout = dict(line.split() for line in result.stdout.splitlines())
+        for cls in (BenchmarkSource, BenchmarkRouting, BenchmarkHostRoute):
+            prefix = f'RdmaProxy{cls.__name__}.'
+            self.assertEqual(int(layout.pop(prefix + 'size')), ctypes.sizeof(cls))
+            for field, _ in cls._fields_:
+                self.assertEqual(int(layout.pop(prefix + field)), getattr(cls, field).offset, prefix + field)
         self.assertEqual(int(layout.pop('size')), ctypes.sizeof(Stats))
         for field, offset in layout.items():
             self.assertEqual(int(offset), getattr(Stats, field).offset, field)

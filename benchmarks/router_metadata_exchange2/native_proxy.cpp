@@ -1,4 +1,5 @@
 #include "native_proxy.h"
+#include "benchmark_route_views.hpp"
 #include "exchange.cuh"
 #include "metadata_view.hpp"
 #include "readback_progress.hpp"
@@ -110,6 +111,13 @@ struct Rme2Proxy {
               int ns, int nd)
         : rank(r), device(d), tokens(t), capacity(t * 8), core(c), nodes(ns), node(nd), timeout(seconds),
           validate(v), per_source_readback(progressive), metadata_barrier(barrier), name(n) {}
+
+    const rme2::receiver::SourceSnapshot& waited_source_snapshot(uint64_t iteration) const {
+        require(source_r && !stopping.load() && failure.empty() && iteration &&
+                sequence == iteration && source_waited_epoch == iteration,
+                "source snapshot view requires successful wait for this iteration");
+        return source_host;
+    }
 
     size_t words() const {
         return nodes == 2 ? rme2::two::words(capacity) :
@@ -1102,13 +1110,22 @@ extern "C" int rme2_source_snapshot_view(Rme2Proxy* p, uint64_t iteration, const
     return api([&] {
         require(p && node_offsets && x3 && x4 && r, "invalid source snapshot view arguments");
         std::lock_guard<std::mutex> lock(p->mutex);
-        require(p->source_r && !p->stopping.load() && p->failure.empty() && iteration &&
-                p->sequence == iteration && p->source_waited_epoch == iteration,
-                "source snapshot view requires successful wait for this iteration");
-        *node_offsets = p->source_host.node_offsets;
-        *x3 = p->source_host.x3;
-        *x4 = p->source_host.x4;
-        *r = p->source_host.r;
+        const auto& snapshot = p->waited_source_snapshot(iteration);
+        *node_offsets = snapshot.node_offsets;
+        *x3 = snapshot.x3;
+        *x4 = snapshot.x4;
+        *r = snapshot.r;
+    });
+}
+extern "C" int rme2_benchmark_route_views(Rme2Proxy* p, uint64_t iteration,
+        RdmaProxyBenchmarkSource* sources, int source_capacity, RdmaProxyBenchmarkRouting* routing,
+        RdmaProxyBenchmarkHostRoute* host_route) {
+    return api([&] {
+        require(p && p->nodes == rme2::two::nodes, "benchmark route views require a two-node proxy");
+        std::lock_guard<std::mutex> lock(p->mutex);
+        const auto& snapshot = p->waited_source_snapshot(iteration);
+        rme2::collect_benchmark_route_views(iteration, p->tokens, p->installed, p->installed_x3_x4,
+                                           snapshot, sources, source_capacity, routing, host_route);
     });
 }
 extern "C" void rme2_destroy(Rme2Proxy* p) { delete p; }

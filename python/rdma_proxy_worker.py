@@ -2110,7 +2110,9 @@ def print_benchmark_routing(node, gpu, iteration, elapsed_ns, stats, up_submitte
           f"a_idx_storage={stats['a_idx_storage']} early_up_launch={int(stats.get('early_up_launch', False))} "
           f"concurrent_local_publication={int(stats.get('concurrent_local_publication', False))} "
           f"native_local_publication={int(stats.get('native_local_publication', False))} "
-          f"native_local_publication_growth={int(stats.get('native_local_publication_growth', False))}",
+          f"native_local_publication_growth={int(stats.get('native_local_publication_growth', False))} "
+          f"view_collection_us={stats['view_collection_elapsed_ns'] / 1000:.3f} "
+          f"route_view_mode={stats['route_view_mode']}",
           flush=True)
     waits = stats.get("completion_wait_ns", {})
     if waits:
@@ -2262,6 +2264,8 @@ def run_proxy_with_concurrent_kernel(
         dynamic = benchmark_metadata is not None or dynamic_routing_enabled(library, handle, proxy_argv)
         prepare_epoch = (benchmark_metadata.prepare if benchmark_metadata is not None
                          else partial(prepare_routing, library, handle))
+        if trace_up_launch and benchmark_metadata is not None:
+            prepare_epoch = partial(prepare_epoch, trace_route_views=True)
         routing_times_ns = []
         benchmark_timings = []
         extents = None
@@ -2862,7 +2866,7 @@ def main() -> int:
                              "up kernels and compare their outputs and timings")
     parser.add_argument("--trace-up-launch", action="store_true",
                         help="record per-iteration host submission and QuACK plan-cache timings "
-                             "and NVTX ranges for up GEMM")
+                             "and NVTX ranges for up GEMM and benchmark route view collection")
     parser.add_argument("--prepared-up-gemm", action=argparse.BooleanOptionalAction, default=None,
                         help="reuse the QuACK host plan for dynamic Hopper multi-buffer SwiGLU "
                              "(default: automatic when the selected QuACK supports it)")

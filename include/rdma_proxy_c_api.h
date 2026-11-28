@@ -351,8 +351,10 @@ RDMA_PROXY_C_API int rdma_proxy_install_borrowed_benchmark_device_indices(
  * compute extents and route views are available when the call returns. On a
  * refreshed route with early local readiness, prepare_iteration can release
  * this GPU's own gather rows. With a native local-publication binding, installation
- * can request those rows before returning. Run run_iteration concurrently with the GEMM
- * to finish transport preparation and publish the remaining rows. */
+ * can request those rows before returning. Prepared local staging can also
+ * forward to other GPUs once every receiver on this node has armed the generation.
+ * Drive run_iteration concurrently with the GEMM to start payload RDMA and
+ * publish rows from remote sources. */
 RDMA_PROXY_C_API int rdma_proxy_install_benchmark_device_indices_for_compute(
     RdmaProxyHandle* handle, uint64_t iteration, const RdmaProxyBenchmarkRouting* routing,
     const RdmaProxyBenchmarkHostRoute* host_route, const RdmaProxyBenchmarkDeviceIndices* device_indices);
@@ -372,9 +374,10 @@ RDMA_PROXY_C_API int rdma_proxy_get_routing_extents(
 RDMA_PROXY_C_API int rdma_proxy_prepare_early_up(RdmaProxyHandle* handle, uint64_t iteration,
     uintptr_t compute_stream, int32_t* armed);
 /* Optional after armed=1 and registration of this route's scatter destinations.
- * Starts the gather scheduler and requests local publication. May overlap GPU
- * launch. Return maps may start afterwards. Call prepare_iteration/run_iteration
- * to prepare returns and advance peer transport. Serialize these host control
+ * Starts the gather scheduler and requests local publication. With prepared
+ * local staging, this also arms this GPU for same-node forwarding. May overlap
+ * GPU launch. Return maps may start afterwards. Call prepare_iteration/run_iteration
+ * to prepare returns and advance RDMA transport. Serialize these host control
  * calls. Repeating this request before full preparation is idempotent. */
 RDMA_PROXY_C_API int rdma_proxy_prepare_local_publication(RdmaProxyHandle* handle, uint64_t iteration);
 RDMA_PROXY_C_API int rdma_proxy_cancel_early_up(RdmaProxyHandle* handle, uint64_t iteration);

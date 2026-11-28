@@ -75,6 +75,7 @@ public:
 
 private:
     friend class ConnectionManager;
+    friend struct BenchmarkRoutingTestAccess;
     IterationControlChannel(int fd, bool client, int peer_rank);
     int fd_;
     bool client_;

@@ -576,8 +576,13 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
         self.assertEqual(output.count("scatter_views_us="), 2)
         self.assertEqual([e for e in events if e[0] == "scatter"], [("scatter", 1)])
         self.assertFalse(any(e[0] == "early-reset" for e in events))
+        # An empty destination still arms its staging receiver during native preparation.
+        self.assertNotIn(("native-request", 2), events)
+        self.assertLess(events.index(("install", 2)), events.index(("prepare", 2)))
+        self.assertLess(events.index(("prepare", 2)), events.index(("payload", 2)))
         for epoch, rows in ((1, 3), (3, 2)):
             request = events.index(("native-request", epoch))
+            self.assertLess(request, events.index(("prepare", epoch)))
             self.assertLess(request, events.index(("up",), events.index(("install", epoch))))
             self.assertLess(request, events.index(("views", rows)))
             self.assertLess(request, events.index(("start-maps", epoch)))

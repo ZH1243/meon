@@ -218,8 +218,14 @@ struct Proxy::PreparedForwardingState {
     std::size_t produced{0};
     std::size_t consumed{0};
     std::atomic<bool> failed{false};
-    std::atomic<uint64_t> active_iteration{0}; // iteration + 1, 0 before run
+    std::atomic<uint64_t> local_iteration{0};  // receiver armed for early staged forwarding
+    std::atomic<uint64_t> active_iteration{0}; // payload start barrier passed
     std::atomic<uint64_t> scanned_iteration{0}; // final metadata read by the preparer
+
+    bool local_only(uint64_t marker) const {
+        return local_iteration.load(std::memory_order_acquire) == marker &&
+               active_iteration.load(std::memory_order_acquire) < marker;
+    }
 };
 
 struct Proxy::ForwardingBatchCompletion {
@@ -746,7 +752,8 @@ void Proxy::install_iteration_routing(uint64_t iteration, IterationRouteData rou
                 local_router_staging_buffer_ = &cuda_buffers_.nvlink_receive_buffer_for_source(
                     config_.node_rank, config_.local_gpu_index).recv;
             } else {
-                install_iteration_forwarding_tables();
+                install_peer_forwarding_tables();
+                prepare_local_forwarding_routing_table();
             }
         }
         local_router_input_staged_ = config_.router_local_input_staging_enabled;
@@ -767,9 +774,8 @@ void Proxy::configure_receive_chunks(PeerState& peer, const std::vector<std::siz
     for (auto& worker : peer.workers) worker->configure_expected_chunks(peer.receive_chunks.size());
 }
 
-void Proxy::install_iteration_forwarding_tables() {
+void Proxy::install_peer_forwarding_tables() {
     prepare_forwarding_routing_tables();
-    prepare_local_forwarding_routing_table();
     for (std::size_t p = 0; p < peers_.size(); ++p) {
         forwarding_next_chunk_by_peer_[p] = 0;
         forwarding_next_batch_by_peer_[p] = 0;
@@ -788,10 +794,10 @@ void Proxy::finish_benchmark_transport(uint64_t iteration) {
     if (!has_pending_benchmark_transport(iteration))
         throw std::runtime_error("no pending benchmark transport for this iteration");
     try {
-        // Own-source publication uses the receiver's mailbox and scheduler.
-        // The coordinator alone prepares peer state, before releasing any WRs.
         configure_receive_chunks(peers_.at(0), *pending_benchmark_receive_indices_);
-        install_iteration_forwarding_tables();
+        install_peer_forwarding_tables();
+        if (!config_.nvlink_forward_local_staging_prepared_enabled)
+            prepare_local_forwarding_routing_table();
         pending_benchmark_receive_indices_.reset();
     } catch (...) {
         routing_failed_ = true;
@@ -960,7 +966,22 @@ void Proxy::prepare_local_publication(uint64_t iteration) {
         throw std::runtime_error("local publication requires the installed early benchmark route");
     if (local_router_input_early_ready_requested_.load(std::memory_order_acquire) == iteration + 1) return;
     prepare_gather_inputs(iteration, true);
+    request_benchmark_local_input(iteration);
+}
+
+void Proxy::request_benchmark_local_input(uint64_t iteration) {
     request_local_router_input_ready(iteration);
+    if (!config_.nvlink_forward_local_staging_prepared_enabled) return;
+    const auto marker = iteration + 1;
+    if (forwarding_rounds_) forwarding_round_requested_.store(marker, std::memory_order_release);
+    // Reserve round zero of the existing staged-batch arrival for receiver readiness.
+    // The submitter can publish round one only after the local producer sees this epoch.
+    auto& arrival = local_iteration_sync_slot(config_.local_gpu_index)->prepared_arrivals[
+        static_cast<std::size_t>(LocalNvlinkBatchSyncPhase::kLocalInputStaging)];
+    atomic_store_u64(&arrival.round, 0);
+    atomic_store_u64(&arrival.iteration, marker);
+    prepared_forwarding_->local_iteration.store(marker, std::memory_order_release);
+    prepared_forwarding_->changed.notify_all();
 }
 
 void Proxy::prepare_iteration_step(uint64_t iteration) {
@@ -994,12 +1015,8 @@ void Proxy::prepare_iteration_step(uint64_t iteration) {
     down_ready_trace_.reset(iteration);
     iteration_prepared_ = true;
     if (has_pending_benchmark_transport(iteration)) {
-        // The benchmark has completed our own staging and installed all expert
-        // lists. The notification receiver can publish work from this one source
-        // while the coordinator prepares the peer transfers. All other source
-        // frontiers still advance only on their actual completion records.
         try {
-            if (!local_requested) request_local_router_input_ready(iteration);
+            if (!local_requested) request_benchmark_local_input(iteration);
         } catch (...) {
             routing_failed_ = true;
             iteration_prepared_ = false;
@@ -2782,7 +2799,9 @@ void Proxy::enqueue_prepared_notifications(
     auto& head = lane < 0 ? dispatch.prepared_head : dispatch.lanes[lane].head;
     auto& queued = lane < 0 ? dispatch.prepared_count : dispatch.lanes[lane].count;
     while (queued == entries.size()) {
-        if (forwarding_stop_.load() || prepared_forwarding_->failed.load()) {
+        // During prepared-only teardown the dispatcher still drains submitted local copies.
+        if (prepared_forwarding_->failed.load() || (forwarding_stop_.load() &&
+            !(count && prepared_forwarding_->local_only(notifications[0].iteration + 1)))) {
             throw std::runtime_error("prepared notification enqueue cancelled");
         }
         if (std::chrono::steady_clock::now() >= deadline) {
@@ -2967,7 +2986,8 @@ void Proxy::enqueue_empty_forwarding_phases(uint64_t iteration) {
         entries.resize(count);
         enqueue_forward_completion_notifications(std::move(entries));
     };
-    if (config_.router_local_input_staging_enabled && local_router_forwarding_chunks_.empty())
+    if (config_.router_local_input_staging_enabled && !config_.nvlink_forward_local_staging_prepared_enabled &&
+        local_router_forwarding_chunks_.empty())
         empty_phase(config_.node_rank, peers_.size());
     for (std::size_t p = 0; p < peers_.size(); ++p)
         if (peers_[p].receive_chunks.empty()) empty_phase(peers_[p].peer_rank, p);
@@ -3434,12 +3454,12 @@ void Proxy::flush_nvlink_forward_notification_log_queue() {
 void Proxy::drain_nvlink_forward_notification_queue(NvlinkForwardNotificationQueue* queue) {
     if (!queue || !nvlink_forward_notification_header_) return;
     while (true) {
-        // Do not leave a newly posted local request behind an unbounded stream
-        // of ordinary notifications from another GPU.
-        begin_forwarding_round_iteration();
-        consume_local_router_input_ready();
         const auto tail = atomic_load_u64(&queue->tail);
         const auto head = atomic_load_u64(&queue->head);
+        // Acquire the incoming head first. Its sender may have observed our
+        // receiver-ready arrival since the receiver last checked the mailbox.
+        begin_forwarding_round_iteration();
+        consume_local_router_input_ready();
         if (tail >= head) return;
         atomic_thread_fence_acquire();
         auto* wire_entry = nvlink_forward_notification_entry(
@@ -3528,7 +3548,10 @@ void Proxy::nvlink_forward_notification_loop() {
                 if (nvlink_forward_notification_queues_complete() && forwarding_rounds_ &&
                     forwarding_rounds_->collector->active() && !forwarding_rounds_->collector->complete()) {
                     forwarding_rounds_->collector->cancel();
-                    throw std::runtime_error("shutdown with incomplete forwarding rounds");
+                    // A prepared-only generation can end here without ever releasing peer transport.
+                    const auto epoch = forwarding_rounds_->receiver_epoch;
+                    if (!prepared_forwarding_ || !prepared_forwarding_->local_only(epoch))
+                        throw std::runtime_error("shutdown with incomplete forwarding rounds");
                 }
                 if (nvlink_forward_notification_queues_complete() &&
                     (!forwarding_rounds_ || !forwarding_rounds_->collector->active() ||
@@ -3553,9 +3576,7 @@ void Proxy::run_iteration(uint64_t iteration) {
     const bool local_input_requested = has_pending_benchmark_transport(iteration);
     if (local_input_requested) {
         finish_benchmark_transport(iteration);
-        // Only peer traffic needs the round collector. Owner-only preparation
-        // may be retired on shutdown without ever starting a forwarding round.
-        if (forwarding_rounds_)
+        if (forwarding_rounds_ && !config_.nvlink_forward_local_staging_prepared_enabled)
             forwarding_round_requested_.store(iteration + 1, std::memory_order_release);
     }
     std::vector<std::vector<ChunkDescriptor>> chunks_by_peer;
@@ -3579,13 +3600,10 @@ void Proxy::run_iteration(uint64_t iteration) {
     std::chrono::steady_clock::time_point start;
     if (config_.router_local_input_early_ready_enabled)
         start = std::chrono::steady_clock::now();
-    if (prepared_forwarding_) {
+    if (prepared_forwarding_ && !config_.nvlink_forward_submit_epilogue_enabled) {
         std::lock_guard<std::mutex> lock(forwarding_mutex_);
         forwarding_iteration_stats_.resize(static_cast<std::size_t>(iteration) + 1);
     }
-    // Finish potentially allocating/locking setup before posting. The enabled
-    // timer includes this work, but no publication-completion wait or setup
-    // separates the mailbox release from prepared forwarding activation.
     if (config_.router_local_input_early_ready_enabled && !local_input_requested)
         request_local_router_input_ready(iteration);
     enqueue_empty_forwarding_phases(iteration);
@@ -3890,7 +3908,12 @@ std::size_t Proxy::synchronize_prepared_nvlink_batch_start(
         } else {
             check_forwarding_error();
         }
-        if (forwarding_stop_.load()) throw std::runtime_error("prepared batch barrier cancelled");
+        if (forwarding_stop_.load()) {
+            if (phase == LocalNvlinkBatchSyncPhase::kLocalInputStaging &&
+                prepared_forwarding_ && prepared_forwarding_->local_only(marker))
+                return 0;
+            throw std::runtime_error("prepared batch barrier cancelled");
+        }
         bool complete = true;
         for (int gpu = 0; gpu < config_.num_gpus_per_node; ++gpu) {
             const auto* slot = local_iteration_sync_slot(gpu);
@@ -5791,6 +5814,8 @@ void Proxy::prepare_forwarding_batch(
         batch.peer_index = peer_index;
         batch.first_chunk = batch.chunk_count = batch.batch_index = batch.bytes = batch.notification_count = 0;
         for (auto& destination : batch.destinations) destination.clear();
+        complete_forwarding_round_records(batch.notifications.data(), batch.notification_count,
+            iteration, config_.node_rank, peer_index, false, true);
         return;
     }
     if (chunk_count == 0 || first_chunk >= chunks.size() ||
@@ -5889,108 +5914,154 @@ void Proxy::prepare_forwarding_batch(
     if (!local) forwarding_compaction_next_source_token_by_peer_[peer_index] = end;
 }
 
-void Proxy::prepared_forwarding_ready_loop() {
+bool Proxy::wait_for_local_staging_receivers(uint64_t iteration) {
+    ScopedPreparedRange wait(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/local_receivers_ready");
+    const auto marker = iteration + 1;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.completion_timeout_ms);
+    for (int gpu = 0; gpu < config_.num_gpus_per_node; ++gpu) {
+        const auto& arrival = local_iteration_sync_slot(gpu)->prepared_arrivals[
+            static_cast<std::size_t>(LocalNvlinkBatchSyncPhase::kLocalInputStaging)];
+        uint64_t polls = 0;
+        while (atomic_load_u64(&arrival.iteration) < marker) {
+            if (forwarding_stop_.load() || prepared_forwarding_->failed.load()) return false;
+            // A rank using synchronous installation may never advertise round zero.
+            // Passing the ordinary payload barrier also proves every receiver has reset.
+            if (prepared_forwarding_->active_iteration.load(std::memory_order_acquire) >= marker) return true;
+            if ((++polls & 0x3ffULL) == 0) {
+                if (config_.nvlink_return_completion_notifications_enabled) drain_return_notifications();
+                if (std::chrono::steady_clock::now() >= deadline)
+                    throw std::runtime_error("timed out waiting for local staging receiver gpu=" +
+                        std::to_string(gpu) + " iteration=" + std::to_string(iteration));
+            }
+            cpu_relax();
+        }
+    }
+    return true;
+}
+
+bool Proxy::publish_prepared_forwarding_batch(uint64_t iteration, std::size_t peer_index,
+    std::size_t first_chunk, std::size_t count, std::size_t& published) {
     auto& state = *prepared_forwarding_;
     const bool atomic_ring = config_.nvlink_forward_prepared_atomic_ring_enabled;
-    std::size_t published = 0;
-    auto order = nvlink_forward_peer_order();
-    const bool include_local = config_.nvlink_forward_local_staging_prepared_enabled;
-    // The extra source index denotes local staging; it never indexes peers_.
-    if (include_local) order.insert(order.begin(), peers_.size());
-    std::vector<std::size_t> next_chunk(peers_.size() + (include_local ? 1 : 0), 0);
     const auto cancelled = [&] { return forwarding_stop_.load() || state.failed.load(); };
+    std::size_t slot_index;
+    if (atomic_ring) {
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(config_.completion_timeout_ms);
+        if (published - state.retired.load(std::memory_order_acquire) == state.slots.size()) {
+            ScopedPreparedRange wait(config_.nvlink_forward_prepared_nvtx_enabled,
+                                     "nvlink_prepare/queue_full_wait");
+            uint64_t polls = 0;
+            while (published - state.retired.load(std::memory_order_acquire) == state.slots.size()) {
+                if (cancelled()) return false;
+                if ((++polls & 0x3ffULL) == 0 && std::chrono::steady_clock::now() >= deadline) {
+                    throw std::runtime_error("timed out waiting for a free prepared forwarding slot");
+                }
+                cpu_relax();
+            }
+        }
+        if (cancelled()) return false;
+        slot_index = published % state.slots.size();
+    } else {
+        std::unique_lock<std::mutex> lock(state.mutex);
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(config_.completion_timeout_ms);
+        while (!cancelled() && state.produced - state.consumed == state.slots.size()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                throw std::runtime_error("timed out waiting for a free prepared forwarding slot");
+            }
+            ScopedPreparedRange wait(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepare/queue_full_wait");
+            state.changed.wait_for(lock, std::chrono::milliseconds(1));
+        }
+        if (cancelled()) return false;
+        slot_index = state.produced % state.slots.size();
+    }
+    // No queue or stream lock while scanning metadata.
+    ScopedPreparedRange prepare(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepare/build_batch");
+    prepare_forwarding_batch(state.slots[slot_index], peer_index, iteration, first_chunk, count);
+    prepare.end();
+    ScopedPreparedRange publish(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepare/publish_batch");
+    if (atomic_ring) {
+        // Account before X can observe the descriptor and Y can retire it.
+        forwarding_batches_in_flight_.fetch_add(1);
+        state.published.store(++published, std::memory_order_release);
+    } else {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (config_.nvlink_forward_submit_epilogue_enabled) {
+            forwarding_batches_in_flight_.fetch_add(1);
+        }
+        ++state.produced; // mutex release publishes all argument arrays
+    }
+    if (!atomic_ring) state.changed.notify_all();
+    return true;
+}
+
+void Proxy::prepared_forwarding_ready_loop() {
+    auto& state = *prepared_forwarding_;
+    const auto order = nvlink_forward_peer_order();
+    std::vector<std::size_t> next_chunk(peers_.size());
+    std::size_t published = 0;
+    const auto cancelled = [&] { return forwarding_stop_.load() || state.failed.load(); };
+    const auto wait_for_release = [&](uint64_t marker, bool local) {
+        const auto ready = [&] {
+            return state.active_iteration.load(std::memory_order_acquire) >= marker ||
+                   (local && state.local_iteration.load(std::memory_order_acquire) >= marker);
+        };
+        if (config_.nvlink_forward_prepared_atomic_ring_enabled) {
+            while (!ready() && !cancelled()) cpu_relax();
+        } else {
+            std::unique_lock<std::mutex> lock(state.mutex);
+            while (!ready() && !cancelled()) state.changed.wait_for(lock, std::chrono::milliseconds(1));
+        }
+        return !cancelled();
+    };
     for (uint64_t iteration = 0;
          !cancelled() && (config_.num_iterations == 0 || iteration < config_.num_iterations);
          ++iteration) {
-        if (atomic_ring) {
-            while (state.active_iteration.load(std::memory_order_acquire) < iteration + 1) {
-                if (cancelled()) return;
-                cpu_relax();
+        const auto marker = iteration + 1;
+        if (config_.nvlink_forward_local_staging_prepared_enabled) {
+            if (!wait_for_release(marker, true)) return;
+            if (state.local_iteration.load(std::memory_order_acquire) == marker) {
+                // This producer owns local chunks and cursors. The borrowed source stays live
+                // through the final scan and iteration_done. Peer transport owns separate tables.
+                prepare_local_forwarding_routing_table();
             }
-        } else {
-            std::unique_lock<std::mutex> lock(state.mutex);
-            while (!cancelled() && state.active_iteration.load() < iteration + 1) {
-                state.changed.wait_for(lock, std::chrono::milliseconds(1));
-            }
+            const auto chunks = local_router_forwarding_chunks_.size();
+            std::size_t first_chunk = 0;
+            do {
+                const auto count = std::min(config_.nvlink_forward_prepared_batch_chunks, chunks - first_chunk);
+                if (!publish_prepared_forwarding_batch(iteration, peers_.size(), first_chunk, count, published)) return;
+                first_chunk += count;
+            } while (first_chunk < chunks);
         }
-        if (cancelled()) return;
-        const auto required_count = config_.router_dynamic_routing_enabled ? 1 : iteration + 1;
+
+        // Wait outside the route lock so the coordinator can finish peer transport setup.
+        if (!wait_for_release(marker, false)) return;
         auto routes_lock = lock_forwarding_routes();
         if (config_.router_dynamic_routing_enabled && routing_iteration_ != iteration)
             throw std::runtime_error("forwarding activated before installing the iteration routes");
+        const auto required_count = config_.router_dynamic_routing_enabled ? 1 : marker;
         std::fill(next_chunk.begin(), next_chunk.end(), 0);
         while (!cancelled()) {
             bool all_prepared = true;
             bool progressed = false;
             for (const auto p : order) {
-                const bool local = include_local && p == peers_.size();
-                const auto& chunks = local ? local_router_forwarding_chunks_ : peers_[p].receive_chunks;
-                const auto work_size = local ? std::max(std::size_t{1}, chunks.size()) : chunks.size();
-                if (next_chunk[p] == work_size) continue;
+                const auto& chunks = peers_[p].receive_chunks;
+                if (next_chunk[p] == chunks.size()) continue;
                 all_prepared = false;
                 const auto count = std::min(config_.nvlink_forward_prepared_batch_chunks,
                                             chunks.size() - next_chunk[p]);
                 bool ready = true;
-                for (std::size_t c = 0; !local && c < count; ++c) {
+                for (std::size_t c = 0; c < count; ++c) {
                     if (!forwarding_chunk_available(peers_[p], chunks[next_chunk[p] + c], required_count)) {
                         ready = false;
                         break;
                     }
                 }
                 if (!ready) continue;
-                std::size_t slot_index;
-                if (atomic_ring) {
-                    const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(config_.completion_timeout_ms);
-                    if (published - state.retired.load(std::memory_order_acquire) == state.slots.size()) {
-                        ScopedPreparedRange wait(config_.nvlink_forward_prepared_nvtx_enabled,
-                                                 "nvlink_prepare/queue_full_wait");
-                        uint64_t polls = 0;
-                        while (published - state.retired.load(std::memory_order_acquire) == state.slots.size()) {
-                            if (cancelled()) return;
-                            if ((++polls & 0x3ffULL) == 0 && std::chrono::steady_clock::now() >= deadline) {
-                                throw std::runtime_error("timed out waiting for a free prepared forwarding slot");
-                            }
-                            cpu_relax();
-                        }
-                    }
-                    if (cancelled()) return;
-                    slot_index = published % state.slots.size();
-                } else {
-                    std::unique_lock<std::mutex> lock(state.mutex);
-                    const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(config_.completion_timeout_ms);
-                    while (!cancelled() && state.produced - state.consumed == state.slots.size()) {
-                        if (std::chrono::steady_clock::now() >= deadline) {
-                            throw std::runtime_error("timed out waiting for a free prepared forwarding slot");
-                        }
-                        ScopedPreparedRange wait(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepare/queue_full_wait");
-                        state.changed.wait_for(lock, std::chrono::milliseconds(1));
-                    }
-                    if (cancelled()) return;
-                    slot_index = state.produced % state.slots.size();
-                }
-                // No queue or stream lock while scanning metadata.
-                ScopedPreparedRange prepare(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepare/build_batch");
-                prepare_forwarding_batch(state.slots[slot_index], p, iteration, next_chunk[p], count);
-                prepare.end();
-                ScopedPreparedRange publish(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepare/publish_batch");
-                if (atomic_ring) {
-                    // Account before X can observe the descriptor and Y can retire it.
-                    forwarding_batches_in_flight_.fetch_add(1);
-                    state.published.store(++published, std::memory_order_release);
-                } else {
-                    std::lock_guard<std::mutex> lock(state.mutex);
-                    if (config_.nvlink_forward_submit_epilogue_enabled) {
-                        forwarding_batches_in_flight_.fetch_add(1);
-                    }
-                    ++state.produced; // mutex release publishes all argument arrays
-                }
-                if (!atomic_ring) state.changed.notify_all();
-                next_chunk[p] += (local && count == 0) ? 1 : count;
+                if (!publish_prepared_forwarding_batch(iteration, p, next_chunk[p], count, published)) return;
+                next_chunk[p] += count;
                 progressed = true;
-                // Publish the entire local prefix before any remote descriptor.
-                if (local && next_chunk[p] < work_size) break;
             }
             if (all_prepared) break;
             if (!progressed) {
@@ -5998,7 +6069,7 @@ void Proxy::prepared_forwarding_ready_loop() {
                 std::this_thread::sleep_for(std::chrono::microseconds(10));
             }
         }
-        if (config_.router_dynamic_routing_enabled) state.scanned_iteration.store(iteration + 1);
+        if (!cancelled() && config_.router_dynamic_routing_enabled) state.scanned_iteration.store(marker);
     }
 }
 
@@ -6247,6 +6318,11 @@ void Proxy::submit_forwarding_loop() {
             round = 0;
         }
         setup.end();
+        // Descriptors can be built while a destination is still resetting. Gate
+        // the first submission, including an empty phase, before any peer-visible work.
+        if (batch->local_source && batch->first_chunk == 0 &&
+            state.local_iteration.load(std::memory_order_acquire) == batch->iteration + 1 &&
+            !wait_for_local_staging_receivers(batch->iteration)) return;
         // Start-only in this mode: the immutable prepared range is never shrunk.
         ScopedPreparedRange barrier(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/local_batch_barrier");
         if (!batch->local_source || batch->chunk_count != 0) {
@@ -6257,6 +6333,7 @@ void Proxy::submit_forwarding_loop() {
                 batch->local_source ? batch->batch_index + 1 : ++round, batch->chunk_count);
         }
         barrier.end();
+        if (cancelled()) return;
         const auto start = std::chrono::steady_clock::now();
         {
             ScopedPreparedRange stream_acquire(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/stream_lock");
@@ -6274,9 +6351,11 @@ void Proxy::submit_forwarding_loop() {
                     std::chrono::milliseconds(config_.completion_timeout_ms);
                 uint64_t polls = 0;
                 for (;;) {
-                    // Cancellation must not publish a successful completion to Y.
-                    // Shutdown still synchronizes before releasing buffers/slots.
-                    if (cancelled()) return;
+                    if (cancelled()) {
+                        // Finish in-flight peer writes before shutdown advertises sender_done.
+                        synchronize_cuda_stream(forwarding_stream_, config_.mock_mode);
+                        return;
+                    }
                     if (query_cuda_stream(forwarding_stream_, config_.mock_mode)) break;
                     if ((++polls & 0x3ffULL) == 0 && std::chrono::steady_clock::now() >= deadline) {
                         throw std::runtime_error("timed out querying prepared forwarding stream completion");
@@ -6327,6 +6406,8 @@ void Proxy::epilogue_forwarding_loop() {
             ScopedPreparedRange stats_lock(config_.nvlink_forward_prepared_nvtx_enabled, "nvlink_prepared/stats_lock");
             std::lock_guard<std::mutex> lock(forwarding_mutex_);
             stats_lock.end();
+            if (forwarding_iteration_stats_.size() <= batch->iteration)
+                forwarding_iteration_stats_.resize(static_cast<std::size_t>(batch->iteration) + 1);
             auto& stats = forwarding_iteration_stats_.at(batch->iteration);
             if (!batch->local_source || batch->chunk_count != 0) ++stats.batch_count;
             stats.total_bytes += batch->bytes;

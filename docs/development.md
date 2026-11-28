@@ -638,6 +638,24 @@ ctest --test-dir build/mock -R '^test_(benchmark_routing|c_api)$' --repeat until
 OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -q
 ```
 
+#### Checking staged NVLink forwarding against H800 report 28
+
+Rebuild the native shared library on **both** Hopper nodes with `cmake --build "$RDMA_PROXY_BUILD_DIR" --target rdma_cpu_proxy_shared -j4`. The report 28 arguments select the early staged-forwarding path from iteration 1. For the numerical run, use 1,024 tokens, at least three iterations and `--check-projections`. Keep benchmark metadata validation and all four return/combine checks enabled. For timing, repeat the original 20,480-token, five-iteration run with 64 prepared chunks and `complete_round` on both nodes.
+
+On node 0, use the end of each GPU’s local staging gather as the origin and compare iterations 1–4 across all eight GPUs. Report 28’s medians were 0.413 ms to the first positive own-source ready prefix, 0.890 ms to up-GEMM kernel start, 2.118 ms to the first outbound staged P2P copy, and 3.057 ms to the first peer-dependent prefix. Median full iteration time was 44.907 ms. Track the first peer-dependent prefix alongside the first copy to see when up-GEMM can actually use the forwarded rows. For an attribution capture, add `--nvlink_forward_prepared_nvtx_enabled=true` and look for `nvlink_prepared/local_receivers_ready` on the submission thread.
+
+The eight-rank host regression holds one local installer and then withholds a same-index start reply. It checks the first cross-GPU payload, its device gather descriptor, and every mock RDMA receive buffer before releasing the reply. It exercises the atomic ring with local batch synchronization both enabled and disabled. These host checks use an Apple M1 Max on macOS 15.6.1 with a Debug native build. Two-node Hopper numerical validation and timing require the target machines.
+
+```bash
+cmake --build build/mock -j6
+ctest --test-dir build/mock --output-on-failure
+ctest --test-dir build/mock -R '^test_benchmark_routing$' --repeat until-fail:5 --output-on-failure
+cmake --build build/return-maps-tsan --target test_benchmark_routing test_dynamic_gather -j4
+ctest --test-dir build/return-maps-tsan -R '^test_(benchmark_routing|dynamic_gather)$' --output-on-failure
+ctest --test-dir build/exchange-host --output-on-failure
+OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -q
+```
+
 ### Two-node test on Hopper
 
 Start these commands concurrently. The addresses below are the checked-in Hopper profile. If your hosts have different addresses, use node 0's rendezvous address for `MASTER_ADDR` in both shells and the opposite host's proxy address for each `PEER_HOST`.

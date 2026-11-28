@@ -2363,6 +2363,9 @@ void CudaBuffers::ingest_router_notification_completion_locked(
     std::size_t start_token,
     std::size_t num_tokens,
     bool flush_ready_entries_per_entry) {
+    // Copies released before cancellation can still deliver completion records.
+    // Drain those records while preserving the table that released the polling kernel.
+    if (early_up_cancelled_.load(std::memory_order_relaxed) && early_up_iteration_ == iteration) return;
     if (!config_.router_routing_enabled || !config_.nvlink_forwarding_enabled) {
         throw std::runtime_error(
             "expert token heads require combined router/NVLink mode");
@@ -2577,6 +2580,8 @@ void CudaBuffers::schedule_router_notification_completions(uint64_t iteration) {
 }
 
 void CudaBuffers::schedule_router_notification_completions_locked() {
+    // Cancellation may occur between ingesting a complete round and scheduling it.
+    if (early_up_cancelled_.load(std::memory_order_relaxed)) return;
     const auto first_new_row =
         router_computation_scheduler_state_.published_rows;
     const bool flush_per_entry =

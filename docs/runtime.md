@@ -327,7 +327,7 @@ receiver serves this request. On Hopper, eligible multi-buffer runs launch up-GE
 after route installation with a compute-stream wait for the gather reset. The
 worker then prepares down and starts the coordinator. Iteration zero and
 the synchronous installation paths post the request after the iteration-start
-barrier. Peer traffic always follows that barrier. The receiver marks
+barrier. The receiver marks
 `[0, local_x3.size())` of its own staged source ready, builds the gather entries,
 and submits their H2D copies and ready-prefix publication. These operations can
 overlap the first NVLink forwarding batch on its separate CUDA stream. There is
@@ -341,6 +341,21 @@ Normal Head/Tail scheduling builds and publishes the gather rows and ready
 prefix, with the same per-entry or coalesced publication policy. The same
 receiver handles later incoming notifications. Other sources may already have
 arrived and are handled by the same scheduler lock.
+
+With `nvlink_forward_local_staging_prepared_enabled=true`, a refreshed direct
+benchmark route can start same-node staged copies before the RDMA start
+exchange. Each receiver publishes round zero of its local-staging arrival
+after its scheduler reset, own-source request, and any complete-round collector
+request. The producer can build copy descriptors immediately. The submitter
+waits for all eight receiver epochs before issuing the first batch. With batch
+synchronization enabled, that batch uses round one. Receivers with an empty
+gather table participate during ordinary preparation. A receiver that needs
+a larger scatter slab participates after rebinding.
+The global payload start also releases the local worker when synchronous ranks
+are present. The coordinator configures the remote QPs and captures their
+baselines independently. Remote forwarding still uses the current iteration’s
+receive completions. Enable `nvlink_forward_prepared_nvtx_enabled` to see the
+receiver wait as `nvlink_prepared/local_receivers_ready`.
 
 Later local forwarding batches suppress only their redundant own-source
 notifications. Copies to other GPUs, their notifications, local batch barriers,

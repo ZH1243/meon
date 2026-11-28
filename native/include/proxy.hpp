@@ -139,6 +139,7 @@ private:
     void release_rdma_returns();
     DownReadyTrace down_ready_trace_;
     friend struct PreparedForwardingTestAccess;
+    friend struct BenchmarkRoutingTestAccess;
     friend struct ReturnNotificationsTestAccess;
     friend struct QpCalibrationTestAccess;
     friend struct IterationBarrierTestAccess;
@@ -234,6 +235,10 @@ private:
     void initialize_prepared_forwarding();
     void prepare_forwarding_batch(PreparedForwardingBatch& batch, std::size_t peer_index,
                                  uint64_t iteration, std::size_t first_chunk, std::size_t chunks);
+    bool publish_prepared_forwarding_batch(uint64_t iteration, std::size_t peer_index,
+                                          std::size_t first_chunk, std::size_t count, std::size_t& published);
+    void request_benchmark_local_input(uint64_t iteration);
+    bool wait_for_local_staging_receivers(uint64_t iteration);
     void prepared_forwarding_ready_loop();
     void prepared_forwarding_loop();
     void submit_forwarding_loop();
@@ -366,7 +371,7 @@ private:
     bool has_pending_benchmark_transport(uint64_t iteration) const;
     void finish_benchmark_transport(uint64_t iteration);
     void configure_receive_chunks(PeerState& peer, const std::vector<std::size_t>& token_indices);
-    void install_iteration_forwarding_tables();
+    void install_peer_forwarding_tables();
     std::shared_lock<std::shared_mutex> lock_forwarding_routes() const;
     std::shared_lock<std::shared_mutex> lock_installed_combine_route() const;
     void require_installed_combine_route() const;

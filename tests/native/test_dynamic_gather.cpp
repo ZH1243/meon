@@ -97,6 +97,30 @@ static void check_mock_gather(ProxyConfig c) {
     }
 }
 
+static void check_cancelled_staged_completion(ProxyConfig config, bool per_entry) {
+    config.router_pooled_up_gemm_enabled = false;
+    config.nvlink_forward_notification_flush_per_entry_enabled = per_entry;
+    CudaBuffers buffers(config);
+    buffers.initialize();
+    buffers.install_iteration_expert_metadata({table(0, {0, 1}), table(1, {0, 1, 2, 3})}, 0);
+    if (!buffers.prepare_early_up(0, 1)) throw std::runtime_error("expected an armed gather");
+    buffers.begin_router_notification_iteration(0, true);
+    buffers.process_router_notification_completion(0, 0, 0, 0, 2);
+    const auto& pub = buffers.router_notification_publication_buffers();
+    const auto* table_words = static_cast<const int32_t*>(pub.device_table.ptr);
+    const auto* ready = static_cast<const int32_t*>(pub.device_ready_rows.ptr);
+    assert(*ready == 1 && pub.table_rows == 3);
+    // A complete round can be between ingest and schedule when the launch fails.
+    buffers.ingest_router_notification_completion(0, 1, 0, 0, 2);
+    buffers.cancel_early_up(0);
+    std::vector<int32_t> cancelled(table_words, table_words + pub.table_rows * pub.table_width);
+    buffers.schedule_router_notification_completions(0);
+    buffers.process_router_notification_completion(0, 1, 0, 2, 2);
+    assert(*ready == 3 && buffers.router_computation_scheduler_state().published_rows == 1);
+    assert(std::equal(cancelled.begin(), cancelled.end(), table_words));
+    assert(std::equal(cancelled.begin(), cancelled.end(), static_cast<const int32_t*>(pub.host_table.ptr)));
+}
+
 struct TestRecords {
     std::array<int32_t, 4> rows{1, 2, 4, 6};
     std::array<int32_t, 2> full_offsets{0, 4}, shrinking_offsets{0, 0};
@@ -229,6 +253,7 @@ int main(int argc, char** argv) try {
 #endif
     } else {
         check_mock_gather(config);
+        for (bool per_entry : {false, true}) check_cancelled_staged_completion(config, per_entry);
         TestRecords records;
         check_borrowed_upload(config, records);
     }

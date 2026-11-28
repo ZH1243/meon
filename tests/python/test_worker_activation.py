@@ -474,6 +474,16 @@ class ActivationCliTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(reason, result.stderr)
 
+    def test_trace_up_launch_is_a_worker_option(self):
+        result = self.run_cli("--concurrent-kernel", "--trace-up-launch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--trace-up-launch", result.stdout.splitlines()[-1])
+        result = self.run_cli("--trace-up-launch")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--trace-up-launch requires --concurrent-kernel", result.stderr)
+        result = self.run_cli("--trace-up-launch", "--communication-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_up_sm_count_reaches_plain_and_fused_launches(self):
         # CPU-only boundary test: do not import CUDA/QuACK or construct buffers.
         for activation in (None, "relu", "swiglu"):
@@ -497,6 +507,10 @@ class ActivationCliTests(unittest.TestCase):
                     runner.launch()
                     self.assertEqual(len(calls), 1)
                     kwargs = calls[0][1]
+                    self.assertNotIn("plan_observer", kwargs)
+                    observer = [].append
+                    runner.launch(plan_observer=observer)
+                    self.assertIs(calls[-1][1]["plan_observer"], observer)
                     self.assertIs(kwargs.get("sm_count"), count)
                     if activation is not None and count is None:
                         self.assertNotIn("sm_count", kwargs)  # Existing QuACK fused API remains usable.

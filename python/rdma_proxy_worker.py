@@ -564,7 +564,7 @@ class GroupedGemmRunner:
             self.pooled_a_idx = self.pooled_index_storage[:output_rows]
             self.pooled_work_table = self.pooled_table_storage[:table_rows]
 
-    def launch(self, *, pooled: bool | None = None) -> None:
+    def launch(self, *, pooled: bool | None = None, plan_observer=None) -> None:
         if pooled is None:
             pooled = self.x_pool is not None
         if pooled and self.x_pool is None:
@@ -574,8 +574,11 @@ class GroupedGemmRunner:
         table = self.pooled_work_table if pooled else self.work_table
         if self.empty_epoch:
             return
+        gemm = self.quack_gemm_act if self.activation is not None else self.quack_gemm
+        if plan_observer is not None:
+            gemm = partial(gemm, plan_observer=plan_observer)
         if self.activation is not None:
-            self.quack_gemm_act(
+            gemm(
                 x,
                 self.weights,
                 activation=self.activation,
@@ -594,7 +597,7 @@ class GroupedGemmRunner:
                 **({"sm_count": self.sm_count} if self.sm_count is not None else {}),
             )
             return
-        self.quack_gemm(
+        gemm(
             x,
             self.transposed_weights,
             self.output,
@@ -2139,6 +2142,7 @@ def run_proxy_with_concurrent_kernel(
     quack_root: Path,
     down_options: argparse.Namespace,
     up_sm_count: int | None = None,
+    trace_up_launch: bool = False,
 ) -> int:
     """Launch readiness-gated QuACK GroupedGEMM with each proxy iteration."""
 
@@ -2381,7 +2385,7 @@ def run_proxy_with_concurrent_kernel(
 
         def submit_up():
             with torch.cuda.stream(kernel_stream):
-                grouped_gemm.launch()
+                launch_up()
                 if benchmark_metadata is not None and not grouped_gemm.empty_epoch:
                     return time.perf_counter_ns()
             return None
@@ -2417,7 +2421,7 @@ def run_proxy_with_concurrent_kernel(
                 if publication_marks is not None:
                     publication_marks["down_wave_start"] = time.perf_counter_ns()
             if not up_bound:
-                grouped_gemm.bind_routing(*extents)
+                bind_routing(*extents)
             if down is not None:
                 down = DownProjectionRunner(torch, grouped_gemm, counts, down_options,
                                             trace_configure=trace.configure if trace else None,
@@ -2476,6 +2480,20 @@ def run_proxy_with_concurrent_kernel(
                 raise
 
         coordinator = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rdma-proxy-iteration-coordinator")
+        bind_routing = grouped_gemm.bind_routing
+        submit_coordinator = coordinator.submit
+        launch_up = grouped_gemm.launch
+        up_trace = None
+        if trace_up_launch:
+            from up_launch_timing import UpLaunchTiming
+            entry = grouped_gemm.quack_gemm if activation is None else grouped_gemm.quack_gemm_act
+            if "plan_observer" not in inspect.signature(entry).parameters:
+                raise RuntimeError("--trace-up-launch requires a QuACK checkout with plan_observer "
+                                   "support. Select it with --quack-root or QUACK_ROOT.")
+            up_trace = UpLaunchTiming(torch.cuda.nvtx)
+            bind_routing = up_trace.timed("bind_routing", bind_routing)
+            submit_coordinator = up_trace.timed("coordinator_submit", submit_coordinator)
+            launch_up = up_trace.timed("up_call", partial(launch_up, plan_observer=up_trace.mark))
 
         print(
             "concurrent-kernel mode enabled: Python will launch one readiness-gated "
@@ -2503,7 +2521,7 @@ def run_proxy_with_concurrent_kernel(
                         if state == LOCAL_NEEDS_STORAGE:
                             # No publication or polling kernel can consume the undersized slab.
                             with torch.cuda.stream(kernel_stream):
-                                grouped_gemm.bind_routing(*extents)
+                                bind_routing(*extents)
                             bind_publication_storage()
                             state = publication_state(iteration)
                             if state != LOCAL_REQUESTED:
@@ -2520,7 +2538,7 @@ def run_proxy_with_concurrent_kernel(
                         early_up_iteration = iteration
                         if not grew_slab:
                             with torch.cuda.stream(kernel_stream):
-                                grouped_gemm.bind_routing(*extents)
+                                bind_routing(*extents)
                         if down is not None and not native_requested:
                             columns = 2 if down_options.down_n_tile_major_output else 1
                             async_scatter.reserve_addresses(grouped_gemm, columns)
@@ -2531,7 +2549,7 @@ def run_proxy_with_concurrent_kernel(
                                               torch.cuda.current_stream(cuda_device_id), publication_marks,
                                               native_requested)
                             publication_marks["submit"] = time.perf_counter_ns()
-                            payload = coordinator.submit(run_on_coordinator, iteration, None, prepare, prepared)
+                            payload = submit_coordinator(run_on_coordinator, iteration, None, prepare, prepared)
                             del prepare  # The queued callable owns a reference to the previous down runner.
                         # Keep the old runner's allocations through the setup-stream join.
                         previous = down
@@ -2556,7 +2574,7 @@ def run_proxy_with_concurrent_kernel(
             start_barrier = threading.Barrier(2) if early_up_iteration is None else None
             if prepared is None:
                 prepare_proxy(iteration)
-                payload = coordinator.submit(run_on_coordinator, iteration, start_barrier)
+                payload = submit_coordinator(run_on_coordinator, iteration, start_barrier)
             if start_barrier is not None:
                 start_barrier.wait()
             log_startup("proxy released; up GEMM launch begin")
@@ -2658,6 +2676,10 @@ def run_proxy_with_concurrent_kernel(
                     down.finish_iteration()
                 pipeline_ms += (time.perf_counter_ns() - reset_started_ns) / 1e6
             pipeline_timings.append((iteration, pipeline_ms))
+            if up_trace is not None:
+                live_extents = extents if dynamic else (
+                    grouped_gemm.a_idx[0].numel(), grouped_gemm.work_table.shape[0])
+                up_trace.finish_iteration(live_extents)
             if benchmark_metadata is not None:
                 stats = dict(benchmark_metadata.last_stats, early_up_launch=start_barrier is None,
                              concurrent_local_publication=prepared is not None,
@@ -2722,6 +2744,8 @@ def run_proxy_with_concurrent_kernel(
               "checks for performance):", flush=True)
         for iteration, pipeline_ms in pipeline_timings:
             print(f"  pipeline iteration {iteration}: elapsed_ms={pipeline_ms:.4f}", flush=True)
+        if up_trace is not None:
+            up_trace.report(node_rank, local_gpu_index)
         if benchmark_metadata is not None:
             print("Benchmark routing elapsed_us covers route generation through local installation, "
                   "including the pre-exchange rank barrier. exchange_staging_us runs from aligned submit "
@@ -2800,6 +2824,9 @@ def main() -> int:
     parser.add_argument("--benchmark-ready-up-gemm", action="store_true",
                         help="replay the final pooled iteration's ready work through both "
                              "up kernels and compare their outputs and timings")
+    parser.add_argument("--trace-up-launch", action="store_true",
+                        help="record per-iteration host submission and QuACK plan-cache timings "
+                             "and NVTX ranges for up GEMM")
     parser.add_argument(
         "--communication-only",
         action="store_true",
@@ -2874,6 +2901,7 @@ def main() -> int:
         args.concurrent_kernel = False
         args.pooled_up_gemm = False
         args.benchmark_ready_up_gemm = False
+        args.trace_up_launch = False
         args.check_projections = False
         args.weighted_contributions = False
         args.grouped_gemm_activation = "none"
@@ -2888,6 +2916,8 @@ def main() -> int:
             raise ValueError("--pooled-up-gemm requires Hopper SM90")
         if args.benchmark_ready_up_gemm and not args.pooled_up_gemm:
             raise ValueError("--benchmark-ready-up-gemm requires --pooled-up-gemm")
+        if args.trace_up_launch and not args.concurrent_kernel:
+            raise ValueError("--trace-up-launch requires --concurrent-kernel")
         if args.up_sm_count is not None and not args.concurrent_kernel:
             raise ValueError("--up-sm-count requires --concurrent-kernel")
         validate_up_sm_count(args.up_sm_count, args.expert_gemm_cluster_m)
@@ -2963,6 +2993,7 @@ def main() -> int:
             quack_root=args.quack_root,
             down_options=args,
             up_sm_count=args.up_sm_count,
+            trace_up_launch=args.trace_up_launch,
         )
     return run_proxy(
         library,

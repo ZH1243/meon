@@ -656,6 +656,59 @@ ctest --test-dir build/exchange-host --output-on-failure
 OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -q
 ```
 
+#### Profiling up-GEMM submission after H800 report 29
+
+Use the updated meon worker and select the updated QuACK checkout with `QUACK_ROOT` on both hosts. Add `--trace-up-launch` to the report 29 command on each node. The diagnostic uses host timestamps and NVTX on the submission thread. It prints one `up_launch_timing` line per rank and iteration after the run. Iteration zero includes the first up launch. Its initial routing bind takes place during runner construction, outside the measured loop.
+
+Use these arguments on each host, with the node's matching launcher.
+
+```bash
+args=(
+    --num_iterations=5 --num_tokens=20480 --token_dimension=7168
+    --nvlink_forward_prepared_batch_chunks=64
+    --grouped-gemm-m-tile=128 --grouped-gemm-n-tile=256
+    --grouped-gemm-output-dimension=2048 --grouped-gemm-max-swizzle-size=1
+    --down-tile-m=192 --down-tile-n=128 --down-cluster-m=1 --down-max-swizzle-size=2
+    --down-sm-count=124 --intra-node-combine-ctas=8
+    --cpu-scatter-preparation --cpu-scatter-publication=threaded
+    --router_local_input_early_ready_enabled=true --nvlink_forward_notification_scheduling_mode=complete_round
+    --down-output-reset=end-of-iteration --nvlink_return_local_batch_sync_enabled=true
+    --completion_timeout_ms=600000 --return-token-timeout=600 --dynamic-routing --benchmark-metadata-exchange
+    --no-check-return-token-results --no-check-intra-node-combine
+    --no-check-rdma-return-token-results --no-check-inter-node-combine --no-benchmark-metadata-validation
+    --trace-up-launch
+)
+# Node 0
+bash scripts/run_node0_torchrun.sh "${args[@]}"
+# Node 1
+bash scripts/run_node1_torchrun.sh "${args[@]}"
+```
+
+| Host field | Interval |
+| --- | --- |
+| `bind_routing_us` | Binding this iteration's live tensor views. Present when rebinding ran inside the loop. |
+| `coordinator_submit_us` | Entry to return of the main thread's executor submission. The existing `local_publication_timing` line measures work on the coordinator thread. |
+| `up_call_us` | Entry to return of the up runner's launch call on the compute stream. |
+| `pre_key_us`, `plan_lookup_us` | Up call entry to the start of key construction, then key construction through the actual host plan-cache lookup. |
+| `plan_build_us`, `after_plan_us` | On a miss, lookup through insertion of the new plan, including any cold compilation. On a hit, build time is zero. The final span runs from the resolved plan through host return from the launch. |
+
+Group by `node`, `gpu` and `iteration`. Compare `source_index_rows` and `table_rows` with `plan_cache=hit` or `miss`. The four QuACK spans sum to `up_call_us` up to rounding. An empty table reports `plan_cache=empty`. A call that returns before looking up a plan reports `no_lookup`. Both omit the four inner spans.
+
+In Nsight Systems, match `meon/up/bind_routing`, `meon/up/coordinator_submit` and `meon/up/up_call` with the current GPU's local ready-prefix H2D and the CUDA launch inside the up-call range. Across the eight node-0 GPUs and iterations 1–4, report 29 measured a median 415 µs from local publication to CUDA launch entry and 19 µs from entry to kernel start. Use this capture for attribution. Measure a subsequent optimization's iteration time with tracing disabled, and check GPU 0 Tensor Active through the first peer publication.
+
+The Hopper numerical regression exercises a cold lookup, changed live extents, and reuse of the original plan for plain and SwiGLU up-GEMM.
+
+```bash
+(cd "$QUACK_ROOT" && python -m pytest -q tests/test_gemm_gather_table.py -k gather_table_plan_observer)
+```
+
+Host verification on arm64 macOS 15.6.1 used Python 3.9.12, CPU PyTorch 1.13.1 and the Debug mock build. The Python suite ran 130 tests with eight skips, and the three native regressions passed. Both node launchers accepted the capture arguments in worker dry runs. The Hopper numerical regression and two-node timing capture require the target machines.
+
+```bash
+OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 /Users/zhuhao/opt/anaconda3/bin/python3 -m unittest discover -s tests/python -q
+ctest --test-dir build/mock -R '^test_(benchmark_routing|dynamic_gather|c_api)$' --output-on-failure
+```
+
 ### Two-node test on Hopper
 
 Start these commands concurrently. The addresses below are the checked-in Hopper profile. If your hosts have different addresses, use node 0's rendezvous address for `MASTER_ADDR` in both shells and the opposite host's proxy address for each `PEER_HOST`.

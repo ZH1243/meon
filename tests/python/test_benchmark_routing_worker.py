@@ -101,7 +101,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                    tile_major=True, has_reservation_api=True, rows_per_epoch=(1, 0), down_factory=None,
                    native_returns=False, early=False, concurrent_publication=False, native_publication=False,
                    fail_prepare=False, fail_up=False, fail_local=False, inter_combine=False, need_counts=False,
-                   fail_inter_epoch=None, split_api=True):
+                   fail_inter_epoch=None, split_api=True, trace_up_launch=False):
         events, output = [], io.StringIO()
 
         def status(name):
@@ -229,15 +229,28 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
             gemm_dimension = 4
 
             def __init__(self, *args, routing_extents, **kwargs):
+                self.cached_extents = set()
                 self.bind_routing(*routing_extents)
 
             def bind_routing(self, source_rows, rows):
                 self.epoch = getattr(self, "epoch", -1) + 1
                 self.empty_epoch = not rows
+                self.extents = (source_rows, rows)
                 events.append(("bind", rows))
 
-            def launch(self):
+            def quack_gemm(self, *, plan_observer=None):
+                if plan_observer is not None:
+                    plan_observer("key_start")
+                    if self.extents in self.cached_extents:
+                        plan_observer("cache_hit")
+                    else:
+                        plan_observer("cache_miss")
+                        plan_observer("plan_built")
+                self.cached_extents.add(self.extents)
+
+            def launch(self, *, plan_observer=None):
                 if not self.empty_epoch:
+                    self.quack_gemm(plan_observer=plan_observer)
                     events.append(("up",))
                     if native_publication and self.epoch and fail_up:
                         raise RuntimeError("injected up launch failure")
@@ -251,13 +264,22 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                         if fail_up:
                             raise RuntimeError("injected up launch failure")
 
+        @contextlib.contextmanager
+        def nvtx_range(name):
+            test.assertIs(threading.current_thread(), main_thread)
+            events.append(("range-start", name))
+            try:
+                yield
+            finally:
+                events.append(("range-end", name))
+
         stream = SimpleNamespace(cuda_stream=42, synchronize=lambda: events.append(("join-stream",)),
                                  wait_stream=lambda other: events.append(("wait-setup",)))
         torch = SimpleNamespace(cuda=SimpleNamespace(
             get_device_capability=lambda _: (9, 0), Stream=lambda **_: stream,
             Event=lambda **_: SimpleNamespace(record=lambda _: None, synchronize=lambda: None),
             device=lambda _: contextlib.nullcontext(), stream=lambda _: contextlib.nullcontext(), current_stream=lambda _: stream,
-            synchronize=lambda _: events.append(("device-sync",))))
+            synchronize=lambda _: events.append(("device-sync",)), nvtx=SimpleNamespace(range=nvtx_range)))
         options = SimpleNamespace(pooled_up_gemm=False, down_projection2=scatter_publication is not None,
                                   cpu_scatter_preparation=scatter_publication is not None,
                                   cpu_scatter_publication=scatter_publication, down_n_tile_major_output=tile_major,
@@ -344,7 +366,7 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                     library, ["worker"], 0, node_rank=0, local_gpu_index=0, world_size=16, num_experts=128,
                     expert_gemm_dimension=4, activation=None, expert_gemm_m_tile=128, expert_gemm_n_tile=128,
                     expert_gemm_k_tile=None, expert_gemm_cluster_m=2, expert_gemm_max_swizzle_size=1,
-                    quack_root=Path("."), down_options=options)
+                    quack_root=Path("."), down_options=options, trace_up_launch=trace_up_launch)
             else:
                 worker.run_proxy(library, ["worker"], 0, node_rank=0, local_gpu_index=0)
         return events, output.getvalue()
@@ -376,6 +398,40 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
         records = [line for line in result.splitlines() if line.strip().startswith("benchmark_metadata ")]
         self.assertIn("r_ready_to_up_submit_us=", records[0])
         self.assertNotIn("r_ready_to_up_submit_us=", records[1])
+        self.assertNotIn("up_launch_timing", result)
+        self.assertFalse(any(e[0] == "range-start" for e in events))
+
+    def test_trace_up_launch_measures_cache_and_submission_per_epoch(self):
+        rows = (2, 3, 0, 2)
+        schedule = Mock()
+        schedule.start.side_effect = lambda epoch, counts: ("table", counts[0])
+        with patch("down_wave_schedule.DownWaveSchedule.reserve_if_supported", return_value=schedule):
+            events, output = self.run_worker(compute=True, early=True, native_publication=True,
+                                             scatter_publication="threaded", native_returns=True,
+                                             rows_per_epoch=rows, down_factory=self.down_factory,
+                                             trace_up_launch=True)
+        records = [dict(field.split("=") for field in line.split()[1:])
+                   for line in output.splitlines() if line.strip().startswith("up_launch_timing ")]
+        self.assertEqual([r["plan_cache"] for r in records], ["miss", "miss", "empty", "hit"])
+        for epoch, record in enumerate(records):
+            self.assertEqual((record["node"], record["gpu"], record["iteration"],
+                              record["source_index_rows"], record["table_rows"]),
+                             ("0", "0", str(epoch), "1", str(rows[epoch])))
+            self.assertEqual("bind_routing_us" in record, epoch != 0)
+            self.assertGreaterEqual(float(record["coordinator_submit_us"]), 0)
+            if not rows[epoch]:
+                self.assertNotIn("plan_build_us", record)
+                continue
+            phases = [float(record[name + "_us"]) for name in ("pre_key", "plan_lookup", "plan_build", "after_plan")]
+            self.assertTrue(all(span >= 0 for span in phases))
+            self.assertAlmostEqual(sum(phases), float(record["up_call_us"]), delta=0.003)
+        self.assertEqual(records[-1]["plan_build_us"], "0.000")
+        for name, count in (("bind_routing", 3), ("coordinator_submit", 4), ("up_call", 4)):
+            self.assertEqual(events.count(("range-start", f"meon/up/{name}")), count)
+            self.assertEqual(events.count(("range-end", f"meon/up/{name}")), count)
+        begin = events.index(("native-request", 1))
+        self.assertLess(events.index(("range-end", "meon/up/coordinator_submit"), begin),
+                        events.index(("up",), begin))
 
     def down_factory(self, events):
         prepared_options = SimpleNamespace(external_scatter_addresses=True)
@@ -589,11 +645,17 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
             self.assertLess(events.index(("wait-scatter", epoch)), events.index(("down", rows)))
 
     def test_native_up_only_failure_cancels_before_join(self):
-        events, _ = self.run_worker(compute=True, early=True, native_publication=True,
-                                    rows_per_epoch=(1, 2), fail_up=True)
-        self.assertIn(("bind-publication", 0), events)
-        self.assertLess(events.index(("native-request", 1)), events.index(("cancel", 1)))
-        self.assertLess(events.index(("cancel", 1)), events.index(("join-stream",)))
+        for tracing in (False, True):
+            with self.subTest(tracing=tracing):
+                events, _ = self.run_worker(compute=True, early=True, native_publication=True,
+                                            rows_per_epoch=(1, 2), fail_up=True, trace_up_launch=tracing)
+                self.assertIn(("bind-publication", 0), events)
+                requested = events.index(("native-request", 1))
+                cancelled = events.index(("cancel", 1))
+                self.assertLess(requested, cancelled)
+                self.assertLess(cancelled, events.index(("join-stream",)))
+                if tracing:
+                    self.assertLess(events.index(("range-end", "meon/up/up_call"), requested), cancelled)
 
     def test_blocking_cuda_launch_releases_the_coordinator_first(self):
         with patch.dict(os.environ, CUDA_LAUNCH_BLOCKING="1"):

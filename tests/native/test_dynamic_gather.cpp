@@ -108,6 +108,34 @@ static void check_cuda(cudaError_t status) {
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 }
 
+static void check_early_reset_cuda(ProxyConfig config, TestRecords& pinned) {
+    config.router_pooled_up_gemm_enabled = false;
+    CudaBuffers buffers(config);
+    buffers.initialize();
+    const auto release = [](void* stream) { destroy_cuda_stream(stream, false); };
+    std::unique_ptr<void, decltype(release)> consumer(create_cuda_stream(config.cuda_device_id, true, false), release);
+    const auto stream = static_cast<cudaStream_t>(consumer.get());
+    for (unsigned epoch = 0; epoch < 3; ++epoch) {
+        buffers.install_iteration_expert_metadata({table(0, {1, 2}), table(1, {})}, epoch);
+        const auto& pub = buffers.router_notification_publication_buffers();
+        if (epoch) {
+            if (!buffers.prepare_early_up(epoch, reinterpret_cast<uintptr_t>(stream)))
+                throw std::runtime_error("expected early up reset");
+            // The nonblocking consumer's first read is ordered only by the
+            // current reset event. The preceding generation published a positive row.
+            check_cuda(cudaMemcpyAsync(pinned.readback.data(), pub.device_ready_rows.ptr, sizeof(int32_t),
+                                       cudaMemcpyDeviceToHost, stream));
+            check_cuda(cudaStreamSynchronize(stream));
+            if (pinned.readback[0] != 0) throw std::runtime_error("consumer read a stale ready prefix");
+        }
+        buffers.begin_router_notification_iteration(epoch);
+        buffers.process_router_notification_completion(0, 0, epoch, 0, config.num_tokens);
+        buffers.synchronize_router_notification_stream();
+        check_cuda(cudaMemcpy(pinned.readback.data(), pub.device_ready_rows.ptr, sizeof(int32_t), cudaMemcpyDeviceToHost));
+        if (pinned.readback[0] != 1) throw std::runtime_error("missing current gather publication");
+    }
+}
+
 static void check_direct_index_padding_cuda() {
     // Include a long tail (multiple grid strides), an empty list, a full list,
     // and one guard word on either side of every view, as in the IPC arena.
@@ -195,6 +223,7 @@ int main(int argc, char** argv) try {
         // CudaBuffers, including cleanup after a partially completed upload.
         auto* records = new (memory) TestRecords{};
         check_borrowed_upload(config, *records);
+        check_early_reset_cuda(config, *records);
 #else
         return 77;
 #endif

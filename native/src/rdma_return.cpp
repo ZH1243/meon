@@ -246,6 +246,7 @@ void Proxy::finish_rdma_returns() const {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(state.timeout_ms);
     const auto expected = (state.iteration + 1) * state.groups;
     for (;;) {
+        cuda_buffers_.check_early_up_cancelled();
         cuda_buffers_.check_down_metadata_error();
         service_rdma_returns();
         check_forwarding_error();

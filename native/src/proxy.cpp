@@ -841,7 +841,17 @@ void Proxy::run() {
     finish_run();
 }
 
+bool Proxy::prepare_early_up(uint64_t iteration, uintptr_t stream) {
+    if (!initialized_ || routing_failed_ || routing_iteration_ != iteration || iteration_prepared_)
+        throw std::runtime_error("early up launch requires an installed, unprepared route");
+    if (!has_pending_benchmark_transport(iteration) || config_.expert_gemm_device_capacity != 9 ||
+        config_.router_pooled_up_gemm_enabled)
+        return false;
+    return cuda_buffers_.prepare_early_up(iteration, stream);
+}
+
 void Proxy::prepare_iteration_step(uint64_t iteration) {
+    cuda_buffers_.check_early_up_cancelled();
     if (!initialized_) throw std::runtime_error("proxy is not initialized");
     if (config_.num_iterations != 0 && iteration >= config_.num_iterations) {
         throw std::runtime_error("proxy iteration index exceeds configured num_iterations");
@@ -908,6 +918,7 @@ void Proxy::prepare_iteration_step(uint64_t iteration) {
 }
 
 void Proxy::run_iteration_step(uint64_t iteration) {
+    cuda_buffers_.check_early_up_cancelled();
     if (!initialized_) throw std::runtime_error("proxy is not initialized");
     if (config_.num_iterations != 0 && iteration >= config_.num_iterations) {
         throw std::runtime_error("proxy iteration index exceeds configured num_iterations");
@@ -4169,6 +4180,7 @@ void Proxy::wait_for_iteration(
                           std::chrono::milliseconds(config_.rdma_qp_calibration_enabled && !rdma_qp_calibration_complete_ ?
                               calibration_remaining_ms() : config_.completion_timeout_ms);
     while (true) {
+        cuda_buffers_.check_early_up_cancelled();
         service_rdma_returns();
         bool complete = true;
         for (std::size_t q = 0; q < peer.workers.size(); ++q) {
@@ -4223,6 +4235,7 @@ void Proxy::wait_for_outgoing_transfer(
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(config_.completion_timeout_ms);
     while (true) {
+        cuda_buffers_.check_early_up_cancelled();
         service_rdma_returns();
         bool complete = true;
         for (std::size_t q = 0; q < peer.workers.size(); ++q) {

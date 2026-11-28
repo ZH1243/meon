@@ -255,6 +255,9 @@ public:
         int source_gpu_index) const;
     RouterComputationSchedulerState router_computation_scheduler_state() const;
     RouterNotificationSchedulingDiagnostics router_notification_scheduling_diagnostics() const;
+    bool prepare_early_up(uint64_t iteration, uintptr_t stream);
+    void cancel_early_up(uint64_t iteration);
+    void check_early_up_cancelled() const;
     void begin_router_notification_iteration(uint64_t iteration);
     void synchronize_router_notification_stream();
     void synchronize_router_notification_publication();
@@ -362,6 +365,7 @@ private:
     void record_router_computation_start();
     void upload_publication_range(const CpuPinnedBuffer& host, GpuBuffer& device,
                                   std::size_t offset, std::size_t bytes);
+    void write_gather_ready_rows(int32_t rows);
     void flush_router_notification_publication_range(
         std::size_t table_offset,
         std::size_t table_bytes);
@@ -467,6 +471,10 @@ private:
     // until their stream operations complete. Slot i permanently contains i.
     CpuPinnedBuffer router_notification_ready_values_;
     void* router_notification_publication_stream_{nullptr};
+    void* early_up_reset_event_{nullptr};
+    std::optional<uint64_t> early_up_iteration_;
+    std::size_t early_up_visible_rows_{0};
+    std::atomic<bool> early_up_cancelled_{false};
     void* router_computation_start_event_{nullptr};
     void* router_computation_end_event_{nullptr};
     mutable std::mutex router_computation_timing_mutex_;

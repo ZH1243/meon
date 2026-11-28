@@ -323,7 +323,9 @@ On refreshed two-node benchmark routes, the concurrent worker with direct
 device indices posts the local readiness request during iteration preparation,
 after the ready counter has been reset on the GPU. The native coordinator can
 prepare peer receive chunks and forwarding tables while the notification
-receiver serves this request and Python launches up-GEMM. Iteration zero and
+receiver serves this request. On Hopper, eligible multi-buffer runs launch up-GEMM
+after route installation with a compute-stream wait for the gather reset. The
+worker then prepares down and starts the coordinator. Iteration zero and
 the synchronous installation paths post the request after the iteration-start
 barrier. Peer traffic always follows that barrier. The receiver marks
 `[0, local_x3.size())` of its own staged source ready, builds the gather entries,

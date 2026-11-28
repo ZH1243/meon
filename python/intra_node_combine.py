@@ -292,19 +292,21 @@ class IntraNodeCombine:
         print(f"[gpu={self.exchange.down.up.cuda_device_id}] intra-node combine warmup complete",
               flush=True)
 
-    def prepare_iteration(self):
+    def prepare_iteration(self, stream=None):
         """Reset publication before allowing any work for the next iteration.
 
         Caller has joined combine and all consumers from the previous iteration.
-        Returning guarantees zero is visible, including to other CUDA streams.
+        A supplied down stream orders the resets before its mapping_ready event.
+        Otherwise finish the reset here for independently launched readers.
         """
         if self.launched:
             raise RuntimeError("cannot reset intra-node readiness while combine is active")
         if self.ready_groups is not None:
-            with self.torch.cuda.stream(self.control_stream):
+            with self.torch.cuda.stream(self.control_stream if stream is None else stream):
                 self.ready_groups.zero_()
                 self.completion_slots.zero_()
-            self.control_stream.synchronize()
+            if stream is None:
+                self.control_stream.synchronize()
 
     def launch(self):
         # Called on the down stream after mapping/reset and down launch. This

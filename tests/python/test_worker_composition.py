@@ -202,6 +202,11 @@ class CompositionCudaTests(unittest.TestCase):
         self._composition(128, 4, policy="distinct", preparation="threaded",
                           output_reset="end-of-iteration", defer_wave_schedule=True)
 
+    def test_hopper_drains_early_up_with_empty_descriptors(self):
+        if self.arch != 9:
+            self.skipTest("requires Hopper")
+        self._composition(128, 4, cancel_up=True)
+
     def test_hopper_reuses_packed_down_wave_schedule(self):
         if self.arch != 9:
             self.skipTest("requires Hopper")
@@ -210,7 +215,7 @@ class CompositionCudaTests(unittest.TestCase):
 
     def _composition(self, tile_m, sm_count, policy=None, preparation="gpu",
                      publication_default=False, up_sm_counts=None, output_reset="before-down",
-                     pooled=False, defer_wave_schedule=False, external_waves=False):
+                     pooled=False, defer_wave_schedule=False, external_waves=False, cancel_up=False):
         torch = self.torch
         single_upload = preparation in ("deferred", "threaded")
         root = Path(os.environ.get("QUACK_ROOT", PYTHON_DIR.parents[1] / "quack_for_communication_overlap"))
@@ -279,6 +284,25 @@ class CompositionCudaTests(unittest.TestCase):
             tile_m=tile_m, tile_n=tile_n, tile_k=None, cluster_m=cluster_m,
             max_swizzle_size=1, quack_root=root,
             sm_count=None if up_sm_counts is None else up_sm_counts[0])
+        if cancel_up:
+            # Warm with valid rows, then poison the table. A cancelled launch
+            # consumes empty ranges in every descriptor and leaves all output intact.
+            up.launch()
+            up.output.fill_(17)
+            table.fill_(-12345)
+            ready.zero_()
+            consumer, publisher = torch.cuda.Stream(), torch.cuda.Stream()
+            empty_rows = torch.zeros(table.shape, dtype=torch.int32, pin_memory=True)
+            final = torch.tensor([len(rows)], dtype=torch.int32, pin_memory=True)
+            torch.cuda.synchronize()
+            with torch.cuda.stream(consumer):
+                up.launch()
+            with torch.cuda.stream(publisher):
+                table.copy_(empty_rows, non_blocking=True)
+                ready.copy_(final, non_blocking=True)
+            consumer.synchronize()
+            self.assertTrue(torch.all(up.output == 17).item())
+            return
         up.original_reference = original
         up.original_reference_recompute = True
         parser = argparse.ArgumentParser()

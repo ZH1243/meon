@@ -338,6 +338,37 @@ The CPU regression covers empty routes, changing row counts and isolation of QuA
 
 To compare with report 19, rebuild `rdma_cpu_proxy_shared` and update the worker on both Hopper nodes. Add `--router_local_input_early_ready_enabled=true` to both commands in the small two-node numerical run above, with projection and return/combine checks enabled. Then repeat the original timing command and confirm `a_idx_storage=exchange_device`. For iterations 1–4 compare local staging gather end to the first positive ready-row publication, up-GEMM start, and full iteration time. Report 19's median gather-to-up-GEMM interval on Node 0 was 1.56 ms. For an attribution run, enable `--nvlink_forward_prepared_nvtx_enabled=true` and inspect `router/local_input_early_ready` on the notification receiver and `router/prepare_peer_transport` on the coordinator. An expert with too few ready local rows waits for another source.
 
+For comparison with H800 report 20, rebuild the shared library and update the Python
+worker on both nodes. Use the same launch arguments. Confirm `early_up_launch=1`
+in each nonempty steady iteration's `benchmark_metadata` line. This path requires
+Hopper multi-buffer up-GEMM, direct benchmark indices and early local readiness.
+When running down and combine, it also requires deferred QuACK down setup,
+native threaded scatter and wave scheduling, and asynchronous combine maps.
+Empty routes, iteration zero, older libraries and synchronous CUDA launches (`CUDA_LAUNCH_BLOCKING=1`) use the ordinary launch path.
+
+On node 0, match each GPU's local staging graph end to its up-GEMM start and
+first positive ready-prefix publication. Report 20 medians across 32 observations
+(iterations 1–4, eight GPUs) were **1.379 ms** to kernel start and **0.924 ms**
+to first publication. Also compare full iteration time. The timing line measures
+host submission and cannot establish the first useful GPU tile time.
+Before collecting timings, run the same path on both hosts with 1,024 tokens
+and at least three iterations, enable `--check-projections` and retain the
+launcher's return and combine checks.
+
+Host verification used an Apple M1 Max, macOS 15.6.1, CPU PyTorch 1.13.1 and
+Python 3.9.12. The two-node H800 numerical run and performance comparison are
+outstanding. The CUDA reset-event regression runs in
+`test_borrowed_routing_upload_cuda`. The Hopper composition suite exercises
+the empty-range cancellation descriptors with QuACK.
+
+```bash
+cmake -S . -B build/mock -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/mock -j6
+ctest --test-dir build/mock --output-on-failure
+ctest --test-dir build/exchange-host --output-on-failure
+OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -q
+```
+
 Local verification of this change used an Apple M1 Max, macOS 15.6.1 and CPU PyTorch 1.13.1. The Debug native regressions cover a delayed rank, an empty local source, multiple epochs and shutdown after preparation. The two-node Hopper numerical and timing checks above require CUDA, NVLink and RDMA.
 
 ```bash

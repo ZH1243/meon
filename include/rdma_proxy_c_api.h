@@ -361,6 +361,16 @@ RDMA_PROXY_C_API int rdma_proxy_retire_borrowed_benchmark_routing(RdmaProxyHandl
 RDMA_PROXY_C_API int rdma_proxy_get_routing_extents(
     RdmaProxyHandle* handle, uint64_t* indices_per_source, uint64_t* table_rows);
 
+/* On a refreshed, nonempty Hopper multi-buffer route with deferred peer transport,
+ * reset the gather prefix and enqueue a wait on compute_stream. Set armed to 1
+ * on success, or 0 when ordinary prepare_iteration is required. Call once after
+ * install and before scatter configuration/prepare. The embedder must have
+ * retired the previous GPU readers. On failure after arming, cancel before
+ * joining the polling kernel. A cancelled iteration is only valid for teardown. */
+RDMA_PROXY_C_API int rdma_proxy_prepare_early_up(RdmaProxyHandle* handle, uint64_t iteration,
+    uintptr_t compute_stream, int32_t* armed);
+RDMA_PROXY_C_API int rdma_proxy_cancel_early_up(RdmaProxyHandle* handle, uint64_t iteration);
+
 /* Finite-run iteration control for embedding runtimes that own the main loop. */
 RDMA_PROXY_C_API int rdma_proxy_get_num_iterations(
     RdmaProxyHandle* handle,

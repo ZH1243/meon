@@ -306,6 +306,16 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch, bool split_transpor
                 }) - indices.begin();
                 rank.device_indices.at(live)[0] = -11;
                 direct_install(views);
+                const auto& pub = rank.proxy->router_notification_publication_buffers();
+                if (rank.proxy->prepare_early_up(epoch, 1) != split_transport)
+                    throw std::runtime_error("incorrect early up eligibility");
+                if (split_transport) {
+                    if (*static_cast<const int32_t*>(pub.device_ready_rows.ptr) != 0 ||
+                        rank.proxy->router_computation_scheduler_state().iteration_initialized)
+                        throw std::runtime_error("early up must reset the device prefix before scheduler setup");
+                    expect_error([&] { rank.proxy->prepare_early_up(epoch, 1); });
+                    expect_error([&] { rank.proxy->cancel_early_up(epoch - 1); });
+                }
                 if (rank.device_indices[live][0] != -11)
                     throw std::runtime_error("direct A_idx installation overwrote a live device index");
                 rank.device_indices[live][0] = indices[live][0];
@@ -463,7 +473,11 @@ void run_benchmark_iteration(Rank& rank, int gpu, int epoch, bool split_transpor
             throw std::runtime_error("incorrect async return map extents");
     }
     if (split_transport && gpu == 0 && epoch != 0) {
+        const auto& publication = rank.proxy->router_notification_publication_buffers();
+        const auto before = publication.ready_rows_publication_count;
         rank.proxy->prepare_iteration_step(epoch);
+        if (epoch == 1 && publication.ready_rows_publication_count != before)
+            throw std::runtime_error("ordinary preparation repeated the early reset");
         if (epoch == 2) {
             // The coordinator has not entered run_iteration_step: transport
             // preparation is still pending while the owner publishes real rows.
@@ -559,8 +573,62 @@ void check_empty_device_indices(Rank& rank, uint64_t epoch, bool split_transport
     for (const auto* slot : rank.device_indices)
         if (slot[0] != 0 || !std::all_of(slot + 1, slot + tokens*experts_per_gpu, [](int32_t n) { return n == -5; }))
             throw std::runtime_error("empty source lists must expose exactly one zero index");
+    if (rank.proxy->prepare_early_up(epoch, 1)) throw std::runtime_error("empty up route was armed");
     if (split_transport)
         rank.proxy->prepare_iteration_step(epoch);  // Shutdown before peer transport starts.
+}
+
+void check_cancelled_publication(Rank& rank, int gpu, bool publish_local) {
+    constexpr uint64_t epoch = 3;
+    std::array<RdmaProxyBenchmarkSource, nodes*gpus> sources{};
+    for (int s = 0; s < nodes*gpus; ++s) {
+        rank.offsets[s].fill(0);
+        rank.indices[s].clear();
+        if (s == gpu || s == gpus + gpu) {
+            // Distinct experts, so this rank can publish its first complete
+            // batch from its local row while the remote descriptor stays pending.
+            std::fill(rank.offsets[s].begin() + (s == gpu ? 1 : 2), rank.offsets[s].end(), 1);
+            rank.indices[s].push_back(0);
+        }
+        sources[s] = {rank.offsets[s].data(), rank.indices[s].data(), rank.indices[s].size()};
+    }
+    rank.source_offsets = {0, 1, 1};
+    rank.source_x3[0] = 0;
+    rank.source_x4[0] = 1;
+    rank.source_r.fill(0);
+    int32_t remote_row = 0;
+    uint8_t remote_mask = 1;
+    RdmaProxyBenchmarkRouting route{sizeof(route), nodes*gpus, sources.data(), &remote_row, &remote_mask, 1};
+    RdmaProxyBenchmarkHostRoute host{sizeof(host), nodes+1, 1, rank.source_r.size(),
+        rank.source_offsets.data(), rank.source_x3.data(), rank.source_x4.data(), rank.source_r.data()};
+    auto slots = rank.index_addresses();
+    RdmaProxyBenchmarkDeviceIndices views{sizeof(views), nodes*gpus, tokens*experts_per_gpu, slots.data()};
+    rank.proxy->install_borrowed_benchmark_route_views(epoch, route, host, &views, true);
+    if (!rank.proxy->prepare_early_up(epoch, 1)) throw std::runtime_error("expected early up launch");
+    const auto& pub = rank.proxy->router_notification_publication_buffers();
+    auto* table = static_cast<int32_t*>(pub.device_table.ptr);
+    const auto words = pub.table_width * pub.table_rows;
+    std::fill_n(table, words, -9);
+    if (publish_local) {
+        rank.proxy->prepare_iteration_step(epoch);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!rank.proxy->router_computation_scheduler_state().published_rows) {
+            if (std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("missing local publication");
+            std::this_thread::yield();
+        }
+    }
+    const auto ready = *static_cast<const int32_t*>(pub.device_ready_rows.ptr);
+    if (ready < 0 || static_cast<std::size_t>(ready) >= pub.table_rows || (ready != 0) != publish_local)
+        throw std::runtime_error("incorrect prefix before cancellation");
+    const std::vector<int32_t> prefix(table, table + ready*pub.table_width);
+    rank.proxy->cancel_early_up(epoch);
+    rank.proxy->cancel_early_up(epoch);
+    expect_error([&] { rank.proxy->prepare_iteration_step(epoch); });
+    expect_error([&] { rank.proxy->run_iteration_step(epoch); });
+    if (static_cast<std::size_t>(*static_cast<const int32_t*>(pub.device_ready_rows.ptr)) != pub.table_rows ||
+        !std::equal(prefix.begin(), prefix.end(), table) ||
+        !std::all_of(table + prefix.size(), table + words, [](auto v) { return v == 0; }))
+        throw std::runtime_error("failed to release only the unpublished suffix");
 }
 
 void run(bool prepared, bool validate, bool split_transport) {
@@ -669,6 +737,7 @@ void run(bool prepared, bool validate, bool split_transport) {
                 if (epoch == 2 && gpu == 0) continue;
                 expect_error([&] { rank.proxy->retire_borrowed_benchmark_routing(epoch - 1); });
                 rank.proxy->retire_borrowed_benchmark_routing(epoch);
+                expect_error([&] { rank.proxy->cancel_early_up(epoch); });
                 expect_error([&] { rank.proxy->retire_borrowed_benchmark_routing(epoch); });
                 expect_error([&] { (void)rank.proxy->router_expert_metadata_for_source(0, 0); });
                 rank.poison_expert_records();
@@ -690,6 +759,10 @@ void run(bool prepared, bool validate, bool split_transport) {
     check_final_borrowed_install(ranks[1], 3, {tokens}, false, validate ? "invalid token index" : nullptr);
     check_final_borrowed_install(ranks[2], 3, {0}, true, "device index slot disagrees");
     check_empty_device_indices(ranks[3], 3, split_transport);
+    if (split_transport) {
+        check_cancelled_publication(ranks[5], 5, false);
+        check_cancelled_publication(ranks[6], 6, true);
+    }
     check_final_borrowed_install(ranks[4], 3, {1, 0}, false, validate ? "not monotonic" : nullptr);
     on_all_gpus([&](int gpu) { ranks[gpu].proxy->shutdown(); });
     expect_error([&] { (void)ranks[0].proxy->router_expert_metadata_for_source(0, 0); });

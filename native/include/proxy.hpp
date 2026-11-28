@@ -49,6 +49,8 @@ public:
     void retire_borrowed_benchmark_routing(uint64_t iteration);
     void run();
     void run_once();
+    bool prepare_early_up(uint64_t iteration, uintptr_t stream);
+    void cancel_early_up(uint64_t iteration) { cuda_buffers_.cancel_early_up(iteration); }
     void prepare_iteration_step(uint64_t iteration);
     void run_iteration_step(uint64_t iteration);
     void record_router_computation_end(uint64_t iteration, uintptr_t cuda_stream);

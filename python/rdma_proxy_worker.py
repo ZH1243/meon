@@ -884,12 +884,13 @@ def compact_combine_mapping(torch, mapping, num_sources, capacity):
     return compact, used.sum(dim=1), output_to_input
 
 
-def allocate_cpu_scatter_metadata_storage(torch, address_shape, device, weighted):
+def allocate_cpu_scatter_metadata_storage(torch, address_shape, device, weighted, storage=None):
     """Allocate the address and optional weight views for a single native upload."""
     scatter_bytes = math.prod(address_shape) * 8  # int64 addresses
     weight_offset = (scatter_bytes + 15) // 16 * 16
     total_bytes = weight_offset + address_shape[0] * 4 if weighted else scatter_bytes
-    storage = torch.empty(total_bytes, dtype=torch.uint8, device=device)
+    storage = (torch.empty(total_bytes, dtype=torch.uint8, device=device) if storage is None
+               else storage.narrow(0, 0, total_bytes))
     addresses = storage[:scatter_bytes].view(torch.int64).reshape(address_shape)
     weights = storage[weight_offset:].view(torch.float32) if weighted else None
     return storage, addresses, weights
@@ -958,6 +959,17 @@ class CpuScatterConfig(ctypes.Structure):
 
 class AsyncScatterLookup:
     """Stable host destinations written by the native scatter thread on refreshed routes."""
+
+    address_storage = None
+
+    def reserve_addresses(self, up, columns):
+        # cudaMalloc on cache growth can join a polling up kernel. Reserve before launch.
+        size = up.output_storage.shape[0] * columns * 8
+        if self.address_storage is None or self.address_storage.numel() < size:
+            self.address_storage = up.torch.empty(size, dtype=up.torch.uint8, device=up.output.device)
+            # Native H2D uses a different stream. Finish a stream-ordered
+            # allocation on growth, before a polling kernel can be resident.
+            up.torch.cuda.current_stream(up.cuda_device_id).synchronize()
 
     @classmethod
     def reserve_if_supported(cls, library, down, options, exchange):
@@ -1105,7 +1117,8 @@ class DownProjectionRunner:
                 # The native publisher fills every live row before down's event wait.
                 address_shape = (routes, 2) if args.n_tile_major_output else (routes,)
                 self.cpu_scatter_metadata, addresses, self.route_weights = allocate_cpu_scatter_metadata_storage(
-                    torch, address_shape, up.output.device, weighted)
+                    torch, address_shape, up.output.device, weighted,
+                    storage=getattr(async_scatter, "address_storage", None))
                 external["scatter_row_addresses"] = addresses
             elif routes:
                 external["scatter_mapping"] = torch.zeros((routes, 2), dtype=torch.int64, device=up.output.device)
@@ -2013,7 +2026,7 @@ def print_benchmark_routing(node, gpu, iteration, elapsed_ns, stats, up_submitte
           f"reuse_barrier_us={stats['reuse_barrier_ns'] / 1000:.3f} "
           f"release_barrier_us={stats['release_barrier_ns'] / 1000:.3f}{submit} "
           f"source_route={stats['source_route']} source_route_storage={stats['source_route_storage']} "
-          f"a_idx_storage={stats['a_idx_storage']}",
+          f"a_idx_storage={stats['a_idx_storage']} early_up_launch={int(stats.get('early_up_launch', False))}",
           flush=True)
 
 
@@ -2090,6 +2103,7 @@ def run_proxy_with_concurrent_kernel(
     down_schedule = None
     async_scatter = None
     return_maps = None
+    early_up_iteration = None
     try:
         device_buffers = install_python_device_buffers(
             library,
@@ -2230,6 +2244,33 @@ def run_proxy_with_concurrent_kernel(
         down_traces = []
         kernel_finished = torch.cuda.Event(enable_timing=False, blocking=False)
 
+        prepare_early = getattr(library, "rdma_proxy_prepare_early_up", None)
+        cancel_early = getattr(library, "rdma_proxy_cancel_early_up", None)
+        # The deferred down path only binds views and starts CPU jobs before
+        # gather publication. Older/eager runners can allocate or wait on CUDA.
+        can_launch_early = (
+            prepare_early is not None and cancel_early is not None and benchmark_metadata is not None
+            and capacity == 9 and not down_options.pooled_up_gemm
+            and os.environ.get("CUDA_LAUNCH_BLOCKING") != "1"
+            and (down is None or (down_schedule is not None and async_scatter is not None
+                                  and down.kernel_options.external_scatter_addresses
+                                  and (down.intra_node_combine is None or return_maps is not None))))
+        if can_launch_early:
+            prepare_early.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t,
+                                      ctypes.POINTER(ctypes.c_int32)]
+            cancel_early.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+            prepare_early.restype = cancel_early.restype = ctypes.c_int
+
+        def cancel_polling_up(iteration):
+            require_proxy_success(library, cancel_early(handle, iteration), "draining early up GEMM")
+
+        def submit_up():
+            with torch.cuda.stream(kernel_stream):
+                grouped_gemm.launch()
+                if benchmark_metadata is not None and not grouped_gemm.empty_epoch:
+                    return time.perf_counter_ns()
+            return None
+
         def proxy_iteration_coordinator() -> None:
             while True:
                 command = commands.get()
@@ -2237,11 +2278,14 @@ def run_proxy_with_concurrent_kernel(
                     return
                 iteration, start_barrier = command
                 try:
-                    # The Python main thread waits on the same barrier immediately
-                    # before enqueueing its CUDA kernel.
-                    start_barrier.wait()
+                    # The ordinary path rendezvous precedes launch. An early up
+                    # is already submitted and only needs the payload to progress.
+                    if start_barrier is not None:
+                        start_barrier.wait()
                     status = library.rdma_proxy_run_iteration(handle, iteration)
                     error = None if status == 0 else proxy_last_error(library)
+                    if status != 0 and start_barrier is None:
+                        cancel_polling_up(iteration)
                     results.put((status, error))
                 except BaseException as error:
                     results.put((-1, f"proxy coordinator failed: {error}"))
@@ -2263,12 +2307,26 @@ def run_proxy_with_concurrent_kernel(
             pipeline_started_ns = time.perf_counter_ns()
             reference_setup_ns = 0
             wave_views = None
+            up_submitted_ns = None
             if dynamic and iteration:
                 # All GPU and peer readers of the previous generation have retired.
                 # Finish Python's optional checks before the native thread reuses A_idx.
                 torch.cuda.synchronize(cuda_device_id)
                 extents, elapsed = prepare_epoch(iteration)
                 routing_times_ns.append(elapsed)
+                if can_launch_early and extents[1]:
+                    armed = ctypes.c_int32()
+                    require_proxy_success(library, prepare_early(handle, iteration, int(kernel_stream.cuda_stream),
+                                                                  ctypes.byref(armed)), "ordering early up GEMM")
+                    if armed.value:
+                        early_up_iteration = iteration
+                        # A growing output may be allocated with cudaMallocAsync.
+                        with torch.cuda.stream(kernel_stream):
+                            grouped_gemm.bind_routing(*extents)
+                        if down is not None:
+                            columns = 2 if down_options.down_n_tile_major_output else 1
+                            async_scatter.reserve_addresses(grouped_gemm, columns)
+                        up_submitted_ns = submit_up()
                 if return_maps is not None:
                     # Remote contributions can require both maps even when this
                     # computing rank has no expert work this epoch.
@@ -2277,7 +2335,8 @@ def run_proxy_with_concurrent_kernel(
                 computation_tokens.value = sum(counts)
                 if down_schedule is not None and computation_tokens.value:
                     wave_views = down_schedule.start(iteration, counts)
-                grouped_gemm.bind_routing(*extents)
+                if early_up_iteration is None:
+                    grouped_gemm.bind_routing(*extents)
                 if down is not None:
                     previous = down
                     down = DownProjectionRunner(torch, grouped_gemm, counts, down_options,
@@ -2297,15 +2356,17 @@ def run_proxy_with_concurrent_kernel(
                             configure_original_reference(grouped_gemm, down, library, handle, return_exchange,
                                                          num_experts=num_experts, iteration=iteration)
                             reference_setup_ns = time.perf_counter_ns() - reference_begin
-                    del previous
+                    if early_up_iteration is None:
+                        del previous
                 # Finish any local torch setup. Async metadata publication is gated by final gather.
-                torch.cuda.synchronize(cuda_device_id)
+                if early_up_iteration is None:
+                    torch.cuda.synchronize(cuda_device_id)
 
             def log_startup(message):
                 if iteration == 0 and down is not None and down.combine:
                     print(f"[gpu={cuda_device_id}] iteration=0: {message}", flush=True)
 
-            if down is not None and down.intra_node_combine is not None:
+            if early_up_iteration is None and down is not None and down.intra_node_combine is not None:
                 down.intra_node_combine.prepare_iteration()
             log_startup("proxy preparation begin")
             require_proxy_success(
@@ -2313,18 +2374,16 @@ def run_proxy_with_concurrent_kernel(
                 library.rdma_proxy_prepare_iteration(handle, iteration),
                 f"preparing proxy iteration {iteration}",
             )
-            start_barrier = threading.Barrier(2)
+            start_barrier = threading.Barrier(2) if early_up_iteration is None else None
             commands.put((iteration, start_barrier))
-            start_barrier.wait()
+            if start_barrier is not None:
+                start_barrier.wait()
             log_startup("proxy released; up GEMM launch begin")
 
             kernel_error: BaseException | None = None
-            up_submitted_ns = None
             try:
-                with torch.cuda.stream(kernel_stream):
-                    grouped_gemm.launch()
-                    if benchmark_metadata is not None and not grouped_gemm.empty_epoch:
-                        up_submitted_ns = time.perf_counter_ns()
+                if early_up_iteration is None:
+                    up_submitted_ns = submit_up()
                 log_startup("up GEMM launch returned")
                 require_proxy_success(
                     library,
@@ -2335,7 +2394,13 @@ def run_proxy_with_concurrent_kernel(
                     ),
                     f"recording GroupedGEMM end for iteration {iteration}",
                 )
+                if early_up_iteration is not None and down is not None:
+                    # Join setup only for down and compute-stream teardown.
+                    kernel_stream.wait_stream(torch.cuda.current_stream(cuda_device_id))
+                    del previous
                 with torch.cuda.stream(kernel_stream):
+                    if early_up_iteration is not None and down is not None and down.intra_node_combine is not None:
+                        down.intra_node_combine.prepare_iteration(stream=kernel_stream)
                     async_returns = iteration != 0 and return_maps is not None
                     if down is not None:
                         needs_metadata_wait = (down.cpu_scatter and
@@ -2352,6 +2417,8 @@ def run_proxy_with_concurrent_kernel(
                     kernel_finished.record(kernel_stream)
             except BaseException as error:
                 kernel_error = error
+                if early_up_iteration is not None:
+                    cancel_polling_up(iteration)
                 # Report before waiting for proxy progress, which may be stalled.
                 print(f"concurrent CUDA launch failed at iteration {iteration}: {error}",
                       file=sys.stderr, flush=True)
@@ -2368,6 +2435,7 @@ def run_proxy_with_concurrent_kernel(
                     f"proxy iteration {iteration} failed: {proxy_error}"
                 )
             kernel_finished.synchronize()
+            early_up_iteration = None
             log_startup("GPU iteration complete")
             if trace is not None:
                 down_traces.append((iteration, trace.read(iteration)))
@@ -2403,7 +2471,8 @@ def run_proxy_with_concurrent_kernel(
                 pipeline_ms += (time.perf_counter_ns() - reset_started_ns) / 1e6
             pipeline_timings.append((iteration, pipeline_ms))
             if benchmark_metadata is not None:
-                benchmark_timings.append((benchmark_metadata.last_stats.copy(), up_submitted_ns))
+                stats = dict(benchmark_metadata.last_stats, early_up_launch=start_barrier is None)
+                benchmark_timings.append((stats, up_submitted_ns))
             elapsed_ms = ctypes.c_float()
             require_proxy_success(
                 library,
@@ -2500,6 +2569,8 @@ def run_proxy_with_concurrent_kernel(
         success = True
         return 0
     finally:
+        if early_up_iteration is not None:
+            cancel_polling_up(early_up_iteration)
         if down is not None and down.intra_node_combine is not None:
             down.intra_node_combine.abort()
         # Keep borrowed inputs, scatter destinations, and any mapped host flag

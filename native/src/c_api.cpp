@@ -692,6 +692,30 @@ extern "C" int rdma_proxy_run_iteration(
     }
 }
 
+extern "C" int rdma_proxy_prepare_early_up(RdmaProxyHandle* handle, uint64_t iteration,
+                                             uintptr_t stream, int32_t* armed) {
+    clear_error();
+    try {
+        if (!handle || !armed || !stream || !handle->initialized || handle->shut_down ||
+            handle->finished || iteration != handle->next_iteration)
+            throw std::runtime_error("early up launch requires the current iteration and a compute stream");
+        select_proxy_cuda_device(*handle);
+        *armed = handle->proxy.prepare_early_up(iteration, stream);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
+extern "C" int rdma_proxy_cancel_early_up(RdmaProxyHandle* handle, uint64_t iteration) {
+    clear_error();
+    try {
+        if (!handle || !handle->initialized || handle->shut_down)
+            throw std::runtime_error("early up cancellation requires an initialized proxy");
+        select_proxy_cuda_device(*handle);
+        handle->proxy.cancel_early_up(iteration);
+        return 0;
+    } catch (...) { return record_current_exception(); }
+}
+
 extern "C" int rdma_proxy_prepare_iteration(
     RdmaProxyHandle* handle,
     uint64_t iteration) {

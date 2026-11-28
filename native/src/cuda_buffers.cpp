@@ -199,6 +199,7 @@ CudaBuffers::~CudaBuffers() {
 #endif
     if (!config_.mock_mode) {
 #if RDMA_PROXY_HAVE_CUDA
+        if (early_up_reset_event_) cudaEventDestroy(reinterpret_cast<cudaEvent_t>(early_up_reset_event_));
         if (router_computation_start_event_) {
             const auto status = cudaEventDestroy(reinterpret_cast<cudaEvent_t>(
                 router_computation_start_event_));
@@ -769,6 +770,8 @@ void CudaBuffers::install_iteration_expert_metadata(
 
     std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
     if (metadata_generations_installed_ && config_.nvlink_forward_completion_notifications_enabled) {
+        check_early_up_cancelled();
+        early_up_iteration_.reset();
         quiesce_down_wave_worker();
         if (cpu_scatter_threaded_) quiesce_cpu_scatter_worker();
         if (cpu_scatter_threaded_ || down_wave_.device)
@@ -795,6 +798,7 @@ void CudaBuffers::retire_borrowed_expert_metadata() {
     // A failed installation can leave index copies or the tail-clear kernel in
     // flight. Fence those writes before the exchange can recycle its slots.
     finish_borrowed_index_writes();
+    early_up_iteration_.reset();
     for (auto& buffer : nvlink_recv_buffers_) {
         if (buffer.expert_metadata.has_borrowed_expert_lists()) {
             buffer.expert_metadata_ready = false;
@@ -1984,6 +1988,7 @@ void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) 
     if (!scheduler.initialized) {
         throw std::runtime_error("router computation scheduler is not initialized");
     }
+    check_early_up_cancelled();
     if (cpu_scatter_device_ && config_.router_weighted_contributions_enabled &&
         !cpu_route_weights_device_)
         throw std::runtime_error("weighted CPU scatter requires packed route-weight storage");
@@ -2062,7 +2067,69 @@ void CudaBuffers::reset_router_computation_iteration_locked(uint64_t iteration) 
     // still have a start event, and the proxy must continue servicing peers.
     if (config_.router_dynamic_routing_enabled && publication.table_rows == 0)
         record_router_computation_start();
-    flush_router_notification_publication_range(0, 0);
+    if (early_up_iteration_ != iteration)
+        flush_router_notification_publication_range(0, 0);
+}
+
+bool CudaBuffers::prepare_early_up(uint64_t iteration, uintptr_t compute_stream) {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    auto& publication = router_notification_publication_buffers_;
+    if (early_up_iteration_ || !compute_stream || router_computation_scheduler_state_.iteration_initialized ||
+        iteration + 1 != metadata_generations_installed_)
+        throw std::runtime_error("invalid or repeated early up reset");
+    if (!publication.table_rows) return false;
+    // Installation joined the previous publication stream. No current
+    // descriptor may be submitted until ordinary iteration preparation.
+    *static_cast<int32_t*>(publication.host_ready_rows.ptr) = 0;
+    write_gather_ready_rows(0);
+#if RDMA_PROXY_HAVE_CUDA
+    if (!config_.mock_mode) {
+        if (!early_up_reset_event_) {
+            cudaEvent_t event{};
+            check_cuda(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "create early up reset event");
+            early_up_reset_event_ = event;
+        }
+        const auto event = reinterpret_cast<cudaEvent_t>(early_up_reset_event_);
+        check_cuda(cudaEventRecord(event, reinterpret_cast<cudaStream_t>(router_notification_publication_stream_)),
+                   "record early up reset");
+        check_cuda(cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(compute_stream), event, 0),
+                   "order up launch after gather reset");
+    }
+#endif
+    early_up_iteration_ = iteration;
+    early_up_visible_rows_ = 0;
+    ++publication.ready_rows_publication_count;
+    return true;
+}
+
+void CudaBuffers::check_early_up_cancelled() const {
+    if (early_up_cancelled_.load(std::memory_order_relaxed))
+        throw std::runtime_error("early up launch cancelled");
+}
+
+void CudaBuffers::cancel_early_up(uint64_t iteration) {
+    std::lock_guard<std::mutex> lock(expert_token_heads_mutex_);
+    if (early_up_iteration_ != iteration) throw std::runtime_error("no matching early up launch to cancel");
+    early_up_cancelled_ = true;  // Exclude further descriptor submissions, including a delayed local notification.
+    auto& p = router_notification_publication_buffers_;
+    if (cpu_scatter_threaded_) {
+        std::lock_guard<std::mutex> worker_lock(cpu_scatter_worker_mutex_);
+        cpu_scatter_worker_cancelled_ = true;
+        cpu_scatter_worker_ready_cv_.notify_all();
+    }
+    if (early_up_visible_rows_ == p.table_rows) return;
+    // A failed submission may have copied descriptors before failing to
+    // publish their prefix. Drain that DMA before touching its pinned source.
+    synchronize_cuda_stream(router_notification_publication_stream_, config_.mock_mode);
+    const auto offset = early_up_visible_rows_ * p.table_row_bytes;
+    const auto bytes = (p.table_rows - early_up_visible_rows_) * p.table_row_bytes;
+    // A valid Hopper multi-buffer row with expert zero and empty ranges
+    // reads no payload and has zero output rows. Keep all visible rows intact.
+    std::memset(static_cast<uint8_t*>(p.host_table.ptr) + offset, 0, bytes);
+    upload_publication_range(p.host_table, p.device_table, offset, bytes);
+    write_gather_ready_rows(static_cast<int32_t>(p.table_rows));
+    synchronize_cuda_stream(router_notification_publication_stream_, config_.mock_mode);
+    early_up_visible_rows_ = p.table_rows;
 }
 
 void CudaBuffers::begin_router_notification_iteration(uint64_t iteration) {
@@ -2616,7 +2683,24 @@ void CudaBuffers::flush_router_notification_publication_range(
         throw std::runtime_error(
             "QuACK ready-row publication value is outside the table range");
     }
-    const void* ready_rows_memcpy_source = publication.host_ready_rows.ptr;
+    check_early_up_cancelled();
+    if (table_bytes != 0) {
+        if (!config_.router_pooled_up_gemm_enabled) record_router_computation_start();
+        upload_publication_range(publication.host_table, publication.device_table,
+                                 table_offset, table_bytes);
+    }
+    write_gather_ready_rows(ready_rows);
+    if (early_up_iteration_) early_up_visible_rows_ = ready_rows;
+    if (table_bytes != 0) ++publication.table_flush_count;
+    ++publication.ready_rows_publication_count;
+    if (static_cast<std::size_t>(ready_rows) == publication.table_rows)
+        commit_final_gather_locked();
+    publish_deferred_cpu_scatter_locked();
+}
+
+void CudaBuffers::write_gather_ready_rows(int32_t ready_rows) {
+    auto& publication = router_notification_publication_buffers_;
+    const void* ready_rows_memcpy_source = &ready_rows;  // Host-backed mock; CUDA copies use pinned slots below.
     if (config_.nvlink_forward_notification_flag_update_mode ==
         NvlinkForwardNotificationFlagUpdateMode::kMemcpy) {
         const auto required_ready_value_bytes =
@@ -2632,11 +2716,6 @@ void CudaBuffers::flush_router_notification_publication_range(
                 router_notification_ready_values_.ptr) + ready_rows;
     }
 
-    if (table_bytes != 0) {
-        if (!config_.router_pooled_up_gemm_enabled) record_router_computation_start();
-        upload_publication_range(publication.host_table, publication.device_table,
-                                 table_offset, table_bytes);
-    }
     if (config_.mock_mode) {
         std::memcpy(
             publication.device_ready_rows.ptr,
@@ -2672,11 +2751,6 @@ void CudaBuffers::flush_router_notification_publication_range(
             "CUDA router notification publication requested but CUDA support was not built");
 #endif
     }
-    if (table_bytes != 0) ++publication.table_flush_count;
-    ++publication.ready_rows_publication_count;
-    if (static_cast<std::size_t>(ready_rows) == publication.table_rows)
-        commit_final_gather_locked();
-    publish_deferred_cpu_scatter_locked();
 }
 
 std::size_t CudaBuffers::token_buffer_bytes() const {

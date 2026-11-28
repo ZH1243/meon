@@ -353,6 +353,17 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                                                 native_returns=native_returns, early=early,
                                                 concurrent_publication=concurrent)
                 self.assertEqual(output.count("concurrent_local_publication=1"), 2 if concurrent else 0)
+                records = [dict(field.split("=") for field in line.split()[1:])
+                           for line in output.splitlines() if line.strip().startswith("local_publication_timing ")]
+                self.assertEqual([int(record["iteration"]) for record in records], [1, 3] if concurrent else [])
+                for record in records:
+                    phases = [float(record[name + "_us"]) for name in (
+                        "handoff", "setup_context", "expert_counts", "down_wave_start", "down_runner", "scatter_register")]
+                    self.assertTrue(all(value >= 0 for value in phases))
+                    # The individually rounded intervals cover submission through scatter registration.
+                    self.assertLessEqual(sum(phases), float(record["submit_to_request_us"]) + 0.004)
+                    self.assertGreaterEqual(float(record["request_call_us"]), 0)
+                    self.assertGreaterEqual(float(record["r_ready_to_submit_us"]), 0)
                 reserve.assert_called_once()
                 for epoch, rows in enumerate(rows_per_epoch):
                     start = events.index(("install", epoch))
@@ -434,6 +445,14 @@ class BenchmarkRoutingWorkerTests(unittest.TestCase):
                 if failure == "fail_prepare":
                     self.assertNotIn(("payload", 1), events)
                 self.assertIn(("close", False), events)
+
+    def test_up_only_publication_reports_only_executed_phases(self):
+        _, output = self.run_worker(compute=True, early=True, concurrent_publication=True, rows_per_epoch=(1, 2))
+        record, = [line for line in output.splitlines() if "local_publication_timing " in line]
+        self.assertIn("iteration=1 ", record)
+        self.assertIn("expert_counts_us=", record)
+        for name in ("down_wave_start_us", "down_runner_us", "scatter_register_us"):
+            self.assertNotIn(name, record)
 
     def test_publication_failure_releases_in_flight_submit(self):
         events, _ = self.run_worker(compute=True, early=True, rows_per_epoch=(1, 2),

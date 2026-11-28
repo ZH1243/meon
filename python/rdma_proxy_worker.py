@@ -2029,6 +2029,21 @@ def print_benchmark_routing(node, gpu, iteration, elapsed_ns, stats, up_submitte
           f"a_idx_storage={stats['a_idx_storage']} early_up_launch={int(stats.get('early_up_launch', False))} "
           f"concurrent_local_publication={int(stats.get('concurrent_local_publication', False))}",
           flush=True)
+    marks = stats.get("local_publication_marks")
+    if marks is not None:
+        submitted = previous = marks["submit"]
+        fields = []
+        for phase in ("handoff", "setup_context", "expert_counts", "down_wave_start",
+                      "down_runner", "scatter_register"):
+            if phase in marks:
+                fields.append(f"{phase}_us={(marks[phase] - previous) / 1000:.3f}")
+                previous = marks[phase]
+        print(f"  local_publication_timing node={node} gpu={gpu} iteration={iteration} "
+              f"r_ready_to_submit_us={(submitted - stats['r_ready_ns']) / 1000:.3f} "
+              f"{' '.join(fields)} "
+              f"submit_to_request_us={(marks['request_begin'] - submitted) / 1000:.3f} "
+              f"request_call_us={(marks['request_end'] - marks['request_begin']) / 1000:.3f}",
+              flush=True)
 
 
 def prepare_routing(library, handle, iteration):
@@ -2275,18 +2290,22 @@ def run_proxy_with_concurrent_kernel(
                     return time.perf_counter_ns()
             return None
 
-        def refresh_runner(iteration, extents, previous, *, up_bound, publish_local):
+        def refresh_runner(iteration, extents, previous, *, up_bound, publication_marks=None):
             down = previous
             wave_views = None
             reference_setup_ns = 0
-            if return_maps is not None and not publish_local:
+            if return_maps is not None and publication_marks is None:
                 # Remote contributions can require both maps even when this
                 # computing rank has no expert work this epoch.
                 return_maps.start(iteration)
             counts = get_expert_counts(library, handle)
             computation_tokens.value = sum(counts)
+            if publication_marks is not None:
+                publication_marks["expert_counts"] = time.perf_counter_ns()
             if down_schedule is not None and computation_tokens.value:
                 wave_views = down_schedule.start(iteration, counts)
+                if publication_marks is not None:
+                    publication_marks["down_wave_start"] = time.perf_counter_ns()
             if not up_bound:
                 grouped_gemm.bind_routing(*extents)
             if down is not None:
@@ -2295,10 +2314,17 @@ def run_proxy_with_concurrent_kernel(
                                             previous=previous, defer_wave_schedule=True,
                                             external_wave_schedule=wave_views, async_scatter=async_scatter,
                                             kernel_options=previous.kernel_options)
+                if publication_marks is not None:
+                    publication_marks["down_runner"] = time.perf_counter_ns()
                 if down.cpu_scatter:
                     down.configure_cpu_scatter(library, handle)
-            if publish_local:
-                require_proxy_success(library, prepare_local(handle, iteration), "requesting local gather publication")
+                    if publication_marks is not None:
+                        publication_marks["scatter_register"] = time.perf_counter_ns()
+            if publication_marks is not None:
+                publication_marks["request_begin"] = time.perf_counter_ns()
+                status = prepare_local(handle, iteration)
+                publication_marks["request_end"] = time.perf_counter_ns()
+                require_proxy_success(library, status, "requesting local gather publication")
                 if return_maps is not None:
                     return_maps.start(iteration)
             if down is not None:
@@ -2318,10 +2344,13 @@ def run_proxy_with_concurrent_kernel(
             require_proxy_success(library, library.rdma_proxy_prepare_iteration(handle, iteration),
                                   f"preparing proxy iteration {iteration}")
 
-        def prepare_on_coordinator(iteration, extents, previous, setup_stream):
+        def prepare_on_coordinator(iteration, extents, previous, setup_stream, publication_marks):
+            publication_marks["handoff"] = time.perf_counter_ns()
             # CUDA device and current stream are host-thread local.
             with torch.cuda.device(cuda_device_id), torch.cuda.stream(setup_stream):
-                refreshed = refresh_runner(iteration, extents, previous, up_bound=True, publish_local=True)
+                publication_marks["setup_context"] = time.perf_counter_ns()
+                refreshed = refresh_runner(iteration, extents, previous, up_bound=True,
+                                           publication_marks=publication_marks)
                 prepare_proxy(iteration)
                 return refreshed
 
@@ -2357,6 +2386,7 @@ def run_proxy_with_concurrent_kernel(
             wave_views = None
             up_submitted_ns = None
             prepared = None
+            publication_marks = None
             if dynamic and iteration:
                 # All GPU and peer readers of the previous generation have retired.
                 # Finish Python's optional checks before the native thread reuses A_idx.
@@ -2377,10 +2407,12 @@ def run_proxy_with_concurrent_kernel(
                             async_scatter.reserve_addresses(grouped_gemm, columns)
                         if prepare_local is not None:
                             prepared = Future()
-                            payload = coordinator.submit(
-                                run_on_coordinator, iteration, None,
-                                partial(prepare_on_coordinator, iteration, extents, down,
-                                        torch.cuda.current_stream(cuda_device_id)), prepared)
+                            publication_marks = {}
+                            prepare = partial(prepare_on_coordinator, iteration, extents, down,
+                                              torch.cuda.current_stream(cuda_device_id), publication_marks)
+                            publication_marks["submit"] = time.perf_counter_ns()
+                            payload = coordinator.submit(run_on_coordinator, iteration, None, prepare, prepared)
+                            del prepare  # The queued callable owns a reference to the previous down runner.
                         # Keep the old runner's allocations through the setup-stream join.
                         previous = down
                         try:
@@ -2390,7 +2422,7 @@ def run_proxy_with_concurrent_kernel(
                                 down, wave_views, reference_setup_ns = prepared.result()
                 if prepared is None:
                     down, wave_views, reference_setup_ns = refresh_runner(
-                        iteration, extents, down, up_bound=early_up_iteration is not None, publish_local=False)
+                        iteration, extents, down, up_bound=early_up_iteration is not None)
                 if early_up_iteration is None:
                     torch.cuda.synchronize(cuda_device_id)
 
@@ -2499,7 +2531,8 @@ def run_proxy_with_concurrent_kernel(
             pipeline_timings.append((iteration, pipeline_ms))
             if benchmark_metadata is not None:
                 stats = dict(benchmark_metadata.last_stats, early_up_launch=start_barrier is None,
-                             concurrent_local_publication=prepared is not None)
+                             concurrent_local_publication=prepared is not None,
+                             local_publication_marks=publication_marks)
                 benchmark_timings.append((stats, up_submitted_ns))
             elapsed_ms = ctypes.c_float()
             require_proxy_success(

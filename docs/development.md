@@ -531,6 +531,40 @@ The post-install barrier removal passed the same host suites on the M1 Max. The 
 
 The CUDA build, two-node numerical and transport checks, and Nsight timing comparison require the Hopper hosts.
 
+#### Diagnosing the host delay in H800 report 22
+
+Update `python/rdma_proxy_worker.py` on both nodes and repeat the report 22
+command. For each successful steady iteration with `concurrent_local_publication=1`,
+the worker prints one `local_publication_timing` line in the end-of-run summary.
+Each value is host wall time in microseconds from the same rank's monotonic clock.
+
+| Field | Interval |
+| --- | --- |
+| `r_ready_to_submit_us` | Benchmark R readiness through main-thread submission of the coordinator task. Shares the origin of `r_ready_to_up_submit_us`. |
+| `handoff_us` | Immediately before executor submission through entry into the preparation callable on the coordinator. Includes executor dispatch and time until Python can run there. |
+| `setup_context_us` | Coordinator entry through selection of its CUDA device and setup stream. |
+| `expert_counts_us` | Reading current expert counts and computing the routed token total. |
+| `down_wave_start_us` | Starting the asynchronous down-wave job and binding its returned views. |
+| `down_runner_us` | Constructing the refreshed down projection runner. |
+| `scatter_register_us` | Configuring the current scatter destinations and starting native lookup. |
+| `submit_to_request_us` | Total from executor submission to entry into the native local-publication call. Includes all preceding phases starting at handoff. |
+| `request_call_us` | Wall time inside that native call, which prepares gather inputs and posts the local-ready request. The receiver publishes eligible descriptors asynchronously. |
+
+For iterations 1–4, compare `handoff_us` with the individual setup phases on
+the same GPU. Optional phases appear only when executed. The timings include
+time a thread spends descheduled within each interval. Use the GPU timeline
+to measure gather-end to first positive ready prefix (report 22 median
+**1.323 ms** across node 0's 32 samples). The worker collects host timestamps
+without adding CUDA synchronization or printing during submission.
+
+Host verification used an Apple M1 Max on macOS 15.6.1 with Python 3.9.12 and
+CPU PyTorch 1.13.1. The instrumented two-node H800 run is outstanding.
+
+```bash
+OMP_NUM_THREADS=1 PYTHONPATH=tests/python /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest -q test_benchmark_routing_worker
+OMP_NUM_THREADS=1 /Users/zhuhao/opt/anaconda3/bin/python3 -B -m unittest discover -s tests/python -q
+```
+
 ### Two-node test on Hopper
 
 Start these commands concurrently. The addresses below are the checked-in Hopper profile. If your hosts have different addresses, use node 0's rendezvous address for `MASTER_ADDR` in both shells and the opposite host's proxy address for each `PEER_HOST`.
